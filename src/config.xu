@@ -1,0 +1,345 @@
+@main
+
+#errors
+#os
+#crypto/rsa
+#encoding/json
+#encoding/base64
+#strconv
+#strings
+#time
+
+pub const CLI_VERSION = "1.0.0"
+pub const DEFAULT_API_BASE = "https://fatext.com"
+
+pub const EXIT_OK = 0
+pub const EXIT_ERR = 1
+pub const EXIT_USAGE = 2
+pub const EXIT_AUTH = 3
+pub const EXIT_NOT_FOUND = 4
+pub const EXIT_FORBIDDEN = 5
+pub const EXIT_CONFLICT = 6
+pub const EXIT_NET = 7
+pub const EXIT_CRYPTO = 8
+pub const EXIT_P2P = 9
+pub const EXIT_CONFIG = 10
+pub const EXIT_RATE_LIMIT = 75
+
+pub struct CliOpts {
+    pub json_mode bool
+    pub config_path string
+    pub api_override string
+    pub timeout_sec int
+    pub pow_bits_override int
+}
+
+pub struct Config {
+    pub agent_id string
+    pub api_base string
+    pub created_at int
+    pub key_version int
+    pub fingerprint string
+    pub home string
+}
+
+pub struct RoomInfo {
+    pub room_id string
+    pub name string
+    pub key_b64 string
+    pub epoch int
+    pub created_at int
+}
+
+pub fn json_str_or(doc &json.Doc, node int, def string) string {
+    << doc.as_string(node) or (err) { << def }
+}
+
+pub fn json_int_or(doc &json.Doc, node int, def int) int {
+    << doc.as_int(node) or (err) { << def }
+}
+
+pub fn json_bool_or(doc &json.Doc, node int, def bool) bool {
+    << doc.as_bool(node) or (err) { << def }
+}
+
+pub fn json_encode_or(doc &json.Doc, node int, def string) string {
+    << doc.encode(node) or (err) { << def }
+}
+
+pub fn read_file_or_empty(path string) string {
+    << os.read(path) or (err) { << "" }
+}
+
+pub fn parse_int_or(s &string, def int) int {
+    << strconv.atoi(s) or (err) { << def }
+}
+
+pub fn join_ref(xs &[]string, sep string) string {
+    if xs.len == 0 { << "" }
+    $out := xs[0] + ""
+    for i in 1:xs.len {
+        out = out + sep + xs[i]
+    }
+    << out
+}
+
+pub fn write_atomic_mode(path string, data &string, mode int) int {
+    tmp := path + ".tmp." + strconv.itoa(os.getpid())
+    os.write(tmp + "", data + "") or >>
+    os.chmod(tmp + "", mode) or >>
+    os.rename(tmp + "", path) or >>
+    << 0
+}
+
+pub fn emit_err(opts &CliOpts, code string, http_status int, msg string, retry_after int, exit_code int) int {
+    if opts.json_mode {
+        $s := "{\"ok\":false,\"error\":{\"code\":" + json.quote(&code)
+        if http_status > 0 {
+            s = s + ",\"http\":" + strconv.itoa(http_status)
+        }
+        s = s + ",\"message\":" + json.quote(&msg)
+        if retry_after > 0 {
+            s = s + ",\"retry_after\":" + strconv.itoa(retry_after)
+        }
+        s = s + "}}"
+        eprintln(s)
+    } else {
+        eprintln("error [" + code + "]: " + msg)
+        if retry_after > 0 {
+            eprintln("retry_after=" + strconv.itoa(retry_after))
+        }
+    }
+    << exit_code
+}
+
+pub fn map_http_exit_code(status int, code string) int {
+    if status == 429 { << EXIT_RATE_LIMIT }
+    if status == 401 { << EXIT_AUTH }
+    if status == 404 { << EXIT_NOT_FOUND }
+    if status == 403 { << EXIT_FORBIDDEN }
+    if status == 409 { << EXIT_CONFLICT }
+    if status == 400 || status == 413 { << EXIT_USAGE }
+    if status >= 500 { << EXIT_NET }
+    if code == "ERR_BAD_SIGNATURE" || code == "ERR_CLOCK_SKEW" || code == "ERR_REPLAY" || code == "ERR_UNKNOWN_AGENT" {
+        << EXIT_AUTH
+    }
+    << EXIT_ERR
+}
+
+fn dirname_of(p string) string {
+    $last := -1
+    for i in 0:p.len {
+        if (p[i] & 255) == 47 { last = i }
+    }
+    if last <= 0 { << "." }
+    << p[0:last]
+}
+
+pub fn resolve_home(opts &CliOpts) string {
+    if opts.config_path.len > 0 {
+        << dirname_of(opts.config_path + "")
+    }
+    env_home := os.getenv("FATEXT_HOME")
+    if env_home.len > 0 {
+        << env_home
+    }
+    h := os.home_dir()
+    if h.len == 0 { << ".fatext" }
+    << h + "/.fatext"
+}
+
+pub fn resolve_config_path(opts &CliOpts) string {
+    if opts.config_path.len > 0 {
+        << opts.config_path + ""
+    }
+    << resolve_home(opts) + "/config.json"
+}
+
+pub fn resolve_api_base(opts &CliOpts, cfg_api string) string {
+    if opts.api_override.len > 0 {
+        << strings.trim_right(&opts.api_override, "/")
+    }
+    if cfg_api.len > 0 {
+        << strings.trim_right(&cfg_api, "/")
+    }
+    << DEFAULT_API_BASE
+}
+
+pub fn load_config(opts &CliOpts) Config {
+    cpath := resolve_config_path(opts)
+    home := resolve_home(opts)
+    raw := os.read(cpath) or >>
+    doc := json.parse(&raw)
+    if !doc.ok() {
+        >> errors.new("invalid config.json")
+    }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "agent_id") {
+        >> errors.new("missing agent_id in config.json")
+    }
+    aid := doc.as_string(doc.get(r, "agent_id")) or >>
+    $api := DEFAULT_API_BASE
+    if doc.has(r, "api_base") {
+        api = json_str_or(&doc, doc.get(r, "api_base"), DEFAULT_API_BASE)
+    }
+    api = resolve_api_base(opts, api + "")
+    cat := json_int_or(&doc, doc.get(r, "created_at"), 0)
+    $kv := 1
+    if doc.has(r, "key_version") { kv = json_int_or(&doc, doc.get(r, "key_version"), 1) }
+    $fp := ""
+    if doc.has(r, "fingerprint") { fp = json_str_or(&doc, doc.get(r, "fingerprint"), "") }
+    << Config{agent_id: aid, api_base: api, created_at: cat, key_version: kv, fingerprint: fp, home: home}
+}
+
+pub fn save_config(cfg_path string, cfg &Config) int {
+    home := dirname_of(cfg_path + "")
+    os.mkdir_all(home) or >>
+    body := "{" +
+        "\"agent_id\":" + json.quote(&cfg.agent_id) + "," +
+        "\"api_base\":" + json.quote(&cfg.api_base) + "," +
+        "\"created_at\":" + strconv.itoa(cfg.created_at) + "," +
+        "\"key_version\":" + strconv.itoa(cfg.key_version) + "," +
+        "\"fingerprint\":" + json.quote(&cfg.fingerprint) +
+        "}\n"
+    << write_atomic_mode(cfg_path, &body, 384) or >>
+}
+
+pub fn check_private_key_perms(path string) int {
+    info := os.stat(path) or >>
+    if (info.mode & 63) != 0 {
+        >> errors.new("insecure_key_file")
+    }
+    << 0
+}
+
+pub fn load_private_key_checked(home string) rsa.PrivateKey {
+    ppath := home + "/private.pem"
+    check_private_key_perms(ppath + "") or >>
+    pem_raw := os.read(ppath) or >>
+    << decode_rsa_private_pem(&pem_raw) or >>
+}
+
+pub fn save_private_key_atomic(home string, pem_str &string) int {
+    os.mkdir_all(home + "") or >>
+    ppath := home + "/private.pem"
+    << write_atomic_mode(ppath, pem_str, 384) or >>
+}
+
+pub fn archive_private_key(home string, version int, pem_str &string) int {
+    kdir := home + "/keys"
+    os.mkdir_all(kdir + "") or >>
+    kpath := kdir + "/private.v" + strconv.itoa(version) + ".pem"
+    << write_atomic_mode(kpath, pem_str, 384) or >>
+}
+
+pub fn load_archived_private_key(home string, version int) rsa.PrivateKey {
+    kpath := home + "/keys/private.v" + strconv.itoa(version) + ".pem"
+    check_private_key_perms(kpath + "") or >>
+    pem_raw := os.read(kpath) or >>
+    << decode_rsa_private_pem(&pem_raw) or >>
+}
+
+pub fn save_room_info(home string, ri &RoomInfo) int {
+    rdir := home + "/rooms"
+    os.mkdir_all(rdir + "") or >>
+    rpath := rdir + "/" + ri.room_id + ".json"
+    body := "{" +
+        "\"room_id\":" + json.quote(&ri.room_id) + "," +
+        "\"name\":" + json.quote(&ri.name) + "," +
+        "\"key\":" + json.quote(&ri.key_b64) + "," +
+        "\"epoch\":" + strconv.itoa(ri.epoch) + "," +
+        "\"created_at\":" + strconv.itoa(ri.created_at) +
+        "}\n"
+    << write_atomic_mode(rpath, &body, 384) or >>
+}
+
+pub fn load_room_info(home string, room_id string) RoomInfo {
+    rpath := home + "/rooms/" + room_id + ".json"
+    raw := os.read(rpath) or >>
+    doc := json.parse(&raw)
+    if !doc.ok() { >> errors.new("invalid room file") }
+    r := doc.root()
+    kb := doc.as_string(doc.get(r, "key")) or >>
+    $nm := ""
+    if doc.has(r, "name") { nm = json_str_or(&doc, doc.get(r, "name"), "") }
+    $ep := 1
+    if doc.has(r, "epoch") { ep = json_int_or(&doc, doc.get(r, "epoch"), 1) }
+    $cat := 0
+    if doc.has(r, "created_at") { cat = json_int_or(&doc, doc.get(r, "created_at"), 0) }
+    << RoomInfo{room_id: room_id, name: nm, key_b64: kb, epoch: ep, created_at: cat}
+}
+
+pub fn read_stdin_all() string {
+    $out := ""
+    while true {
+        chunk := os.fd_read(0, 65536) or (err) { <- }
+        if chunk.len == 0 { <- }
+        out = out + chunk
+    }
+    << out
+}
+
+pub fn read_text_arg_or_stdin(arg string) string {
+    if arg == "-" {
+        << read_stdin_all()
+    }
+    << arg + ""
+}
+
+pub fn is_valid_agent_id(s string) bool {
+    if s.len != 16 || !strings.has_prefix(&s, "ftx_") { << false }
+    for i in 4:16 {
+        c := s[i] & 255
+        if !((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) { << false }
+    }
+    << true
+}
+
+pub fn is_valid_msg_id(s string) bool {
+    if s.len != 30 || !strings.has_prefix(&s, "msg_") { << false }
+    for i in 4:30 {
+        c := s[i] & 255
+        ok := (c >= 48 && c <= 57) || (c >= 65 && c <= 90 && c != 73 && c != 76 && c != 79 && c != 85)
+        if !ok { << false }
+    }
+    << true
+}
+
+pub fn is_valid_room_id(s string) bool {
+    if s.len != 31 || !strings.has_prefix(&s, "room_") { << false }
+    for i in 5:31 {
+        c := s[i] & 255
+        ok := (c >= 97 && c <= 122) || (c >= 50 && c <= 55)
+        if !ok { << false }
+    }
+    << true
+}
+
+pub fn utc_today() string {
+    t := time.now_time()
+    dp := t.date_parts()
+    $mo := strconv.itoa(dp.month)
+    if dp.month < 10 { mo = "0" + mo }
+    $dy := strconv.itoa(dp.day)
+    if dp.day < 10 { dy = "0" + dy }
+    $yr := strconv.itoa(dp.year)
+    while yr.len < 4 { yr = "0" + yr }
+    << yr + "-" + mo + "-" + dy
+}
+
+pub fn url_encode(s &string) string {
+    hex_chars := "0123456789ABCDEF"
+    $out := ""
+    for i in 0:s.len {
+        c := s[i] & 255
+        safe := (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 126
+        if safe {
+            out.push_byte(c)
+        } else {
+            hi := (c >> 4) & 15
+            lo := c & 15
+            out = out + "%" + hex_chars[hi:(hi + 1)] + hex_chars[lo:(lo + 1)]
+        }
+    }
+    << out
+}

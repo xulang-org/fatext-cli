@@ -1,0 +1,519 @@
+@main
+
+#errors
+#math/big
+#crypto/rand
+#crypto/rsa
+#crypto/rsa/oaep
+#crypto/aes
+#crypto/cipher
+#crypto/sha256
+#encoding/asn1
+#encoding/base64
+#encoding/hex
+#encoding/json
+#encoding/pem
+#strconv
+#strings
+
+fn der_len_bytes(n int) []int {
+    $b := []int{}
+    if n < 128 {
+        b.push(n)
+    } else if n < 256 {
+        b.push(129)
+        b.push(n)
+    } else if n < 65536 {
+        b.push(130)
+        b.push((n >> 8) & 255)
+        b.push(n & 255)
+    } else {
+        b.push(131)
+        b.push((n >> 16) & 255)
+        b.push((n >> 8) & 255)
+        b.push(n & 255)
+    }
+    << b
+}
+
+fn der_tlv(tag int, body &string) string {
+    $out := []int{}
+    out.push(tag)
+    lb := der_len_bytes(body.len)
+    for i in 0:lb.len { out.push(lb[i]) }
+    for i in 0:body.len { out.push(body[i] & 255) }
+    << string_from_bytes(out)
+}
+
+fn marshal_big_int(z &big.Int) string {
+    raw := z.bytes()
+    $out := []int{}
+    if raw.len == 0 {
+        out.push(0)
+    } else {
+        if (raw[0] & 128) != 0 {
+            out.push(0)
+        }
+        for i in 0:raw.len {
+            out.push(raw[i] & 255)
+        }
+    }
+    body := string_from_bytes(out)
+    << der_tlv(asn1.TAG_INTEGER, &body)
+}
+
+pub fn encode_rsa_private_pem(priv &rsa.PrivateKey) string {
+    $one := big.new_int(1)
+    $nn := big.new_int(0)
+    nn.set(&priv.public.n)
+    $ee := big.new_int(priv.public.e)
+    $dd := big.new_int(0)
+    dd.set(&priv.d)
+    $p := big.new_int(0)
+    p.set(&priv.p)
+    $q := big.new_int(0)
+    q.set(&priv.q)
+
+    $pm1 := big.new_int(0)
+    pm1.sub(&p, &one)
+    $qm1 := big.new_int(0)
+    qm1.sub(&q, &one)
+    $dp := big.new_int(0)
+    dp.mod(&dd, &pm1) or >>
+    $dq := big.new_int(0)
+    dq.mod(&dd, &qm1) or >>
+    $qinv := big.new_int(0)
+    qinv.mod_inverse(&q, &p) or >>
+
+    elems := [asn1.marshal_int(0), marshal_big_int(&nn), marshal_big_int(&ee), marshal_big_int(&dd), marshal_big_int(&p), marshal_big_int(&q), marshal_big_int(&dp), marshal_big_int(&dq), marshal_big_int(&qinv)]
+    der := asn1.marshal_seq(&elems)
+    blk := pem.Block{typ: "RSA PRIVATE KEY", keys: []string{}, vals: []string{}, bytes: der, rest: ""}
+    << pem.encode_to_memory(&blk)
+}
+
+fn parse_pkcs1_private_der(der &string) rsa.PrivateKey {
+    seq := asn1.unmarshal(der) or >>
+    if seq.tag != asn1.TAG_SEQUENCE {
+        >> errors.new("rsa: invalid PKCS#1 private key")
+    }
+    $d := asn1.new_decoder(&seq.bytes)
+    vv := d.next() or >>
+    _ := vv.as_int() or >>
+    nv := d.next() or >>
+    ev := d.next() or >>
+    dv := d.next() or >>
+    pv := d.next() or >>
+    qv := d.next() or >>
+    if nv.tag != asn1.TAG_INTEGER || ev.tag != asn1.TAG_INTEGER || dv.tag != asn1.TAG_INTEGER || pv.tag != asn1.TAG_INTEGER || qv.tag != asn1.TAG_INTEGER {
+        >> errors.new("rsa: malformed PKCS#1 fields")
+    }
+    $n := big.new_int(0)
+    n.set_bytes(nv.bytes + "")
+    e := ev.as_int() or >>
+    $d_int := big.new_int(0)
+    d_int.set_bytes(dv.bytes + "")
+    $p := big.new_int(0)
+    p.set_bytes(pv.bytes + "")
+    $q := big.new_int(0)
+    q.set_bytes(qv.bytes + "")
+    << rsa.PrivateKey{public: rsa.PublicKey{n: n, e: e}, d: d_int, p: p, q: q}
+}
+
+pub fn decode_rsa_private_pem(pem_str &string) rsa.PrivateKey {
+    blk := pem.decode(pem_str)
+    if blk.bytes.len == 0 {
+        >> errors.new("rsa: no PEM private key found")
+    }
+    if blk.typ == "RSA PRIVATE KEY" {
+        << parse_pkcs1_private_der(&blk.bytes) or >>
+    }
+    if blk.typ == "PRIVATE KEY" {
+        p8 := asn1.unmarshal(&blk.bytes) or >>
+        if p8.tag != asn1.TAG_SEQUENCE {
+            >> errors.new("rsa: invalid PKCS#8 sequence")
+        }
+        $d := asn1.new_decoder(&p8.bytes)
+        _ := d.next() or >>
+        _ := d.next() or >>
+        octv := d.next() or >>
+        inner := octv.as_octet() or >>
+        << parse_pkcs1_private_der(&inner) or >>
+    }
+    >> errors.new("rsa: unsupported private key PEM type: " + blk.typ)
+}
+
+pub fn encode_spki_public_pem(pk &rsa.PublicKey) string {
+    $nn := big.new_int(0)
+    nn.set(&pk.n)
+    rsa_elems := [marshal_big_int(&nn), asn1.marshal_int(pk.e)]
+    rsa_der := asn1.marshal_seq(&rsa_elems)
+    oid_rsa := asn1.marshal_oid(&[1, 2, 840, 113549, 1, 1, 1]) or >>
+    alg_elems := [oid_rsa, asn1.marshal_null()]
+    alg_der := asn1.marshal_seq(&alg_elems)
+    spki_elems := [alg_der, asn1.marshal_bit_string(&rsa_der)]
+    spki_der := asn1.marshal_seq(&spki_elems)
+    blk := pem.Block{typ: "PUBLIC KEY", keys: []string{}, vals: []string{}, bytes: spki_der, rest: ""}
+    << pem.encode_to_memory(&blk)
+}
+
+fn oid_is_rsa(arcs &[]int) bool {
+    if arcs.len != 7 { << false }
+    << arcs[0] == 1 && arcs[1] == 2 && arcs[2] == 840 && arcs[3] == 113549 && arcs[4] == 1 && arcs[5] == 1 && arcs[6] == 1
+}
+
+pub fn decode_spki_public_pem(pem_str &string) rsa.PublicKey {
+    blk := pem.decode(pem_str)
+    if blk.typ != "PUBLIC KEY" || blk.bytes.len == 0 {
+        >> errors.new("rsa: expected PUBLIC KEY PEM")
+    }
+    spki := asn1.unmarshal(&blk.bytes) or >>
+    if spki.tag != asn1.TAG_SEQUENCE {
+        >> errors.new("rsa: invalid SPKI sequence")
+    }
+    $d := asn1.new_decoder(&spki.bytes)
+    alg := d.next() or >>
+    keyv := d.next() or >>
+    $ad := asn1.new_decoder(&alg.bytes)
+    oidv := ad.next() or >>
+    arcs := oidv.as_oid() or >>
+    if !oid_is_rsa(&arcs) {
+        >> errors.new("rsa: public key is not RSA")
+    }
+    bits := keyv.as_bit_string() or >>
+    rseq := asn1.unmarshal(&bits) or >>
+    $rd := asn1.new_decoder(&rseq.bytes)
+    nv := rd.next() or >>
+    ev := rd.next() or >>
+    $n := big.new_int(0)
+    n.set_bytes(nv.bytes + "")
+    e := ev.as_int() or >>
+    << rsa.PublicKey{n: n, e: e}
+}
+
+pub fn pubkey_fingerprint(pub_pem &string) string {
+    blk := pem.decode(pub_pem)
+    if blk.bytes.len == 0 { << "" }
+    d := sha256.sum256_bytes(blk.bytes + "")
+    << "SHA256:" + base64.encode_to_string(d)
+}
+
+pub fn sign_pss_message(priv &rsa.PrivateKey, msg &string) string {
+    hashed := sha256.sum256_bytes(msg + "")
+    sig := oaep.sign_pss(priv, rsa.SHA256, &hashed) or >>
+    << base64.encode_to_string(sig)
+}
+
+pub fn verify_pss_message(pk &rsa.PublicKey, msg &string, sig_b64 string) bool {
+    trimmed := strings.trim_space(&sig_b64)
+    if trimmed.len == 0 { << false }
+    sig := base64.decode_string(trimmed) or (err) { << false }
+    hashed := sha256.sum256_bytes(msg + "")
+    rc := oaep.verify_pss(pk, rsa.SHA256, &hashed, &sig) or (err) { << false }
+    << rc == 0
+}
+
+pub fn sign_http_request(priv &rsa.PrivateKey, method string, path_and_query string, ts string, body &string) string {
+    body_hex := sha256.sum256(body + "")
+    sts := method + "\n" + path_and_query + "\n" + ts + "\n" + body_hex
+    << sign_pss_message(priv, &sts) or >>
+}
+
+pub fn leading_zero_bits(digest &string) int {
+    $bits := 0
+    for i in 0:digest.len {
+        b := digest[i] & 255
+        if b == 0 {
+            bits += 8
+            ->
+        }
+        $mask := 128
+        while mask > 0 {
+            if (b & mask) != 0 {
+                << bits
+            }
+            bits += 1
+            mask = mask >> 1
+        }
+    }
+    << bits
+}
+
+pub fn solve_pow_register(pub_pem &string, ts string, bits int) string {
+    pem_hex := sha256.sum256(pub_pem + "")
+    $n := 0
+    while true {
+        ns := strconv.itoa(n)
+        d := sha256.sum256_bytes(pem_hex + ":" + ts + ":" + ns)
+        if leading_zero_bits(&d) >= bits {
+            << ns
+        }
+        n += 1
+    }
+    << "0"
+}
+
+pub fn solve_pow_post(agent_id string, ts string, bits int) string {
+    $n := 0
+    while true {
+        ns := strconv.itoa(n)
+        d := sha256.sum256_bytes(agent_id + ":" + ts + ":" + ns)
+        if leading_zero_bits(&d) >= bits {
+            << ns
+        }
+        n += 1
+    }
+    << "0"
+}
+
+pub fn random_b64(n int) string {
+    r := rand.read(n) or >>
+    << base64.encode_to_string(r)
+}
+
+pub fn generate_room_id() string {
+    b32 := "abcdefghijklmnopqrstuvwxyz234567"
+    rnd := rand.read(26) or >>
+    $out := "room_"
+    for i in 0:26 {
+        idx := (rnd[i] & 255) % 32
+        out = out + b32[idx:(idx + 1)]
+    }
+    << out
+}
+
+pub fn generate_session_id() string {
+    rnd := rand.read(8) or >>
+    << "s_" + hex.encode_to_string(rnd)
+}
+
+pub struct DecryptedMsg {
+    pub ok bool
+    pub err string
+    pub msg_type string
+    pub from_id string
+    pub to_id string
+    pub room_id string
+    pub ts int
+    pub nonce string
+    pub body_json string
+    pub conv_state string
+    pub verified bool
+}
+
+fn dec_fail(err string) DecryptedMsg {
+    << DecryptedMsg{
+        ok: false, err: err, msg_type: "", from_id: "", to_id: "",
+        room_id: "", ts: 0, nonce: "", body_json: "", conv_state: "open", verified: false
+    }
+}
+
+fn dm_inner_jcs_nosig(body_json string, conv_state string, from_id string, nonce string, to_id string, ts int, msg_type string) string {
+    // Keys sorted alphabetically (RFC 8785 JCS)
+    << "{\"body\":" + body_json +
+        ",\"conversation_state\":" + json.quote(&conv_state) +
+        ",\"from\":" + json.quote(&from_id) +
+        ",\"nonce\":" + json.quote(&nonce) +
+        ",\"to\":" + json.quote(&to_id) +
+        ",\"ts\":" + strconv.itoa(ts) +
+        ",\"type\":" + json.quote(&msg_type) +
+        ",\"v\":1}"
+}
+
+fn room_inner_jcs_nosig(body_json string, from_id string, nonce string, room_id string, ts int, msg_type string) string {
+    << "{\"body\":" + body_json +
+        ",\"from\":" + json.quote(&from_id) +
+        ",\"nonce\":" + json.quote(&nonce) +
+        ",\"room\":" + json.quote(&room_id) +
+        ",\"ts\":" + strconv.itoa(ts) +
+        ",\"type\":" + json.quote(&msg_type) +
+        ",\"v\":1}"
+}
+
+pub fn encrypt_dm_frame(sender_id string, sender_priv &rsa.PrivateKey, to_id string, to_pk &rsa.PublicKey, to_key_ver int, msg_type string, body_json string, conv_state string, ts int) string {
+    nonce_b64 := random_b64(16) or >>
+    nosig := dm_inner_jcs_nosig(body_json + "", conv_state + "", sender_id + "", nonce_b64 + "", to_id + "", ts, msg_type + "")
+    sig_b64 := sign_pss_message(sender_priv, &nosig) or >>
+    plaintext := "{\"body\":" + body_json +
+        ",\"conversation_state\":" + json.quote(&conv_state) +
+        ",\"from\":" + json.quote(&sender_id) +
+        ",\"nonce\":" + json.quote(&nonce_b64) +
+        ",\"sig\":" + json.quote(&sig_b64) +
+        ",\"to\":" + json.quote(&to_id) +
+        ",\"ts\":" + strconv.itoa(ts) +
+        ",\"type\":" + json.quote(&msg_type) +
+        ",\"v\":1}"
+
+    cek := rand.read(32) or >>
+    iv := rand.read(12) or >>
+    empty_lbl := ""
+    ek := oaep.encrypt_oaep(to_pk, rsa.SHA256, &cek, &empty_lbl) or >>
+    ciph := aes.new_cipher(&cek) or >>
+    aad := "fatext-dm\n" + sender_id + "\n" + to_id + "\n" + strconv.itoa(to_key_ver)
+    ct := cipher.seal_gcm(&ciph, &iv, &plaintext, &aad) or >>
+
+    ek_b64 := base64.encode_to_string(ek)
+    iv_b64 := base64.encode_to_string(iv)
+    ct_b64 := base64.encode_to_string(ct)
+    << "{\"v\":1,\"alg\":\"RSA-OAEP-256+A256GCM\",\"to_key_version\":" + strconv.itoa(to_key_ver) +
+        ",\"ek\":" + json.quote(&ek_b64) +
+        ",\"iv\":" + json.quote(&iv_b64) +
+        ",\"ct\":" + json.quote(&ct_b64) + "}"
+}
+
+pub fn decrypt_dm_frame(self_id string, self_priv &rsa.PrivateKey, expected_from string, sender_pk &rsa.PublicKey, sender_has_pk bool, outer_json &string) DecryptedMsg {
+    doc := json.parse(outer_json)
+    if !doc.ok() { << dec_fail("invalid outer frame json") }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "ek") || !doc.has(r, "iv") || !doc.has(r, "ct") {
+        << dec_fail("missing dm envelope fields")
+    }
+    ek_b64 := doc.as_string(doc.get(r, "ek")) or (err) { << dec_fail("bad ek") }
+    iv_b64 := doc.as_string(doc.get(r, "iv")) or (err) { << dec_fail("bad iv") }
+    ct_b64 := doc.as_string(doc.get(r, "ct")) or (err) { << dec_fail("bad ct") }
+    $kv := 1
+    if doc.has(r, "to_key_version") {
+        kv = json_int_or(&doc, doc.get(r, "to_key_version"), 1)
+    }
+
+    ek := base64.decode_string(ek_b64) or (err) { << dec_fail("bad ek base64") }
+    iv := base64.decode_string(iv_b64) or (err) { << dec_fail("bad iv base64") }
+    ct := base64.decode_string(ct_b64) or (err) { << dec_fail("bad ct base64") }
+
+    empty_lbl := ""
+    cek := oaep.decrypt_oaep(self_priv, rsa.SHA256, &ek, &empty_lbl) or (err) {
+        << dec_fail("rsa-oaep decrypt failed: " + err.msg())
+    }
+    ciph := aes.new_cipher(&cek) or (err) { << dec_fail("aes init failed") }
+    aad := "fatext-dm\n" + expected_from + "\n" + self_id + "\n" + strconv.itoa(kv)
+    pt := cipher.open_gcm(&ciph, &iv, &ct, &aad) or (err) {
+        << dec_fail("aes-gcm auth failed")
+    }
+
+    idoc := json.parse(&pt)
+    if !idoc.ok() { << dec_fail("invalid inner json") }
+    ir := idoc.root()
+    if !idoc.is_dict(ir) || !idoc.has(ir, "from") || !idoc.has(ir, "to") || !idoc.has(ir, "type") || !idoc.has(ir, "body") {
+        << dec_fail("missing inner fields")
+    }
+    mfrom := idoc.as_string(idoc.get(ir, "from")) or (err) { << dec_fail("bad inner from") }
+    mto := idoc.as_string(idoc.get(ir, "to")) or (err) { << dec_fail("bad inner to") }
+    mtype := idoc.as_string(idoc.get(ir, "type")) or (err) { << dec_fail("bad inner type") }
+    mnonce := idoc.as_string(idoc.get(ir, "nonce")) or (err) { << dec_fail("bad inner nonce") }
+    mts := idoc.as_int(idoc.get(ir, "ts")) or (err) { << dec_fail("bad inner ts") }
+    $cstate := "open"
+    if idoc.has(ir, "conversation_state") {
+        cstate = json_str_or(&idoc, idoc.get(ir, "conversation_state"), "open")
+    }
+    $sig := ""
+    if idoc.has(ir, "sig") {
+        sig = json_str_or(&idoc, idoc.get(ir, "sig"), "")
+    }
+    bjson := idoc.encode(idoc.get(ir, "body")) or (err) { << dec_fail("bad inner body") }
+
+    if mfrom != expected_from || mto != self_id {
+        << dec_fail("dm sender/recipient mismatch")
+    }
+    $verified := false
+    if sender_has_pk && sig.len > 0 {
+        nosig := dm_inner_jcs_nosig(bjson + "", cstate + "", mfrom + "", mnonce + "", mto + "", mts, mtype + "")
+        verified = verify_pss_message(sender_pk, &nosig, sig + "")
+    }
+    << DecryptedMsg{
+        ok: true, err: "", msg_type: mtype, from_id: mfrom, to_id: mto,
+        room_id: "", ts: mts, nonce: mnonce, body_json: bjson, conv_state: cstate, verified: verified
+    }
+}
+
+pub fn encrypt_room_frame(sender_id string, sender_priv &rsa.PrivateKey, room_id string, room_key_bytes &string, epoch int, body_json string, ts int) string {
+    nonce_b64 := random_b64(16) or >>
+    msg_type := "text"
+    nosig := room_inner_jcs_nosig(body_json + "", sender_id + "", nonce_b64 + "", room_id + "", ts, msg_type + "")
+    sig_b64 := sign_pss_message(sender_priv, &nosig) or >>
+    plaintext := "{\"body\":" + body_json +
+        ",\"from\":" + json.quote(&sender_id) +
+        ",\"nonce\":" + json.quote(&nonce_b64) +
+        ",\"room\":" + json.quote(&room_id) +
+        ",\"sig\":" + json.quote(&sig_b64) +
+        ",\"ts\":" + strconv.itoa(ts) +
+        ",\"type\":\"text\",\"v\":1}"
+
+    iv := rand.read(12) or >>
+    ciph := aes.new_cipher(room_key_bytes) or >>
+    aad := "fatext-room\n" + room_id + "\n" + strconv.itoa(epoch)
+    ct := cipher.seal_gcm(&ciph, &iv, &plaintext, &aad) or >>
+    iv_b64 := base64.encode_to_string(iv)
+    ct_b64 := base64.encode_to_string(ct)
+    << "{\"v\":1,\"alg\":\"A256GCM\",\"epoch\":" + strconv.itoa(epoch) +
+        ",\"iv\":" + json.quote(&iv_b64) +
+        ",\"ct\":" + json.quote(&ct_b64) + "}"
+}
+
+pub fn decrypt_room_frame(room_id string, room_key_bytes &string, expected_from string, sender_pk &rsa.PublicKey, sender_has_pk bool, outer_json &string) DecryptedMsg {
+    doc := json.parse(outer_json)
+    if !doc.ok() { << dec_fail("invalid room frame json") }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "iv") || !doc.has(r, "ct") {
+        << dec_fail("missing room envelope fields")
+    }
+    iv_b64 := doc.as_string(doc.get(r, "iv")) or (err) { << dec_fail("bad iv") }
+    ct_b64 := doc.as_string(doc.get(r, "ct")) or (err) { << dec_fail("bad ct") }
+    $epoch := 1
+    if doc.has(r, "epoch") {
+        epoch = json_int_or(&doc, doc.get(r, "epoch"), 1)
+    }
+    iv := base64.decode_string(iv_b64) or (err) { << dec_fail("bad iv base64") }
+    ct := base64.decode_string(ct_b64) or (err) { << dec_fail("bad ct base64") }
+
+    ciph := aes.new_cipher(room_key_bytes) or (err) { << dec_fail("aes init failed") }
+    aad := "fatext-room\n" + room_id + "\n" + strconv.itoa(epoch)
+    pt := cipher.open_gcm(&ciph, &iv, &ct, &aad) or (err) {
+        << dec_fail("room gcm auth failed")
+    }
+
+    idoc := json.parse(&pt)
+    if !idoc.ok() { << dec_fail("invalid room inner json") }
+    ir := idoc.root()
+    if !idoc.is_dict(ir) || !idoc.has(ir, "from") || !idoc.has(ir, "room") || !idoc.has(ir, "body") {
+        << dec_fail("missing room inner fields")
+    }
+    mfrom := idoc.as_string(idoc.get(ir, "from")) or (err) { << dec_fail("bad room from") }
+    mroom := idoc.as_string(idoc.get(ir, "room")) or (err) { << dec_fail("bad room id") }
+    mtype := "text"
+    mnonce := idoc.as_string(idoc.get(ir, "nonce")) or (err) { << dec_fail("bad room nonce") }
+    mts := idoc.as_int(idoc.get(ir, "ts")) or (err) { << dec_fail("bad room ts") }
+    $sig := ""
+    if idoc.has(ir, "sig") {
+        sig = json_str_or(&idoc, idoc.get(ir, "sig"), "")
+    }
+    bjson := idoc.encode(idoc.get(ir, "body")) or (err) { << dec_fail("bad room body") }
+
+    if mfrom != expected_from || mroom != room_id {
+        << dec_fail("room sender/id mismatch")
+    }
+    $verified := false
+    if sender_has_pk && sig.len > 0 {
+        nosig := room_inner_jcs_nosig(bjson + "", mfrom + "", mnonce + "", mroom + "", mts, mtype + "")
+        verified = verify_pss_message(sender_pk, &nosig, sig + "")
+    }
+    << DecryptedMsg{
+        ok: true, err: "", msg_type: mtype, from_id: mfrom, to_id: "",
+        room_id: mroom, ts: mts, nonce: mnonce, body_json: bjson, conv_state: "open", verified: verified
+    }
+}
+
+pub fn decrypt_mail_envelope(self_id string, priv &rsa.PrivateKey, mail_id string, to_key_ver int, env_json &string) string {
+    doc := json.parse(env_json)
+    if !doc.ok() { >> errors.new("mail: invalid envelope json") }
+    r := doc.root()
+    ek_b64 := doc.as_string(doc.get(r, "ek")) or >>
+    iv_b64 := doc.as_string(doc.get(r, "iv")) or >>
+    ct_b64 := doc.as_string(doc.get(r, "ct")) or >>
+    ek := base64.decode_string(ek_b64) or >>
+    iv := base64.decode_string(iv_b64) or >>
+    ct := base64.decode_string(ct_b64) or >>
+    empty_lbl := ""
+    cek := oaep.decrypt_oaep(priv, rsa.SHA256, &ek, &empty_lbl) or >>
+    ciph := aes.new_cipher(&cek) or >>
+    aad := "fatext-mail\n" + self_id + "\n" + mail_id + "\n" + strconv.itoa(to_key_ver)
+    << cipher.open_gcm(&ciph, &iv, &ct, &aad) or >>
+}

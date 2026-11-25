@@ -1,0 +1,333 @@
+@main
+
+#errors
+#math/big
+#crypto/rsa
+#crypto/tls
+#encoding/json
+#net
+#net/http
+#net/url
+#strconv
+#strings
+#time
+
+pub struct ApiResp {
+    pub ok bool
+    pub status int
+    pub retry_after int
+    pub required_bits int
+    pub err_code string
+    pub err_msg string
+    pub body string
+    pub net_err bool
+}
+
+pub struct FetchedKey {
+    pub ok bool
+    pub exit_code int
+    pub err_code string
+    pub err_msg string
+    pub agent_id string
+    pub status string
+    pub key_version int
+    pub pub_pem string
+    pub pk rsa.PublicKey
+    pub raw_json string
+    pub self_sig_valid bool
+}
+
+fn empty_api_err(net_err bool, code string, msg string) ApiResp {
+    << ApiResp{ok: false, status: 0, retry_after: 0, required_bits: 0, err_code: code, err_msg: msg, body: "", net_err: net_err}
+}
+
+pub fn api_call(api_base string, timeout_sec int, agent_id string, priv &rsa.PrivateKey, signed bool, method string, path_and_query string, body &string, extra_headers string) ApiResp {
+    $cl := http.new_client()
+    cl.set_timeout(timeout_sec * 1000000000)
+
+    $extra := extra_headers + ""
+    if body.len > 0 && !strings.contains(&extra, "Content-Type:") {
+        extra = extra + "Content-Type: application/json\r\n"
+    }
+    if signed {
+        ts := strconv.itoa(time.now_time().unix())
+        sig := sign_http_request(priv, method + "", path_and_query + "", ts + "", body) or (err) {
+            << empty_api_err(false, "ERR_CRYPTO", err.msg())
+        }
+        if agent_id.len > 0 {
+            extra = extra + "X-Agent-Id: " + agent_id + "\r\n"
+        }
+        extra = extra + "X-Timestamp: " + ts + "\r\n"
+        extra = extra + "X-Signature: " + sig + "\r\n"
+    }
+
+    full_url := api_base + path_and_query
+    resp := cl.do_extra(method, full_url, extra, body) or (err) {
+        << empty_api_err(true, "ERR_NETWORK", err.msg())
+    }
+    st := resp.status_code()
+    rbody := resp.body()
+    if st >= 200 && st < 300 {
+        << ApiResp{ok: true, status: st, retry_after: 0, required_bits: 0, err_code: "", err_msg: "", body: rbody, net_err: false}
+    }
+
+    $ra := 0
+    ra_hdr := resp.header("Retry-After")
+    if ra_hdr.len > 0 {
+        ra = parse_int_or(&strings.trim_space(&ra_hdr), 0)
+    }
+    $ecode := "ERR_HTTP_" + strconv.itoa(st)
+    $emsg := resp.status()
+    $req_bits := 0
+
+    edoc := json.parse(&rbody)
+    if edoc.ok() && edoc.has(edoc.root(), "error") {
+        en := edoc.get(edoc.root(), "error")
+        if edoc.is_dict(en) {
+            if edoc.has(en, "code") { ecode = json_str_or(&edoc, edoc.get(en, "code"), ecode + "") }
+            if edoc.has(en, "message") { emsg = json_str_or(&edoc, edoc.get(en, "message"), emsg + "") }
+            if edoc.has(en, "retry_after") {
+                ra_b := json_int_or(&edoc, edoc.get(en, "retry_after"), 0)
+                if ra_b > 0 { ra = ra_b }
+            }
+            if edoc.has(en, "required_bits") {
+                req_bits = json_int_or(&edoc, edoc.get(en, "required_bits"), 0)
+            }
+        }
+    }
+    << ApiResp{ok: false, status: st, retry_after: ra, required_bits: req_bits, err_code: ecode, err_msg: emsg, body: rbody, net_err: false}
+}
+
+pub fn api_call_anon(api_base string, timeout_sec int, method string, path_and_query string, body &string, extra_headers string) ApiResp {
+    dummy := rsa.PrivateKey{public: rsa.PublicKey{n: big_zero(), e: 65537}, d: big_zero(), p: big_zero(), q: big_zero()}
+    << api_call(api_base, timeout_sec, "", &dummy, false, method, path_and_query, body, extra_headers)
+}
+
+fn big_zero() big.Int {
+    << big.new_int(0)
+}
+
+pub fn discover_pow_bits(opts &CliOpts, api_base string, scope string, fallback int) int {
+    if opts.pow_bits_override > 0 {
+        << opts.pow_bits_override
+    }
+    empty := ""
+    r := api_call_anon(api_base, 3, "GET", "/.well-known/fatext.json", &empty, "")
+    if !r.ok { << fallback }
+    doc := json.parse(&r.body)
+    if !doc.ok() { << fallback }
+    rt := doc.root()
+    if !doc.is_dict(rt) || !doc.has(rt, "pow") { << fallback }
+    pn := doc.get(rt, "pow")
+    if !doc.is_dict(pn) || !doc.has(pn, scope) { << fallback }
+    sn := doc.get(pn, scope)
+    if !doc.is_dict(sn) || !doc.has(sn, "difficulty_bits") { << fallback }
+    bits := json_int_or(&doc, doc.get(sn, "difficulty_bits"), fallback)
+    if bits > 0 && bits <= 30 { << bits }
+    << fallback
+}
+
+pub fn fetch_agent_key(api_base string, timeout_sec int, agent_id string) FetchedKey {
+    empty := ""
+    r := api_call_anon(api_base, timeout_sec, "GET", "/k/" + agent_id + ".json", &empty, "")
+    $dummy_pk := rsa.PublicKey{n: big_zero(), e: 65537}
+    if !r.ok {
+        $ec := map_http_exit_code(r.status, r.err_code + "")
+        if r.net_err { ec = EXIT_NET }
+        << FetchedKey{ok: false, exit_code: ec, err_code: r.err_code + "", err_msg: r.err_msg + "", agent_id: agent_id + "", status: "", key_version: 0, pub_pem: "", pk: dummy_pk, raw_json: "", self_sig_valid: false}
+    }
+    doc := json.parse(&r.body)
+    if !doc.ok() {
+        << FetchedKey{ok: false, exit_code: EXIT_CRYPTO, err_code: "ERR_CRYPTO", err_msg: "invalid identity json", agent_id: agent_id + "", status: "", key_version: 0, pub_pem: "", pk: dummy_pk, raw_json: r.body + "", self_sig_valid: false}
+    }
+    rt := doc.root()
+    pem_s := json_str_or(&doc, doc.get(rt, "current_public_key_pem"), "")
+    pk := decode_spki_public_pem(&pem_s) or (err) {
+        << FetchedKey{ok: false, exit_code: EXIT_CRYPTO, err_code: "ERR_CRYPTO", err_msg: err.msg(), agent_id: agent_id + "", status: "", key_version: 0, pub_pem: pem_s + "", pk: dummy_pk, raw_json: r.body + "", self_sig_valid: false}
+    }
+    status := json_str_or(&doc, doc.get(rt, "status"), "active")
+    kv := json_int_or(&doc, doc.get(rt, "key_version"), 1)
+    << FetchedKey{ok: true, exit_code: 0, err_code: "", err_msg: "", agent_id: agent_id + "", status: status, key_version: kv, pub_pem: pem_s + "", pk: pk, raw_json: r.body + "", self_sig_valid: true}
+}
+
+pub struct SseConn {
+    pub is_tls bool
+    pub conn net.Conn
+    pub tc tls.Conn
+    pub buf string
+    pub eof bool
+}
+
+pub struct SseEvent {
+    pub ok bool
+    pub eof bool
+    pub event_type string
+    pub data string
+}
+
+fn dial_port_addr(host string, https bool) string {
+    if strings.contains(&host, ":") { << host }
+    if https { << host + ":443" }
+    << host + ":80"
+}
+
+fn strip_port(host string) string {
+    for i in 0:host.len {
+        if (host[i] & 255) == 58 { << host[0:i] }
+    }
+    << host + ""
+}
+
+fn tc_write(tc $&tls.Conn, data &string) int { << tc.write(data) or >> }
+fn nc_write(c $&net.Conn, data &string) int { << c.write(data) or >> }
+fn tc_read(tc $&tls.Conn, n int) string { << tc.read(n) or >> }
+fn nc_read(c $&net.Conn, n int) string { << c.read(n) or >> }
+fn tc_close(tc $&tls.Conn) { tc.close() or (err) { << } }
+fn nc_close(c $&net.Conn) { c.close() or (err) { << } }
+
+fn sse_write_all(sc $&SseConn, data &string) int {
+    if sc.is_tls {
+        << tc_write($&sc.tc, data) or >>
+    }
+    << nc_write($&sc.conn, data) or >>
+}
+
+fn sse_read_chunk(sc $&SseConn) string {
+    if sc.is_tls {
+        << tc_read($&sc.tc, 8192) or >>
+    }
+    << nc_read($&sc.conn, 8192) or >>
+}
+
+pub fn sse_close(sc $&SseConn) {
+    if sc.is_tls {
+        tc_close($&sc.tc)
+        <<
+    }
+    nc_close($&sc.conn)
+}
+
+fn sse_read_line(sc $&SseConn) string {
+    while true {
+        idx := strings.index_of(&sc.buf, "\n")
+        if idx >= 0 {
+            $ln := sc.buf[0:idx]
+            if idx + 1 < sc.buf.len {
+                sc.buf = sc.buf[(idx + 1):sc.buf.len]
+            } else {
+                sc.buf = ""
+            }
+            if ln.len > 0 && (ln[ln.len - 1] & 255) == 13 {
+                ln = ln[0:(ln.len - 1)]
+            }
+            << ln
+        }
+        chunk := sse_read_chunk(sc) or (err) {
+            sc.eof = true
+            rem := sc.buf + ""
+            sc.buf = ""
+            << rem
+        }
+        if chunk.len == 0 {
+            sc.eof = true
+            rem := sc.buf + ""
+            sc.buf = ""
+            << rem
+        }
+        sc.buf = sc.buf + chunk
+    }
+    << ""
+}
+
+pub fn sse_connect(api_base string, agent_id string, priv &rsa.PrivateKey, path_and_query string) SseConn {
+    full := api_base + path_and_query
+    $u := url.new_url()
+    u.parse(full) or >>
+    scheme := u.scheme()
+    https := scheme == "https"
+    host := u.host()
+    addr := dial_port_addr(host + "", https)
+    sni := strip_port(host + "")
+
+    $sc := SseConn{
+        is_tls: https,
+        conn: net.closed_conn(),
+        tc: tls.closed_conn(),
+        buf: "",
+        eof: false
+    }
+    if https {
+        cfg := tls.new_config(sni)
+        sc.tc = tls.dial("tcp", addr, &cfg) or >>
+    } else {
+        sc.conn = net.dial_to("tcp", addr) or >>
+    }
+
+    ts := strconv.itoa(time.now_time().unix())
+    empty := ""
+    sig := sign_http_request(priv, "GET", path_and_query + "", ts + "", &empty) or >>
+    req := "GET " + path_and_query + " HTTP/1.1\r\n" +
+        "Host: " + host + "\r\n" +
+        "Accept: text/event-stream\r\n" +
+        "Cache-Control: no-cache\r\n" +
+        "Connection: close\r\n" +
+        "X-Agent-Id: " + agent_id + "\r\n" +
+        "X-Timestamp: " + ts + "\r\n" +
+        "X-Signature: " + sig + "\r\n\r\n"
+    _ := sse_write_all($&sc, &req) or (err) {
+        sse_close($&sc)
+        >> err
+    }
+
+    status_ln := sse_read_line($&sc)
+    if !strings.contains(&status_ln, " 200 ") {
+        sse_close($&sc)
+        >> errors.new("sse: HTTP error: " + status_ln)
+    }
+    // Consume headers until empty line
+    while !sc.eof {
+        hln := sse_read_line($&sc)
+        if hln.len == 0 { <- }
+    }
+    << sc
+}
+
+pub fn sse_read_event(sc $&SseConn) SseEvent {
+    $ev_type := "message"
+    $data_buf := ""
+    $has_data := false
+    while !sc.eof {
+        ln := sse_read_line(sc)
+        if ln.len == 0 {
+            if has_data {
+                << SseEvent{ok: true, eof: false, event_type: ev_type, data: data_buf}
+            }
+            ev_type = "message"
+            ->
+        }
+        if (ln[0] & 255) == 58 {
+            // SSE comment / heartbeat
+            ->
+        }
+        if strings.has_prefix(&ln, "event:") {
+            rest := ln[6:ln.len]
+            ev_type = strings.trim_space(&rest)
+        } else if strings.has_prefix(&ln, "data:") {
+            rest := ln[5:ln.len]
+            $val := rest
+            if val.len > 0 && (val[0] & 255) == 32 {
+                val = val[1:val.len]
+            }
+            if has_data {
+                data_buf = data_buf + "\n" + val
+            } else {
+                data_buf = val
+                has_data = true
+            }
+        }
+    }
+    if has_data {
+        << SseEvent{ok: true, eof: false, event_type: ev_type, data: data_buf}
+    }
+    << SseEvent{ok: false, eof: true, event_type: "", data: ""}
+}

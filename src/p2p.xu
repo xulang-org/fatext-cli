@@ -1,0 +1,712 @@
+@main
+
+#errors
+#crypto/aes
+#crypto/cipher
+#crypto/ecdh
+#crypto/rand
+#crypto/rsa
+#crypto/sha256
+#encoding/base64
+#encoding/json
+#net
+#os
+#strconv
+#strings
+#time
+
+const P2P_PKT_PUNCH = 1
+const P2P_PKT_ACK = 2
+const P2P_PKT_DATA = 3
+const P2P_PKT_FIN = 4
+
+fn pconn_deadline_q(pconn $&net.PacketConn, dur_ns int) {
+    if dur_ns <= 0 {
+        pconn.set_read_deadline(0) or (err) { << }
+    } else {
+        pconn.set_read_deadline(time.now() + dur_ns) or (err) { << }
+    }
+}
+
+fn pconn_close_q(pconn $&net.PacketConn) {
+    pconn.close() or (err) { << }
+}
+
+fn pconn_write_q(pconn $&net.PacketConn, pkt &string, addr &net.UDPAddr) {
+    _ := pconn.write_to(pkt, addr) or (err) { << }
+}
+
+fn seal_pkt_q(ciph &aes.Cipher, session string, ptype int, seq int, payload &string) string {
+    << p2p_seal_packet(ciph, session, ptype, seq, payload) or (err) { << "" }
+}
+
+fn atoi_or_0(s &string) int {
+    << strconv.atoi(s) or (err) { << 0 }
+}
+
+fn fd_write_q(fd int, s string) {
+    _ := os.fd_write(fd, s) or (err) { << }
+}
+
+fn read_from_or(pconn $&net.PacketConn, n int) net.UDPPacket {
+    << pconn.read_from(n) or (err) { << net.UDPPacket{addr: net.UDPAddr{ip: "", port: 0, zone: ""}, data: ""} }
+}
+
+fn encrypt_dm_or(sender_id string, sender_priv &rsa.PrivateKey, to_id string, to_pk &rsa.PublicKey, to_key_ver int, msg_type string, body_json string, conv_state string, ts int) string {
+    << encrypt_dm_frame(sender_id, sender_priv, to_id, to_pk, to_key_ver, msg_type, body_json, conv_state, ts) or (err) { << "" }
+}
+
+fn net_dial_or(addr string) int {
+    << net.dial(addr) or (err) { << -1 }
+}
+
+fn net_accept_or(lfd int) int {
+    << net.accept(lfd) or (err) { << -1 }
+}
+
+fn gen_sess_or() string {
+    << generate_session_id() or (err) { << "s_0000000000000000" }
+}
+
+fn p2p_log(opts &CliOpts, state string, session string, peer string, extra_json string) {
+    if opts.json_mode {
+        $s := "{\"type\":\"p2p\",\"state\":" + json.quote(&state) + ",\"session\":" + json.quote(&session) + ",\"peer\":" + json.quote(&peer)
+        if extra_json.len > 0 {
+            s = s + "," + extra_json
+        }
+        s = s + "}"
+        eprintln(s)
+    } else {
+        eprintln("p2p [" + state + "] session=" + session + " peer=" + peer)
+    }
+}
+
+fn parse_host_port(hp string) []string {
+    $s := hp + ""
+    if strings.has_prefix(&s, "stun:") {
+        s = s[5:s.len]
+    }
+    $col := -1
+    for i in 0:s.len {
+        if (s[i] & 255) == 58 { col = i }
+    }
+    if col <= 0 || col + 1 >= s.len { << []string{} }
+    << [s[0:col], s[(col + 1):s.len]]
+}
+
+fn udp_addr_from_str(hp string) net.UDPAddr {
+    parts := parse_host_port(hp + "")
+    if parts.len != 2 {
+        >> errors.new("p2p: invalid host:port: " + hp)
+    }
+    port := strconv.atoi(&parts[1]) or >>
+    $ip := net.parse_ip(&parts[0])
+    if ip.len == 0 {
+        ips := net.lookup_ip(parts[0] + "") or >>
+        $found := false
+        for i in 0:ips.len {
+            if ips[i].len == 4 {
+                ip = ips[i] + ""
+                found = true
+                <-
+            }
+        }
+        if !found {
+            >> errors.new("p2p: cannot resolve IPv4 for " + parts[0])
+        }
+    }
+    << net.UDPAddr{ip: ip, port: port, zone: ""}
+}
+
+pub fn stun_discover(pconn &net.PacketConn, stun_hp string) string {
+    if stun_hp.len == 0 || stun_hp == "none" { << "" }
+    raddr := udp_addr_from_str(stun_hp) or (err) { << "" }
+    tx := rand.read(12) or (err) { << "" }
+    // RFC 5389 Binding Request: type=0x0001, len=0x0000, magic=0x2112A442, 12-byte txid
+    $req := [0, 1, 0, 0, 33, 18, 164, 66]
+    for i in 0:12 { req.push(tx[i] & 255) }
+    pkt := string_from_bytes(req)
+    _ := pconn.write_to(&pkt, &raddr) or (err) { << "" }
+    resp := pconn.read_from(2048) or (err) { << "" }
+    d := resp.data + ""
+    if d.len < 20 { << "" }
+    // Verify magic cookie & transaction id
+    if (d[4] & 255) != 33 || (d[5] & 255) != 18 || (d[6] & 255) != 164 || (d[7] & 255) != 66 {
+        << ""
+    }
+    $off := 20
+    while off + 4 <= d.len {
+        atype := ((d[off] & 255) << 8) | (d[off + 1] & 255)
+        alen := ((d[off + 2] & 255) << 8) | (d[off + 3] & 255)
+        off += 4
+        if off + alen > d.len { <- }
+        if (atype == 32 || atype == 1) && alen >= 8 {
+            fam := d[off + 1] & 255
+            if fam == 1 {
+                $xport := ((d[off + 2] & 255) << 8) | (d[off + 3] & 255)
+                $b0 := d[off + 4] & 255
+                $b1 := d[off + 5] & 255
+                $b2 := d[off + 6] & 255
+                $b3 := d[off + 7] & 255
+                if atype == 32 {
+                    xport = xport ^ 8466
+                    b0 = b0 ^ 33
+                    b1 = b1 ^ 18
+                    b2 = b2 ^ 164
+                    b3 = b3 ^ 66
+                }
+                << strconv.itoa(b0) + "." + strconv.itoa(b1) + "." + strconv.itoa(b2) + "." + strconv.itoa(b3) + ":" + strconv.itoa(xport)
+            }
+        }
+        $pad := alen % 4
+        if pad != 0 { pad = 4 - pad }
+        off = off + alen + pad
+    }
+    << ""
+}
+
+fn p2p_derive_key(session string, shared_secret &string) string {
+    << sha256.sum256_bytes("fatext-p2p-v1\n" + session + "\n" + (shared_secret + ""))
+}
+
+fn p2p_seal_packet(ciph &aes.Cipher, session string, ptype int, seq int, payload &string) string {
+    iv := rand.read(12) or >>
+    $hdr := [ptype & 255]
+    $s := seq
+    $sh := 56
+    while sh >= 0 {
+        hdr.push((s >> sh) & 255)
+        sh -= 8
+    }
+    aad := string_from_bytes(hdr) + session
+    ct := cipher.seal_gcm(ciph, &iv, payload, &aad) or >>
+    << string_from_bytes(hdr) + iv + ct
+}
+
+struct P2PPacket {
+    pub ok bool
+    pub ptype int
+    pub seq int
+    pub data string
+}
+
+fn p2p_open_packet(ciph &aes.Cipher, session string, raw &string) P2PPacket {
+    if raw.len < 9 + 12 + 16 {
+        << P2PPacket{ok: false, ptype: 0, seq: 0, data: ""}
+    }
+    ptype := raw[0] & 255
+    $seq := 0
+    for i in 1:9 {
+        seq = (seq << 8) | (raw[i] & 255)
+    }
+    hdr := raw[0:9]
+    iv := raw[9:21]
+    ct := raw[21:raw.len]
+    aad := hdr + session
+    pt := cipher.open_gcm(ciph, &iv, &ct, &aad) or (err) {
+        << P2PPacket{ok: false, ptype: 0, seq: 0, data: ""}
+    }
+    << P2PPacket{ok: true, ptype: ptype, seq: seq, data: pt}
+}
+
+fn local_port_of(pconn &net.PacketConn) int {
+    loc := pconn.local_addr()
+    parts := parse_host_port(loc)
+    if parts.len == 2 {
+        << atoi_or_0(&parts[1])
+    }
+    << 0
+}
+
+fn build_candidates_json(lport int, srflx string) string {
+    $cands := ["{\"t\":\"host\",\"a\":\"127.0.0.1:" + strconv.itoa(lport) + "\"}"]
+    if srflx.len > 0 {
+        cands.push("{\"t\":\"srflx\",\"a\":" + json.quote(&srflx) + "}")
+    }
+    << "[" + strings.join(cands, ",") + "]"
+}
+
+fn extract_candidate_addrs(doc &json.Doc, arr_node int) []net.UDPAddr {
+    $out := []net.UDPAddr{}
+    if !doc.is_list(arr_node) { << out }
+    for i in 0:doc.count(arr_node) {
+        el := doc.at(arr_node, i)
+        if doc.is_dict(el) && doc.has(el, "a") {
+            astr := json_str_or(doc, doc.get(el, "a"), "")
+            addr := udp_addr_from_str(astr + "") or (err) { -> }
+            out.push(addr)
+        }
+    }
+    << out
+}
+
+fn p2p_punch_and_session(
+    opts &CliOpts,
+    pconn $&net.PacketConn,
+    ciph &aes.Cipher,
+    session string,
+    peer_id string,
+    cands &[]net.UDPAddr,
+    is_initiator bool,
+    stdio_mode bool,
+    tcp_fd int
+) int {
+    pconn_deadline_q(pconn, 50000000)
+    $peer_addr := net.UDPAddr{ip: "", port: 0, zone: ""}
+    $connected := false
+    $bytes_in := 0
+    $bytes_out := 0
+    $expected_seq := 1
+    $got_fin := false
+    empty := ""
+    t_start := time.now_time().unix()
+
+    // Hole punching loop up to 10s
+    for round in 0:200 {
+        if time.now_time().unix() - t_start > 10 { <- }
+        punch_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_PUNCH, 0, &empty)
+        if punch_pkt.len > 0 {
+            for i in 0:cands.len {
+                ca := &cands[i]
+                pconn_write_q(pconn, &punch_pkt, ca)
+            }
+        }
+        pconn_deadline_q(pconn, 50000000)
+        upkt := pconn.read_from(4096) or (err) {
+            ->
+        }
+        opened := p2p_open_packet(ciph, session + "", &upkt.data)
+        if opened.ok {
+            peer_addr = net.UDPAddr{ip: upkt.addr.ip + "", port: upkt.addr.port, zone: ""}
+            if opened.ptype == P2P_PKT_PUNCH {
+                ack_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_ACK, 0, &empty)
+                if ack_pkt.len > 0 {
+                    pconn_write_q(pconn, &ack_pkt, &peer_addr)
+                }
+                connected = true
+                <-
+            } else if opened.ptype == P2P_PKT_ACK {
+                connected = true
+                <-
+            } else if opened.ptype == P2P_PKT_DATA {
+                if stdio_mode && !is_initiator && opened.seq >= expected_seq {
+                    bytes_in += opened.data.len
+                    fd_write_q(1, opened.data + "")
+                    expected_seq = opened.seq + 1
+                }
+                connected = true
+                <-
+            } else if opened.ptype == P2P_PKT_FIN {
+                got_fin = true
+                connected = true
+                <-
+            }
+        }
+    }
+    if !connected {
+        p2p_log(opts, "failed", session + "", peer_id + "", "\"reason\":\"punch_timeout\"")
+        << EXIT_P2P
+    }
+    p2p_log(opts, "connected", session + "", peer_id + "", "\"path\":\"direct\"")
+
+    if stdio_mode {
+        if is_initiator {
+            // Brief settle so peer finishes handshake before DATA packets arrive
+            time.sleep(50000000)
+            // Read stdin and stream chunks to peer, then send FIN
+            $seq := 1
+            pconn_deadline_q(pconn, 100000000)
+            while true {
+                chunk := os.fd_read(0, 8192) or (err) { <- }
+                if chunk.len == 0 { <- }
+                bytes_out += chunk.len
+                dpkt := p2p_seal_packet(ciph, session + "", P2P_PKT_DATA, seq, &chunk) or (err) { <- }
+                _ := pconn.write_to(&dpkt, &peer_addr) or (err) { <- }
+                seq += 1
+                time.sleep(1000000)
+            }
+            fin_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_FIN, seq, &empty)
+            if fin_pkt.len > 0 {
+                for r in 0:3 {
+                    pconn_write_q(pconn, &fin_pkt, &peer_addr)
+                }
+            }
+        } else {
+            // Receiver: read UDP packets until FIN or idle timeout after data
+            $idle := 0
+            while !got_fin {
+                pconn_deadline_q(pconn, 500000000)
+                upkt := pconn.read_from(65535) or (err) {
+                    idle += 1
+                    if idle > 10 { <- }
+                    ->
+                }
+                idle = 0
+                opened := p2p_open_packet(ciph, session + "", &upkt.data)
+                if !opened.ok { -> }
+                if opened.ptype == P2P_PKT_PUNCH {
+                    ack_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_ACK, 0, &empty)
+                    if ack_pkt.len > 0 { pconn_write_q(pconn, &ack_pkt, &peer_addr) }
+                    ->
+                }
+                if opened.ptype == P2P_PKT_DATA {
+                    if opened.seq >= expected_seq {
+                        bytes_in += opened.data.len
+                        fd_write_q(1, opened.data + "")
+                        expected_seq = opened.seq + 1
+                    }
+                    ->
+                }
+                if opened.ptype == P2P_PKT_FIN {
+                    <-
+                }
+            }
+        }
+    } else if tcp_fd >= 0 {
+        // Basic bidirectional TCP-over-UDP bridge for --forward / --expose
+        $seq := 1
+        while true {
+            // Poll UDP side
+            pconn_deadline_q(pconn, 50000000)
+            upkt := read_from_or(pconn, 65535)
+            if upkt.data.len > 0 {
+                opened := p2p_open_packet(ciph, session + "", &upkt.data)
+                if opened.ok {
+                    if opened.ptype == P2P_PKT_DATA {
+                        bytes_in += opened.data.len
+                        _ := net.conn_write(tcp_fd, &opened.data) or (err) { <- }
+                    } else if opened.ptype == P2P_PKT_FIN {
+                        <-
+                    }
+                }
+            }
+        }
+    }
+
+    p2p_log(opts, "closed", session + "", peer_id + "", "\"bytes_in\":" + strconv.itoa(bytes_in) + ",\"bytes_out\":" + strconv.itoa(bytes_out))
+    << EXIT_OK
+}
+
+fn check_is_friend(api_base string, timeout_sec int, self_id string, priv &rsa.PrivateKey, peer_id string) bool {
+    empty := ""
+    r := api_call(api_base, timeout_sec, self_id, priv, true, "GET", "/v1/friends", &empty, "")
+    if !r.ok { << false }
+    doc := json.parse(&r.body)
+    if !doc.ok() || !doc.has(doc.root(), "friends") { << false }
+    arr := doc.get(doc.root(), "friends")
+    if !doc.is_list(arr) { << false }
+    for i in 0:doc.count(arr) {
+        el := doc.at(arr, i)
+        if doc.is_string(el) {
+            if json_str_or(&doc, el, "") == peer_id { << true }
+        } else if doc.is_dict(el) && doc.has(el, "agent_id") {
+            if json_str_or(&doc, doc.get(el, "agent_id"), "") == peer_id { << true }
+        }
+    }
+    << false
+}
+
+pub fn cmd_p2p_listen(opts &CliOpts, args []string) int {
+    $friends_only := true
+    $expose_ports := []int{}
+    $stdio_mode := false
+    $stun_hp := "stun.cloudflare.com:3478"
+    $i := 0
+    while i < args.len {
+        a := args[i] + ""
+        if a == "--allow-friends-only" {
+            friends_only = true
+        } else if a == "--allow-anyone" {
+            friends_only = false
+        } else if a == "--stdio" {
+            stdio_mode = true
+        } else if a == "--expose" && i + 1 < args.len {
+            i += 1
+            parts := strings.split(&args[i], ",")
+            for j in 0:parts.len {
+                p := atoi_or_0(&strings.trim_space(&parts[j]))
+                if p > 0 { expose_ports.push(p) }
+            }
+        } else if a == "--stun" && i + 1 < args.len {
+            i += 1
+            stun_hp = args[i] + ""
+        } else {
+            << emit_err(opts, "ERR_USAGE", 0, "unknown p2p listen flag: " + a, 0, EXIT_USAGE)
+        }
+        i += 1
+    }
+
+    cfg := load_config(opts) or (err) {
+        << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+    }
+    priv := load_private_key_checked(cfg.home + "") or (err) {
+        << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+    }
+
+    $sc := sse_connect(cfg.api_base + "", cfg.agent_id + "", &priv, "/v1/stream") or (err) {
+        << emit_err(opts, "ERR_NETWORK", 0, err.msg(), 0, EXIT_NET)
+    }
+    p2p_log(opts, "listening", "", cfg.agent_id + "", "")
+
+    while true {
+        ev := sse_read_event($&sc)
+        if ev.eof { <- }
+        if !ev.ok || ev.event_type != "dm" { -> }
+        d := json.parse(&ev.data)
+        if !d.ok() || !d.has(d.root(), "from") || !d.has(d.root(), "frame") { -> }
+        from_id := json_str_or(&d, d.get(d.root(), "from"), "")
+        frame_json := json_encode_or(&d, d.get(d.root(), "frame"), "")
+
+        fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, from_id + "")
+        dec := decrypt_dm_frame(cfg.agent_id + "", &priv, from_id + "", &fk.pk, fk.ok, &frame_json)
+        if !dec.ok || !dec.verified || dec.msg_type != "p2p_offer" { -> }
+
+        odoc := json.parse(&dec.body_json)
+        if !odoc.ok() { -> }
+        oroot := odoc.root()
+        sess := json_str_or(&odoc, odoc.get(oroot, "session"), "")
+        exp := json_int_or(&odoc, odoc.get(oroot, "expires_at"), 0)
+        now := time.now_time().unix()
+        if exp > 0 && now > exp { -> }
+
+        mode := json_str_or(&odoc, odoc.get(oroot, "mode"), "stdio")
+        rport := json_int_or(&odoc, odoc.get(oroot, "remote_port"), 0)
+        xpub_b64 := json_str_or(&odoc, odoc.get(oroot, "x25519_pub"), "")
+        cands := extract_candidate_addrs(&odoc, odoc.get(oroot, "candidates"))
+
+        $accept := true
+        $reason := ""
+        if friends_only && !check_is_friend(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, from_id + "") {
+            accept = false
+            reason = "not_friend"
+        }
+        if accept && mode == "forward" {
+            $allowed := false
+            for j in 0:expose_ports.len {
+                if expose_ports[j] == rport { allowed = true }
+            }
+            if !allowed {
+                accept = false
+                reason = "port_not_exposed"
+            }
+        }
+        if !accept {
+            ans_rej := "{\"session\":" + json.quote(&sess) + ",\"accept\":false,\"reason\":" + json.quote(&reason) + "}"
+            rej_frame := encrypt_dm_or(cfg.agent_id + "", &priv, from_id + "", &fk.pk, fk.key_version, "p2p_answer", ans_rej, "open", now)
+            if rej_frame.len > 0 {
+                _ := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/dm/" + from_id, &rej_frame, "")
+            }
+            ->
+        }
+
+        $pconn := net.listen_packet("udp4", "0.0.0.0:0") or (err) {
+            sse_close($&sc)
+            << emit_err(opts, "ERR_P2P", 0, err.msg(), 0, EXIT_P2P)
+        }
+        lport := local_port_of(&pconn)
+        pconn_deadline_q($&pconn, 1500000000)
+        srflx := stun_discover(&pconn, stun_hp + "")
+
+        xpriv := ecdh.generate_key(ecdh.x25519()) or (err) {
+            pconn_close_q($&pconn)
+            sse_close($&sc)
+            << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+        }
+        xpub_bytes := xpriv.public_key().bytes()
+        my_xpub_b64 := base64.encode_to_string(xpub_bytes)
+
+        peer_xpub_raw := base64.decode_string(xpub_b64) or (err) {
+            pconn_close_q($&pconn)
+            ->
+        }
+        peer_xpub := ecdh.new_public_key(ecdh.x25519(), &peer_xpub_raw) or (err) {
+            pconn_close_q($&pconn)
+            ->
+        }
+        shared := xpriv.ecdh(&peer_xpub) or (err) {
+            pconn_close_q($&pconn)
+            ->
+        }
+        sess_key := p2p_derive_key(sess + "", &shared)
+        ciph := aes.new_cipher(&sess_key) or (err) {
+            pconn_close_q($&pconn)
+            ->
+        }
+
+        cands_json := build_candidates_json(lport, srflx)
+        ans_body := "{\"session\":" + json.quote(&sess) + ",\"accept\":true,\"candidates\":" + cands_json + ",\"x25519_pub\":" + json.quote(&my_xpub_b64) + "}"
+        ans_frame := encrypt_dm_or(cfg.agent_id + "", &priv, from_id + "", &fk.pk, fk.key_version, "p2p_answer", ans_body, "open", now)
+        _ := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/dm/" + (from_id + ""), &ans_frame, "")
+        p2p_log(opts, "offer_accepted", sess + "", from_id + "", "")
+
+        sse_close($&sc)
+        $tcp_fd := -1
+        if mode == "forward" && !stdio_mode {
+            tcp_fd = net_dial_or("127.0.0.1:" + strconv.itoa(rport))
+        }
+        rc := p2p_punch_and_session(opts, $&pconn, &ciph, sess + "", from_id + "", &cands, false, stdio_mode || mode == "stdio", tcp_fd)
+        pconn_close_q($&pconn)
+        << rc
+    }
+    sse_close($&sc)
+    << EXIT_OK
+}
+
+pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
+    if args.len < 1 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p connect <agent_id> [--forward L:R] [--relay URL] [--stun HOST:PORT]", 0, EXIT_USAGE)
+    }
+    peer_id := args[0] + ""
+    if !is_valid_agent_id(peer_id + "") {
+        << emit_err(opts, "ERR_USAGE", 0, "invalid peer agent_id: " + peer_id, 0, EXIT_USAGE)
+    }
+    $lport_fwd := 0
+    $rport_fwd := 0
+    $forward_mode := false
+    $stun_hp := "stun.cloudflare.com:3478"
+    $i := 1
+    while i < args.len {
+        a := args[i] + ""
+        if a == "--forward" && i + 1 < args.len {
+            i += 1
+            ps := strings.split(&args[i], ":")
+            if ps.len != 2 {
+                << emit_err(opts, "ERR_USAGE", 0, "--forward requires <local_port>:<remote_port>", 0, EXIT_USAGE)
+            }
+            lport_fwd = parse_int_or(&ps[0], 0)
+            rport_fwd = parse_int_or(&ps[1], 0)
+            if lport_fwd <= 0 || rport_fwd <= 0 {
+                << emit_err(opts, "ERR_USAGE", 0, "invalid --forward ports", 0, EXIT_USAGE)
+            }
+            forward_mode = true
+        } else if a == "--stun" && i + 1 < args.len {
+            i += 1
+            stun_hp = args[i] + ""
+        } else if a == "--relay" && i + 1 < args.len {
+            i += 1
+        } else {
+            << emit_err(opts, "ERR_USAGE", 0, "unknown p2p connect flag: " + a, 0, EXIT_USAGE)
+        }
+        i += 1
+    }
+
+    cfg := load_config(opts) or (err) {
+        << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+    }
+    priv := load_private_key_checked(cfg.home + "") or (err) {
+        << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+    }
+    fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, peer_id + "")
+    if !fk.ok {
+        << emit_err(opts, fk.err_code + "", 0, fk.err_msg + "", 0, fk.exit_code)
+    }
+
+    $sc := sse_connect(cfg.api_base + "", cfg.agent_id + "", &priv, "/v1/stream") or (err) {
+        << emit_err(opts, "ERR_NETWORK", 0, err.msg(), 0, EXIT_NET)
+    }
+    $pconn := net.listen_packet("udp4", "0.0.0.0:0") or (err) {
+        sse_close($&sc)
+        << emit_err(opts, "ERR_P2P", 0, err.msg(), 0, EXIT_P2P)
+    }
+    lport := local_port_of(&pconn)
+    pconn_deadline_q($&pconn, 1500000000)
+    srflx := stun_discover(&pconn, stun_hp + "")
+
+    xpriv := ecdh.generate_key(ecdh.x25519()) or (err) {
+        pconn_close_q($&pconn)
+        sse_close($&sc)
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+    xpub_b64 := base64.encode_to_string(xpriv.public_key().bytes())
+    sess := gen_sess_or()
+    now := time.now_time().unix()
+    $mode_s := "stdio"
+    if forward_mode { mode_s = "forward" }
+    cands_json := build_candidates_json(lport, srflx)
+    offer_body := "{\"session\":" + json.quote(&sess) +
+        ",\"candidates\":" + cands_json +
+        ",\"x25519_pub\":" + json.quote(&xpub_b64) +
+        ",\"mode\":" + json.quote(&mode_s) +
+        ",\"remote_port\":" + strconv.itoa(rport_fwd) +
+        ",\"relay\":false,\"expires_at\":" + strconv.itoa(now + 60) + "}"
+
+    offer_frame := encrypt_dm_frame(cfg.agent_id + "", &priv, peer_id + "", &fk.pk, fk.key_version, "p2p_offer", offer_body, "open", now) or (err) {
+        pconn_close_q($&pconn)
+        sse_close($&sc)
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+    dm_r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/dm/" + (peer_id + ""), &offer_frame, "")
+    if !dm_r.ok {
+        pconn_close_q($&pconn)
+        sse_close($&sc)
+        << emit_err(opts, dm_r.err_code + "", dm_r.status, dm_r.err_msg + "", dm_r.retry_after, map_http_exit_code(dm_r.status, dm_r.err_code + ""))
+    }
+    p2p_log(opts, "offer_sent", sess + "", peer_id + "", "")
+
+    // Wait for matching p2p_answer over SSE
+    $peer_cands := []net.UDPAddr{}
+    $peer_xpub_b64 := ""
+    $got_answer := false
+    while true {
+        ev := sse_read_event($&sc)
+        if ev.eof { <- }
+        if !ev.ok || ev.event_type != "dm" { -> }
+        d := json.parse(&ev.data)
+        if !d.ok() || !d.has(d.root(), "from") || !d.has(d.root(), "frame") { -> }
+        from_id := json_str_or(&d, d.get(d.root(), "from"), "")
+        if from_id != peer_id { -> }
+        frame_json := json_encode_or(&d, d.get(d.root(), "frame"), "")
+        dec := decrypt_dm_frame(cfg.agent_id + "", &priv, peer_id + "", &fk.pk, true, &frame_json)
+        if !dec.ok || !dec.verified || dec.msg_type != "p2p_answer" { -> }
+        ad := json.parse(&dec.body_json)
+        if !ad.ok() { -> }
+        ar := ad.root()
+        if json_str_or(&ad, ad.get(ar, "session"), "") != sess { -> }
+        acc := json_bool_or(&ad, ad.get(ar, "accept"), false)
+        if !acc {
+            rsn := json_str_or(&ad, ad.get(ar, "reason"), "rejected")
+            pconn_close_q($&pconn)
+            sse_close($&sc)
+            << emit_err(opts, "ERR_P2P_REJECTED", 0, "peer rejected offer: " + rsn, 0, EXIT_P2P)
+        }
+        peer_cands = extract_candidate_addrs(&ad, ad.get(ar, "candidates"))
+        peer_xpub_b64 = json_str_or(&ad, ad.get(ar, "x25519_pub"), "")
+        got_answer = true
+        <-
+    }
+    sse_close($&sc)
+    if !got_answer || peer_cands.len == 0 || peer_xpub_b64.len == 0 {
+        pconn_close_q($&pconn)
+        << emit_err(opts, "ERR_P2P", 0, "no valid p2p_answer received", 0, EXIT_P2P)
+    }
+
+    px_raw := base64.decode_string(peer_xpub_b64) or (err) {
+        pconn_close_q($&pconn)
+        << emit_err(opts, "ERR_CRYPTO", 0, "invalid peer x25519 key", 0, EXIT_CRYPTO)
+    }
+    px := ecdh.new_public_key(ecdh.x25519(), &px_raw) or (err) {
+        pconn_close_q($&pconn)
+        << emit_err(opts, "ERR_CRYPTO", 0, "invalid peer x25519 key", 0, EXIT_CRYPTO)
+    }
+    shared := xpriv.ecdh(&px) or (err) {
+        pconn_close_q($&pconn)
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+    sess_key := p2p_derive_key(sess + "", &shared)
+    ciph := aes.new_cipher(&sess_key) or (err) {
+        pconn_close_q($&pconn)
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+
+    $tcp_fd := -1
+    if forward_mode {
+        lfd := net.listen("127.0.0.1:" + strconv.itoa(lport_fwd)) or (err) {
+            pconn_close_q($&pconn)
+            << emit_err(opts, "ERR_P2P", 0, err.msg(), 0, EXIT_P2P)
+        }
+        tcp_fd = net_accept_or(lfd)
+    }
+    rc := p2p_punch_and_session(opts, $&pconn, &ciph, sess + "", peer_id + "", &peer_cands, true, !forward_mode, tcp_fd)
+    pconn_close_q($&pconn)
+    << rc
+}

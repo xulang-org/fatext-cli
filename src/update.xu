@@ -202,6 +202,30 @@ fn supported_platform(platform &string) bool {
     << p == "macos-arm64" || p == "macos-x64" || p == "linux-x64" || p == "linux-arm64" || p == "windows-x64" || p == "windows-arm64"
 }
 
+fn detect_host_platform() string {
+    bt := strings.replace_all(&BUILD_TARGET, "/", "-")
+    if supported_platform(&bt) {
+        << bt
+    }
+    $os_part := "linux"
+    t := xu_target_os()
+    if t == 0 { os_part = "macos" }
+    else if t == 2 { os_part = "windows" }
+
+    $raw_arch := ""
+    if t == 2 {
+        raw_arch = strings.to_lower(&os.getenv("PROCESSOR_ARCHITECTURE"))
+    } else {
+        $cmd := exec.command("uname", "-m")
+        raw_arch = strings.to_lower(&strings.trim_space(&(cmd.output() or (err) { << "" })))
+    }
+    $arch_part := "x64"
+    if raw_arch == "arm64" || raw_arch == "aarch64" {
+        arch_part = "arm64"
+    }
+    << os_part + "-" + arch_part
+}
+
 fn entry_path(dest &string, name &string) string {
     if name.len == 0 || name[0] == 47 || name[0] == 92 {
         >> errors.new("unsafe archive path")
@@ -591,7 +615,7 @@ pub fn cmd_update(opts &CliOpts, args []string) int {
         }
     }
 
-    platform := strings.replace_all(&BUILD_TARGET, "/", "-")
+    platform := detect_host_platform()
     if !supported_platform(&platform) {
         << emit_err(opts, "ERR_ERR", 0, "unsupported host platform (" + platform + ")", 0, EXIT_ERR)
     }
@@ -633,6 +657,7 @@ pub fn cmd_update(opts &CliOpts, args []string) int {
     eff_api := cfg_opt.api_base + ""
 
     $target_version := req_version + ""
+    $min_v := ""
     if target_version.len == 0 {
         disc := fetch_latest_cli_discovery(opts, &eff_api)
         if !disc.ok {
@@ -642,27 +667,38 @@ pub fn cmd_update(opts &CliOpts, args []string) int {
             ec := map_http_exit_code(disc.http_status, disc.err_code)
             << emit_err(opts, disc.err_code, disc.http_status, disc.err_msg, 0, ec)
         }
+        min_v = disc.min_version + ""
         target_version = validate_release_semver(&disc.latest_version) or (err) {
             << emit_err(opts, "ERR_ERR", 0, err.msg(), 0, EXIT_ERR)
         }
     }
 
     cmp := semver_cmp(&target_version, &CLI_VERSION)
+    unsupported := min_v.len > 0 && semver_lt(&CLI_VERSION, &min_v)
     if check_only {
         $status := "up_to_date"
-        if cmp > 0 { status = "update_available" }
+        $exit_c := EXIT_OK
+        if unsupported {
+            status = "unsupported"
+            exit_c = EXIT_ERR
+        } else if cmp > 0 {
+            status = "update_available"
+        }
         if opts.json_mode {
-            println("{\"ok\":true,\"current_version\":" + json.quote(&CLI_VERSION) + ",\"latest_version\":" + json.quote(&target_version) + ",\"platform\":" + json.quote(&platform) + ",\"status\":" + json.quote(&status) + "}")
+            println("{\"ok\":true,\"current_version\":" + json.quote(&CLI_VERSION) + ",\"min_version\":" + json.quote(&min_v) + ",\"latest_version\":" + json.quote(&target_version) + ",\"platform\":" + json.quote(&platform) + ",\"status\":" + json.quote(&status) + "}")
         } else {
             println("fatext update: current version: " + CLI_VERSION + " (" + platform + ")")
             println("fatext update: latest version:  " + target_version)
-            if cmp > 0 {
+            if min_v.len > 0 { println("fatext update: minimum version: " + min_v) }
+            if unsupported {
+                println("fatext update: CURRENT VERSION IS UNSUPPORTED (below " + min_v + ")! Run 'fatext update' immediately.")
+            } else if cmp > 0 {
                 println("fatext update: update available! Run 'fatext update' to upgrade.")
             } else {
                 println("fatext update: already up to date.")
             }
         }
-        << EXIT_OK
+        << exit_c
     }
 
     if cmp <= 0 && !force && req_prefix.len == 0 {

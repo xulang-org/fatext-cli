@@ -75,6 +75,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="Verify files match VERSION without modifying them")
     ap.add_argument("--tag", default="", help="Optional git tag (e.g. v1.0.0) to assert against VERSION")
+    ap.add_argument("--stamp", action="store_true", help="Stamp git commit and host target into src/version.xu (default: keep dev in local builds)")
     args = ap.parse_args()
 
     ver = read_version()
@@ -98,8 +99,17 @@ def main():
         print(f"version-check ok: {ver}")
         return
 
-    commit = git_short_commit()
-    target = detect_target()
+    should_stamp = args.stamp or bool(
+        os.environ.get("CI")
+        or os.environ.get("GITHUB_ACTIONS")
+        or os.environ.get("FATEXT_BUILD_TARGET", "").strip()
+    )
+    if should_stamp:
+        commit = git_short_commit()
+        target = detect_target()
+    else:
+        commit = "dev"
+        target = "dev"
     want_vxu = expected_version_xu(ver, commit, target)
 
     with open(XUN_FILE, "w", encoding="utf-8") as f:

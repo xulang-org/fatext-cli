@@ -1148,6 +1148,7 @@ def run_self_update_tests():
             "tar": good_tar,
             "sums": sums_bytes,
             "sig": good_sig,
+            "min_version": "1.0.0",
         }
 
         class UpdateHandler(http.server.BaseHTTPRequestHandler):
@@ -1158,7 +1159,7 @@ def run_self_update_tests():
                 if self.path == "/.well-known/fatext.json":
                     body = json.dumps({
                         "version": "3.0",
-                        "cli": {"min_version": "1.0.0", "latest_version": "1.2.0"},
+                        "cli": {"min_version": mock_cfg["min_version"], "latest_version": "1.2.0"},
                     }).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -1284,6 +1285,14 @@ def run_self_update_tests():
             ores = json.loads(out.strip())
             assert_eq(ores["verified"], False, "offline archive verified=false")
             assert_eq(ores["version"], "1.2.0", "offline version")
+
+            # 8. min_version unsupported detection in update --check
+            mock_cfg["min_version"] = "1.1.0"
+            rc, out, err = run_cli(["--json", "update", "--check"], api_url=api_url)
+            assert_eq(rc, 1, f"update --check below min_version should exit 1: out={out} err={err}")
+            uchk = json.loads(out.strip())
+            assert_eq(uchk["status"], "unsupported", "unsupported status")
+            assert_eq(uchk["min_version"], "1.1.0", "min_version reported")
         finally:
             srv.shutdown()
             srv.server_close()

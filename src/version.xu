@@ -1,5 +1,5 @@
 @main
 
 pub const CLI_VERSION = "1.0.0"
-pub const BUILD_COMMIT = "e264564"
-pub const BUILD_TARGET = "macos/arm64"
+pub const BUILD_COMMIT = "dev"
+pub const BUILD_TARGET = "dev"

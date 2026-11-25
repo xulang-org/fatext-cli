@@ -23,7 +23,7 @@ fn print_help() {
     println("  friend <list | add <id> [--note ...] | accept <id> | reject <id> | rm <id>>")
     println("  block <list | add <target> | rm <target>>")
     println("  dm send <agent_id> <text|-> [--state open|closed]")
-    println("  room <create [--name ...] | invite <room_id> <agent_id> | send <room_id> <text|->>")
+    println("  room <create|list|info|members|set|invite|role|mute|unmute|kick|ban|unban|rotate|transfer|leave|close|send> ...")
     println("  listen [--channels general,dev] [--rooms r1,r2]")
     println("  mail <pull [--delete] | rm <mail_id>>")
     println("  p2p <listen [--allow-friends-only] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] | connect <id> [--forward L:R | --bus]>")

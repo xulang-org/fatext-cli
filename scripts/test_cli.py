@@ -474,6 +474,28 @@ class RelayState:
         self.streams = {}      # id -> list[queue.Queue]
         self.mail = {}         # id -> list[dict]
         self.rotations = []    # recorded key rotations for assertions
+        self.rooms = {}        # room_id -> dict
+
+    def room_json(self, room: dict, viewer_id: str) -> dict:
+        return {
+            "room_id": room["room_id"],
+            "name": room["name"],
+            "topic": room["topic"],
+            "owner_id": room["owner_id"],
+            "controller_id": room["controller_id"],
+            "epoch": room["epoch"],
+            "status": room["status"],
+            "send_policy": room["send_policy"],
+            "invite_policy": room["invite_policy"],
+            "join_policy": room["join_policy"],
+            "max_members": room["max_members"],
+            "slow_mode_sec": room["slow_mode_sec"],
+            "locked": room["locked"],
+            "your_role": next((m["role"] for m in room["members"] if m["agent_id"] == viewer_id), ""),
+            "member_count": len(room["members"]),
+            "members": list(room["members"]),
+            "banned": list(room["banned"]),
+        }
 
     def next_agent_id(self) -> str:
         with self.lock:
@@ -648,6 +670,40 @@ def make_relay_handler(state: RelayState):
                             lst.remove(q)
                 return
 
+            if p == "/v1/rooms":
+                ag, err = self._verify_auth("GET", self.path, b"")
+                if err:
+                    self._send_json(401, {"error": {"code": err, "message": err}})
+                    return
+                aid = ag["agent_id"]
+                with state.lock:
+                    rms = [
+                        state.room_json(r, aid)
+                        for r in state.rooms.values()
+                        if r["status"] == "active" and any(m["agent_id"] == aid for m in r["members"])
+                    ]
+                self._send_json(200, {"ok": True, "rooms": rms})
+                return
+
+            if p.startswith("/v1/rooms/") and p.count("/") == 3:
+                ag, err = self._verify_auth("GET", self.path, b"")
+                if err:
+                    self._send_json(401, {"error": {"code": err, "message": err}})
+                    return
+                rid = p[len("/v1/rooms/"):]
+                aid = ag["agent_id"]
+                with state.lock:
+                    r = state.rooms.get(rid)
+                    if not r:
+                        self._send_json(404, {"error": {"code": "ERR_NOT_FOUND", "message": "not found"}})
+                        return
+                    if not any(m["agent_id"] == aid for m in r["members"]):
+                        self._send_json(403, {"error": {"code": "ERR_FORBIDDEN", "message": "not a member"}})
+                        return
+                    out = state.room_json(r, aid)
+                self._send_json(200, {"ok": True, "room": out})
+                return
+
             self._send_json(404, {"error": {"code": "ERR_NOT_FOUND", "message": p}})
 
         def do_POST(self):
@@ -764,16 +820,135 @@ def make_relay_handler(state: RelayState):
                 self._send_json(202, {"ok": True, "delivered": True})
                 return
 
-            if p.startswith("/v1/rooms/") and p.endswith("/send"):
-                rid = p[len("/v1/rooms/"):-len("/send")]
+            if p == "/v1/rooms":
+                rid = doc.get("room_id", "")
                 with state.lock:
-                    targets = list(state.streams.keys())
-                for t in targets:
-                    if t != aid:
-                        state.push_sse(t, "room", {"room_id": rid, "from": aid, "frame": doc})
-                self._send_json(202, {"ok": True, "room_id": rid})
+                    r = {
+                        "room_id": rid,
+                        "name": doc.get("name", ""),
+                        "topic": doc.get("topic", ""),
+                        "owner_id": aid,
+                        "controller_id": aid,
+                        "epoch": 1,
+                        "status": "active",
+                        "send_policy": doc.get("send_policy", "all"),
+                        "invite_policy": doc.get("invite_policy", "admins"),
+                        "join_policy": doc.get("join_policy", "invite_only"),
+                        "max_members": int(doc.get("max_members", 64)),
+                        "slow_mode_sec": int(doc.get("slow_mode_sec", 0)),
+                        "locked": bool(doc.get("locked", False)),
+                        "members": [{"agent_id": aid, "role": "owner", "muted": False, "joined_at": int(time.time())}],
+                        "banned": [],
+                    }
+                    state.rooms[rid] = r
+                    out = state.room_json(r, aid)
+                self._send_json(201, {"ok": True, "room": out})
                 return
 
+            if p.startswith("/v1/rooms/"):
+                parts = p[len("/v1/rooms/"):].split("/")
+                rid = parts[0]
+                if len(parts) == 2 and parts[1] == "send":
+                    with state.lock:
+                        r = state.rooms.get(rid)
+                        targets = [m["agent_id"] for m in r["members"]] if r else list(state.streams.keys())
+                    for t in targets:
+                        if t != aid:
+                            state.push_sse(t, "room", {"room_id": rid, "from": aid, "frame": doc})
+                    self._send_json(202, {"ok": True, "room_id": rid})
+                    return
+                if len(parts) == 2 and parts[1] == "members":
+                    tid = doc["agent_id"]
+                    role = doc.get("role", "member")
+                    with state.lock:
+                        r = state.rooms[rid]
+                        r["members"].append({"agent_id": tid, "role": role, "muted": False, "joined_at": int(time.time())})
+                        ep = r["epoch"]
+                        mc = len(r["members"])
+                    if "invite_frame" in doc:
+                        state.push_sse(tid, "dm", {"from": aid, "frame": doc["invite_frame"]})
+                    self._send_json(200, {"ok": True, "room_id": rid, "agent_id": tid, "role": role, "epoch": ep, "member_count": mc, "delivered": "sse"})
+                    return
+                if len(parts) == 2 and parts[1] == "rekey":
+                    with state.lock:
+                        r = state.rooms[rid]
+                        if doc.get("bump_epoch"):
+                            r["epoch"] += 1
+                        if int(doc.get("epoch", 0)) > r["epoch"]:
+                            r["epoch"] = int(doc["epoch"])
+                        ep = r["epoch"]
+                    for env in doc.get("envelopes", []):
+                        state.push_sse(env["to"], "dm", {"from": aid, "frame": env["frame"]})
+                    self._send_json(200, {"ok": True, "room_id": rid, "epoch": ep, "delivered": len(doc.get("envelopes", []))})
+                    return
+                if len(parts) == 2 and parts[1] == "transfer":
+                    tid = doc["agent_id"]
+                    with state.lock:
+                        r = state.rooms[rid]
+                        for m in r["members"]:
+                            if m["agent_id"] == aid:
+                                m["role"] = "admin"
+                            elif m["agent_id"] == tid:
+                                m["role"] = "owner"
+                        r["owner_id"] = tid
+                    self._send_json(200, {"ok": True, "room_id": rid, "owner_id": tid})
+                    return
+                if len(parts) == 2 and parts[1] == "leave":
+                    with state.lock:
+                        r = state.rooms[rid]
+                        r["members"] = [m for m in r["members"] if m["agent_id"] != aid]
+                    self._send_json(200, {"ok": True, "room_id": rid, "left": True})
+                    return
+                if len(parts) == 4 and parts[1] == "members" and parts[3] in ("kick", "ban"):
+                    tid = parts[2]
+                    act = parts[3]
+                    with state.lock:
+                        r = state.rooms[rid]
+                        r["members"] = [m for m in r["members"] if m["agent_id"] != tid]
+                        if act == "ban" and tid not in r["banned"]:
+                            r["banned"].append(tid)
+                        if doc.get("rotate_epoch", True):
+                            r["epoch"] += 1
+                        ep = r["epoch"]
+                        rem = [m["agent_id"] for m in r["members"]]
+                    self._send_json(200, {"ok": True, "room_id": rid, "target": tid, "action": act, "epoch": ep, "remaining_members": rem})
+                    return
+
+            self._send_json(404, {"error": {"code": "ERR_NOT_FOUND", "message": p}})
+
+        def do_PATCH(self):
+            body = self._read_body()
+            p = urllib.parse.urlparse(self.path).path
+            ag, err = self._verify_auth("PATCH", self.path, body)
+            if err:
+                self._send_json(401, {"error": {"code": err, "message": err}})
+                return
+            aid = ag["agent_id"]
+            doc = json.loads(body.decode("utf-8")) if body else {}
+            if p.startswith("/v1/rooms/"):
+                parts = p[len("/v1/rooms/"):].split("/")
+                rid = parts[0]
+                if len(parts) == 1:
+                    with state.lock:
+                        r = state.rooms[rid]
+                        for k in ("name", "topic", "send_policy", "invite_policy", "join_policy", "max_members", "slow_mode_sec", "locked"):
+                            if k in doc:
+                                r[k] = doc[k]
+                        out = state.room_json(r, aid)
+                    self._send_json(200, {"ok": True, "room": out})
+                    return
+                if len(parts) == 3 and parts[1] == "members":
+                    tid = parts[2]
+                    with state.lock:
+                        r = state.rooms[rid]
+                        m = next(x for x in r["members"] if x["agent_id"] == tid)
+                        if "role" in doc:
+                            m["role"] = doc["role"]
+                        if "muted" in doc:
+                            m["muted"] = bool(doc["muted"])
+                        res = {"ok": True, "room_id": rid, "agent_id": tid, "role": m["role"], "muted": m["muted"]}
+                    self._send_json(200, res)
+                    return
             self._send_json(404, {"error": {"code": "ERR_NOT_FOUND", "message": p}})
 
         def do_DELETE(self):
@@ -804,6 +979,23 @@ def make_relay_handler(state: RelayState):
                     state.mail[aid] = [m for m in state.mail.get(aid, []) if m["mail_id"] != mid]
                 self._send_json(200, {"ok": True, "deleted": mid})
                 return
+            if p.startswith("/v1/rooms/"):
+                parts = p[len("/v1/rooms/"):].split("/")
+                rid = parts[0]
+                if len(parts) == 3 and parts[1] == "bans":
+                    tid = parts[2]
+                    with state.lock:
+                        r = state.rooms[rid]
+                        if tid in r["banned"]:
+                            r["banned"].remove(tid)
+                    self._send_json(200, {"ok": True, "room_id": rid, "unbanned": tid})
+                    return
+                if len(parts) == 1:
+                    with state.lock:
+                        state.rooms[rid]["status"] = "closed"
+                    self._send_json(200, {"ok": True, "room_id": rid, "status": "closed"})
+                    return
+
             self._send_json(404, {"error": {"code": "ERR_NOT_FOUND", "message": p}})
 
     return Handler
@@ -938,6 +1130,30 @@ def run_suite_b():
             assert_eq(evs[1]["text"], "hello room encrypted", "room decrypted text")
             assert_eq(evs[1]["verified"], True, "room sender sig verified")
             assert_true(os.path.isfile(os.path.join(home_b, "rooms", f"{room_id}.json")), "B saved room file")
+
+            rc, out, err = run_cli(["--json", "room", "list"], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"room list: {err}")
+            assert_true(any(x["room_id"] == room_id for x in json.loads(out.strip())["rooms"]), "room in list")
+            rc, out, err = run_cli(["--json", "room", "info", room_id], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"room info: {err}")
+            rc, out, err = run_cli(["--json", "room", "set", room_id, "--topic", "mock topic"], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"room set: {err}")
+            assert_eq(json.loads(out.strip())["room"]["topic"], "mock topic", "room topic updated")
+            rc, _, err = run_cli(["--json", "room", "role", room_id, aid_b, "admin"], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"room role: {err}")
+            rc, _, err = run_cli(["--json", "room", "mute", room_id, aid_b], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"room mute: {err}")
+            rc, _, err = run_cli(["--json", "room", "unmute", room_id, aid_b], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"room unmute: {err}")
+            rc, out, err = run_cli(["--json", "room", "rotate", room_id], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"room rotate: {err}")
+            assert_eq(json.loads(out.strip())["epoch"], 2, "room rotate epoch=2")
+            rc, _, err = run_cli(["--json", "room", "leave", room_id], env_home=home_b, api_url=api_url)
+            assert_eq(rc, 0, f"room leave: {err}")
+            assert_true(not os.path.isfile(os.path.join(home_b, "rooms", f"{room_id}.json")), "B deleted room file on leave")
+            rc, _, err = run_cli(["--json", "room", "close", room_id], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"room close: {err}")
+            assert_true(not os.path.isfile(os.path.join(home_a, "rooms", f"{room_id}.json")), "A deleted room file on close")
 
             # 4. Key rotate on A (save v1 pub_pem first for dual-version mail test)
             pub_v1_pem = state.agents[aid_a]["pub_pem"]

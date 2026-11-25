@@ -275,6 +275,11 @@ pub fn load_room_info(home string, room_id string) RoomInfo {
     << RoomInfo{room_id: room_id, name: nm, key_b64: kb, epoch: ep, created_at: cat}
 }
 
+pub fn delete_room_info_quiet(home string, room_id string) {
+    rpath := home + "/rooms/" + room_id + ".json"
+    os.remove(rpath) or (err) { << }
+}
+
 pub fn read_stdin_all() string {
     $out := ""
     while true {

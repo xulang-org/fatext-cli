@@ -882,27 +882,250 @@ pub fn cmd_dm(opts &CliOpts, args []string) int {
     << EXIT_OK
 }
 
+struct RoomAuthCheck {
+    pub ok bool
+    pub name string
+}
+
+fn check_room_sender_valid(api_base string, timeout_sec int, self_id string, priv &rsa.PrivateKey, rid string, from_id string, require_priv bool) RoomAuthCheck {
+    empty := ""
+    r := api_call(api_base + "", timeout_sec, self_id + "", priv, true, "GET", "/v1/rooms/" + rid, &empty, "")
+    if !r.ok { << RoomAuthCheck{ok: false, name: ""} }
+    doc := json.parse(&r.body)
+    if !doc.ok() || !doc.is_dict(doc.root()) || !doc.has(doc.root(), "room") {
+        << RoomAuthCheck{ok: false, name: ""}
+    }
+    rn := doc.get(doc.root(), "room")
+    if !doc.is_dict(rn) || !doc.has(rn, "members") { << RoomAuthCheck{ok: false, name: ""} }
+    rname := json_str_or(&doc, doc.get(rn, "name"), "")
+    arr := doc.get(rn, "members")
+    if !doc.is_list(arr) { << RoomAuthCheck{ok: false, name: ""} }
+    $self_ok := false
+    $from_ok := false
+    for i in 0:doc.count(arr) {
+        el := doc.at(arr, i)
+        if !doc.is_dict(el) { -> }
+        aid := json_str_or(&doc, doc.get(el, "agent_id"), "")
+        role := json_str_or(&doc, doc.get(el, "role"), "member")
+        if aid == self_id { self_ok = true }
+        if aid == from_id {
+            if !require_priv || role == "owner" || role == "admin" {
+                from_ok = true
+            }
+        }
+    }
+    << RoomAuthCheck{ok: self_ok && from_ok, name: rname}
+}
+
+fn load_room_info_or(home string, rid string) RoomInfo {
+    << load_room_info(home, rid) or (err) {
+        << RoomInfo{room_id: "", name: "", key_b64: "", epoch: 0, created_at: 0}
+    }
+}
+
+struct RoomRekeyOutcome {
+    pub ok bool
+    pub exit_code int
+    pub err_code string
+    pub http_status int
+    pub err_msg string
+    pub body string
+}
+
+fn distribute_room_rekey(opts &CliOpts, cfg &Config, priv &rsa.PrivateKey, rid string, rname string, new_ep int, bump_epoch bool, recipients &[]string) RoomRekeyOutcome {
+    kb64 := random_b64(32) or (err) {
+        << RoomRekeyOutcome{ok: false, exit_code: EXIT_CRYPTO, err_code: "ERR_CRYPTO", http_status: 0, err_msg: err.msg(), body: ""}
+    }
+    now := time.now_time().unix()
+    $envs := []string{}
+    for i in 0:recipients.len {
+        to_id := recipients[i] + ""
+        if to_id == cfg.agent_id || to_id.len == 0 { -> }
+        fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, to_id + "")
+        if !fk.ok { -> }
+        body_json := "{\"epoch\":" + strconv.itoa(new_ep) + ",\"name\":" + json.quote(&rname) + ",\"room_id\":" + json.quote(&rid) + ",\"room_key\":" + json.quote(&kb64) + "}"
+        frame := encrypt_dm_frame(cfg.agent_id + "", priv, to_id + "", &fk.pk, fk.key_version, "room_rekey", body_json, "open", now) or (err) { -> }
+        envs.push("{\"to\":" + json.quote(&to_id) + ",\"frame\":" + frame + "}")
+    }
+    $bp := "false"
+    if bump_epoch { bp = "true" }
+    req_body := "{\"epoch\":" + strconv.itoa(new_ep) + ",\"bump_epoch\":" + bp + ",\"envelopes\":[" + strings.join(envs, ",") + "]}"
+    r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", priv, true, "POST", "/v1/rooms/" + rid + "/rekey", &req_body, "")
+    if !r.ok {
+        $ec := map_http_exit_code(r.status, r.err_code + "")
+        if r.net_err { ec = EXIT_NET }
+        << RoomRekeyOutcome{ok: false, exit_code: ec, err_code: r.err_code + "", http_status: r.status, err_msg: r.err_msg + "", body: ""}
+    }
+    $created_at := now
+    existing := load_room_info_or(cfg.home + "", rid + "")
+    if existing.created_at > 0 { created_at = existing.created_at }
+    ri := RoomInfo{room_id: rid + "", name: rname + "", key_b64: kb64 + "", epoch: new_ep, created_at: created_at}
+    save_room_info(cfg.home + "", &ri) or (err) {
+        << RoomRekeyOutcome{ok: false, exit_code: EXIT_CONFIG, err_code: "ERR_CONFIG", http_status: 0, err_msg: err.msg(), body: ""}
+    }
+    << RoomRekeyOutcome{ok: true, exit_code: EXIT_OK, err_code: "", http_status: 200, err_msg: "", body: r.body + ""}
+}
+
 pub fn cmd_room(opts &CliOpts, args []string) int {
-    if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room <create|invite|send>", 0, EXIT_USAGE) }
+    if args.len < 1 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room <create|list|info|members|set|invite|role|mute|unmute|kick|ban|unban|rotate|transfer|leave|close|send> ...", 0, EXIT_USAGE)
+    }
     sub := args[0] + ""
     cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
     priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    empty := ""
 
     if sub == "create" {
         $label := ""
-        if args.len >= 3 && args[1] == "--name" { label = args[2] + "" }
+        $topic := ""
+        $sp := "all"
+        $ip := "admins"
+        $jp := "invite_only"
+        $max_m := 64
+        $slow_s := 0
+        $locked := false
+        $i := 1
+        while i < args.len {
+            a := args[i] + ""
+            if a == "--name" && i + 1 < args.len {
+                i += 1
+                label = args[i] + ""
+            } else if a == "--topic" && i + 1 < args.len {
+                i += 1
+                topic = args[i] + ""
+            } else if a == "--send-policy" && i + 1 < args.len {
+                i += 1
+                sp = args[i] + ""
+            } else if a == "--invite-policy" && i + 1 < args.len {
+                i += 1
+                ip = args[i] + ""
+            } else if a == "--join-policy" && i + 1 < args.len {
+                i += 1
+                jp = args[i] + ""
+            } else if a == "--max-members" && i + 1 < args.len {
+                i += 1
+                max_m = parse_int_or(&args[i], -1)
+            } else if a == "--slow-mode" && i + 1 < args.len {
+                i += 1
+                slow_s = parse_int_or(&args[i], -1)
+            } else if a == "--locked" { locked = true }
+            else { << emit_err(opts, "ERR_USAGE", 0, "unknown room create flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
         rid := generate_room_id() or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         kb64 := random_b64(32) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        $lk_s := "false"
+        if locked { lk_s = "true" }
+        req_body := "{\"room_id\":" + json.quote(&rid) +
+            ",\"name\":" + json.quote(&label) +
+            ",\"topic\":" + json.quote(&topic) +
+            ",\"send_policy\":" + json.quote(&sp) +
+            ",\"invite_policy\":" + json.quote(&ip) +
+            ",\"join_policy\":" + json.quote(&jp) +
+            ",\"max_members\":" + strconv.itoa(max_m) +
+            ",\"slow_mode_sec\":" + strconv.itoa(slow_s) +
+            ",\"locked\":" + lk_s + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/rooms", &req_body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
         now := time.now_time().unix()
         ri := RoomInfo{room_id: rid + "", name: label + "", key_b64: kb64 + "", epoch: 1, created_at: now}
         save_room_info(cfg.home + "", &ri) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        println("{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"name\":" + json.quote(&label) + ",\"epoch\":1}")
+        println("{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"name\":" + json.quote(&label) + ",\"epoch\":1,\"send_policy\":" + json.quote(&sp) + ",\"invite_policy\":" + json.quote(&ip) + ",\"join_policy\":" + json.quote(&jp) + ",\"max_members\":" + strconv.itoa(max_m) + ",\"slow_mode_sec\":" + strconv.itoa(slow_s) + ",\"locked\":" + lk_s + "}")
+        << EXIT_OK
+    }
+    if sub == "list" {
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/rooms", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "info" || sub == "members" {
+        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room " + sub + " <room_id>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/rooms/" + rid, &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "set" {
+        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room set <room_id> [--name ...] [--topic ...] [--send-policy ...] [--invite-policy ...] [--join-policy ...] [--max-members N] [--slow-mode SEC] [--lock|--unlock]", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        $fields := []string{}
+        $new_name := ""
+        $has_name := false
+        $i := 2
+        while i < args.len {
+            a := args[i] + ""
+            if a == "--name" && i + 1 < args.len {
+                i += 1
+                new_name = args[i] + ""
+                has_name = true
+                fields.push("\"name\":" + json.quote(&new_name))
+            } else if a == "--topic" && i + 1 < args.len {
+                i += 1
+                tv := args[i] + ""
+                fields.push("\"topic\":" + json.quote(&tv))
+            } else if a == "--send-policy" && i + 1 < args.len {
+                i += 1
+                sv := args[i] + ""
+                fields.push("\"send_policy\":" + json.quote(&sv))
+            } else if a == "--invite-policy" && i + 1 < args.len {
+                i += 1
+                iv := args[i] + ""
+                fields.push("\"invite_policy\":" + json.quote(&iv))
+            } else if a == "--join-policy" && i + 1 < args.len {
+                i += 1
+                jv := args[i] + ""
+                fields.push("\"join_policy\":" + json.quote(&jv))
+            } else if a == "--max-members" && i + 1 < args.len {
+                i += 1
+                mv := parse_int_or(&args[i], -1)
+                fields.push("\"max_members\":" + strconv.itoa(mv))
+            } else if a == "--slow-mode" && i + 1 < args.len {
+                i += 1
+                sm := parse_int_or(&args[i], -1)
+                fields.push("\"slow_mode_sec\":" + strconv.itoa(sm))
+            } else if a == "--lock" {
+                fields.push("\"locked\":true")
+            } else if a == "--unlock" {
+                fields.push("\"locked\":false")
+            } else {
+                << emit_err(opts, "ERR_USAGE", 0, "unknown room set flag: " + a, 0, EXIT_USAGE)
+            }
+            i += 1
+        }
+        if fields.len == 0 {
+            << emit_err(opts, "ERR_USAGE", 0, "room set requires at least one option", 0, EXIT_USAGE)
+        }
+        req_body := "{" + strings.join(fields, ",") + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PATCH", "/v1/rooms/" + rid, &req_body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        if has_name {
+            $ri := load_room_info_or(cfg.home + "", rid + "")
+            if ri.room_id.len > 0 {
+                ri.name = new_name + ""
+                _ := save_room_info_q(cfg.home + "", &ri)
+            }
+        }
+        println(r.body)
         << EXIT_OK
     }
     if sub == "invite" {
-        if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room invite <room_id> <agent_id>", 0, EXIT_USAGE) }
+        if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room invite <room_id> <agent_id> [--role admin|member|readonly]", 0, EXIT_USAGE) }
         rid := args[1] + ""
         to_id := args[2] + ""
+        $role := "member"
+        $i := 3
+        while i < args.len {
+            a := args[i] + ""
+            if a == "--role" && i + 1 < args.len {
+                i += 1
+                role = args[i] + ""
+            } else {
+                << emit_err(opts, "ERR_USAGE", 0, "unknown room invite flag: " + a, 0, EXIT_USAGE)
+            }
+            i += 1
+        }
         ri := load_room_info(cfg.home + "", rid + "") or (err) { << emit_err(opts, "ERR_NOT_FOUND", 0, "room key not found locally: " + rid, 0, EXIT_NOT_FOUND) }
         fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, to_id + "")
         if !fk.ok { << emit_err(opts, fk.err_code + "", 0, fk.err_msg + "", 0, fk.exit_code) }
@@ -911,8 +1134,137 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
         frame := encrypt_dm_frame(cfg.agent_id + "", &priv, to_id + "", &fk.pk, fk.key_version, "room_invite", body_json, "open", now) or (err) {
             << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
         }
-        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/dm/" + to_id, &frame, "")
+        req_body := "{\"agent_id\":" + json.quote(&to_id) + ",\"role\":" + json.quote(&role) + ",\"invite_frame\":" + frame + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/rooms/" + rid + "/members", &req_body, "")
         if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "role" {
+        if args.len < 4 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room role <room_id> <agent_id> <admin|member|readonly>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        aid := args[2] + ""
+        role := args[3] + ""
+        req_body := "{\"role\":" + json.quote(&role) + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PATCH", "/v1/rooms/" + rid + "/members/" + aid, &req_body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "mute" || sub == "unmute" {
+        if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room " + sub + " <room_id> <agent_id>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        aid := args[2] + ""
+        $mv := "true"
+        if sub == "unmute" { mv = "false" }
+        req_body := "{\"muted\":" + mv + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PATCH", "/v1/rooms/" + rid + "/members/" + aid, &req_body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "kick" || sub == "ban" {
+        if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room " + sub + " <room_id> <agent_id> [--no-rekey]", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        aid := args[2] + ""
+        $no_rekey := false
+        if args.len >= 4 && args[3] == "--no-rekey" { no_rekey = true }
+        $rot_s := "true"
+        if no_rekey { rot_s = "false" }
+        req_body := "{\"rotate_epoch\":" + rot_s + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/rooms/" + rid + "/members/" + aid + "/" + sub, &req_body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        if no_rekey {
+            println(r.body)
+            << EXIT_OK
+        }
+        kdoc := json.parse(&r.body)
+        if !kdoc.ok() {
+            println(r.body)
+            << EXIT_OK
+        }
+        kr := kdoc.root()
+        new_ep := json_int_or(&kdoc, kdoc.get(kr, "epoch"), 2)
+        $rem := []string{}
+        if kdoc.has(kr, "remaining_members") && kdoc.is_list(kdoc.get(kr, "remaining_members")) {
+            arr := kdoc.get(kr, "remaining_members")
+            for i in 0:kdoc.count(arr) {
+                mid := json_str_or(&kdoc, kdoc.at(arr, i), "")
+                if mid.len > 0 { rem.push(mid) }
+            }
+        }
+        lri := load_room_info_or(cfg.home + "", rid + "")
+        $rname := lri.name + ""
+        rk := distribute_room_rekey(opts, &cfg, &priv, rid + "", rname + "", new_ep, false, &rem)
+        if !rk.ok {
+            << emit_err(opts, rk.err_code + "", rk.http_status, rk.err_msg + "", 0, rk.exit_code)
+        }
+        println("{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"action\":" + json.quote(&sub) + ",\"target\":" + json.quote(&aid) + ",\"epoch\":" + strconv.itoa(new_ep) + ",\"rekeyed\":true}")
+        << EXIT_OK
+    }
+    if sub == "unban" {
+        if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room unban <room_id> <agent_id>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        aid := args[2] + ""
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/rooms/" + rid + "/bans/" + aid, &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "rotate" {
+        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room rotate <room_id>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        gr := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/rooms/" + rid, &empty, "")
+        if !gr.ok { << handle_api_fail(opts, &gr) }
+        gdoc := json.parse(&gr.body)
+        if !gdoc.ok() || !gdoc.has(gdoc.root(), "room") {
+            << emit_err(opts, "ERR_ERR", 0, "invalid room metadata", 0, EXIT_ERR)
+        }
+        rn := gdoc.get(gdoc.root(), "room")
+        cur_ep := json_int_or(&gdoc, gdoc.get(rn, "epoch"), 1)
+        rname := json_str_or(&gdoc, gdoc.get(rn, "name"), "")
+        $mem := []string{}
+        if gdoc.has(rn, "members") && gdoc.is_list(gdoc.get(rn, "members")) {
+            arr := gdoc.get(rn, "members")
+            for i in 0:gdoc.count(arr) {
+                el := gdoc.at(arr, i)
+                mid := json_str_or(&gdoc, gdoc.get(el, "agent_id"), "")
+                if mid.len > 0 { mem.push(mid) }
+            }
+        }
+        new_ep := cur_ep + 1
+        rk := distribute_room_rekey(opts, &cfg, &priv, rid + "", rname + "", new_ep, true, &mem)
+        if !rk.ok {
+            << emit_err(opts, rk.err_code + "", rk.http_status, rk.err_msg + "", 0, rk.exit_code)
+        }
+        println(rk.body)
+        << EXIT_OK
+    }
+    if sub == "transfer" {
+        if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room transfer <room_id> <agent_id>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        aid := args[2] + ""
+        req_body := "{\"agent_id\":" + json.quote(&aid) + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/rooms/" + rid + "/transfer", &req_body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "leave" {
+        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room leave <room_id>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/rooms/" + rid + "/leave", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        delete_room_info_quiet(cfg.home + "", rid + "")
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "close" {
+        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room close <room_id>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/rooms/" + rid, &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        delete_room_info_quiet(cfg.home + "", rid + "")
         println(r.body)
         << EXIT_OK
     }
@@ -995,15 +1347,51 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
                     rname := json_str_or(&bd, bd.get(br, "name"), "")
                     rep := json_int_or(&bd, bd.get(br, "epoch"), 1)
                     $stored := false
-                    if dec.verified && is_valid_room_id(rid + "") && check_is_friend(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, from_id + "") {
-                        ri := RoomInfo{room_id: rid + "", name: rname + "", key_b64: rkey_b64 + "", epoch: rep, created_at: dec.ts}
-                        stored = save_room_info_q(cfg.home + "", &ri)
+                    if dec.verified && is_valid_room_id(rid + "") {
+                        $allowed := check_is_friend(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, from_id + "")
+                        if !allowed {
+                            mc := check_room_sender_valid(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, rid + "", from_id + "", false)
+                            allowed = mc.ok
+                        }
+                        if allowed {
+                            ri := RoomInfo{room_id: rid + "", name: rname + "", key_b64: rkey_b64 + "", epoch: rep, created_at: dec.ts}
+                            stored = save_room_info_q(cfg.home + "", &ri)
+                        }
                     }
                     $st_s := "false"
                     if stored { st_s = "true" }
                     $vs := "false"
                     if dec.verified { vs = "true" }
                     emit_stdout_line("{\"type\":\"room_invite\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + ",\"name\":" + json.quote(&rname) + ",\"stored\":" + st_s + ",\"verified\":" + vs + "}")
+                }
+            } else if dec.msg_type == "room_rekey" {
+                bd := json.parse(&dec.body_json)
+                if bd.ok() {
+                    br := bd.root()
+                    rid := json_str_or(&bd, bd.get(br, "room_id"), "")
+                    rkey_b64 := json_str_or(&bd, bd.get(br, "room_key"), "")
+                    rname := json_str_or(&bd, bd.get(br, "name"), "")
+                    rep := json_int_or(&bd, bd.get(br, "epoch"), 0)
+                    $stored := false
+                    if dec.verified && is_valid_room_id(rid + "") && rep >= 1 {
+                        cur := load_room_info_or(cfg.home + "", rid + "")
+                        if cur.room_id.len == 0 || rep > cur.epoch {
+                            ac := check_room_sender_valid(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, rid + "", from_id + "", true)
+                            if ac.ok {
+                                $cat := dec.ts
+                                if cur.created_at > 0 { cat = cur.created_at }
+                                $use_name := rname + ""
+                                if use_name.len == 0 && ac.name.len > 0 { use_name = ac.name + "" }
+                                ri := RoomInfo{room_id: rid + "", name: use_name + "", key_b64: rkey_b64 + "", epoch: rep, created_at: cat}
+                                stored = save_room_info_q(cfg.home + "", &ri)
+                            }
+                        }
+                    }
+                    $st_s := "false"
+                    if stored { st_s = "true" }
+                    $vs := "false"
+                    if dec.verified { vs = "true" }
+                    emit_stdout_line("{\"type\":\"room_rekey\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + ",\"epoch\":" + strconv.itoa(rep) + ",\"stored\":" + st_s + ",\"verified\":" + vs + "}")
                 }
             } else {
                 bd := json.parse(&dec.body_json)

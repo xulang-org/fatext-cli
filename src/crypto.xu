@@ -592,10 +592,10 @@ pub fn encrypt_doc_envelope(
     plaintext &string,
     agent_kv int,
     agent_pk &rsa.PublicKey,
-    has_human bool,
-    human_id string,
-    human_kv int,
-    human_pk &rsa.PublicKey
+    has_ctrl bool,
+    ctrl_id string,
+    ctrl_kv int,
+    ctrl_pk &rsa.PublicKey
 ) string {
     cek := rand.read(32) or >>
     iv := rand.read(12) or >>
@@ -608,10 +608,10 @@ pub fn encrypt_doc_envelope(
     ek_ag_b64 := base64.encode_to_string(ek_ag)
     $recs := []string{}
     recs.push("{\"role\":\"agent\",\"id\":" + json.quote(&agent_id) + ",\"key_version\":" + strconv.itoa(agent_kv) + ",\"ek\":" + json.quote(&ek_ag_b64) + "}")
-    if has_human && human_id.len > 0 {
-        ek_hu := oaep.encrypt_oaep(human_pk, rsa.SHA256, &cek, &empty_lbl) or >>
-        ek_hu_b64 := base64.encode_to_string(ek_hu)
-        recs.push("{\"role\":\"human\",\"id\":" + json.quote(&human_id) + ",\"key_version\":" + strconv.itoa(human_kv) + ",\"ek\":" + json.quote(&ek_hu_b64) + "}")
+    if has_ctrl && ctrl_id.len > 0 {
+        ek_ct := oaep.encrypt_oaep(ctrl_pk, rsa.SHA256, &cek, &empty_lbl) or >>
+        ek_ct_b64 := base64.encode_to_string(ek_ct)
+        recs.push("{\"role\":\"controller\",\"id\":" + json.quote(&ctrl_id) + ",\"key_version\":" + strconv.itoa(ctrl_kv) + ",\"ek\":" + json.quote(&ek_ct_b64) + "}")
     }
     iv_b64 := base64.encode_to_string(iv)
     ct_b64 := base64.encode_to_string(ct)

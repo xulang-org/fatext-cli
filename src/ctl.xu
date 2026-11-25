@@ -1,0 +1,634 @@
+@main
+
+#crypto/rsa
+#crypto/sha256
+#encoding/json
+#os
+#strconv
+#strings
+#time
+
+pub struct CliScopeRes {
+    pub ok bool
+    pub scopes []string
+}
+
+pub fn cli_valid_scope(s string) bool {
+    << s == "dm" || s == "mail" || s == "profile" || s == "pub" ||
+        s == "room" || s == "rotate" || s == "social" || s == "stream"
+}
+
+pub fn cli_all_scopes() []string {
+    << ["dm", "mail", "profile", "pub", "room", "rotate", "social", "stream"]
+}
+
+pub fn normalize_cli_scopes(csv_in &string) CliScopeRes {
+    trimmed := strings.trim_space(csv_in)
+    if trimmed.len == 0 || trimmed == "all" {
+        << CliScopeRes{ok: true, scopes: cli_all_scopes()}
+    }
+    parts := strings.split(&trimmed, ",")
+    $out := []string{}
+    for i in 0:parts.len {
+        s := strings.trim_space(&parts[i])
+        if s == "all" {
+            << CliScopeRes{ok: true, scopes: cli_all_scopes()}
+        }
+        if !cli_valid_scope(s + "") {
+            << CliScopeRes{ok: false, scopes: []string{}}
+        }
+        $seen := false
+        for j in 0:out.len {
+            if out[j] == s {
+                seen = true
+                <-
+            }
+        }
+        if !seen { out.push(s) }
+    }
+    $i := 0
+    while i < out.len {
+        $j := i + 1
+        while j < out.len {
+            if strings.compare(&out[j], &out[i]) < 0 {
+                tmp := out[i] + ""
+                out[i] = out[j] + ""
+                out[j] = tmp
+            }
+            j += 1
+        }
+        i += 1
+    }
+    << CliScopeRes{ok: true, scopes: out}
+}
+
+pub fn cli_scopes_json_array(scopes &[]string) string {
+    $qs := []string{}
+    for i in 0:scopes.len { qs.push(json.quote(&scopes[i])) }
+    << "[" + strings.join(qs, ",") + "]"
+}
+
+pub fn cli_canon_enrollment(controller_id string, ckv int, cred_id string, exp int, iat int, lbl string, scopes &[]string) string {
+    << "{\"controller_id\":" + json.quote(&controller_id) +
+        ",\"controller_key_version\":" + strconv.itoa(ckv) +
+        ",\"cred_id\":" + json.quote(&cred_id) +
+        ",\"expires_at\":" + strconv.itoa(exp) +
+        ",\"issued_at\":" + strconv.itoa(iat) +
+        ",\"kind\":\"enrollment\"" +
+        ",\"label\":" + json.quote(&lbl) +
+        ",\"scopes\":" + cli_scopes_json_array(scopes) + "}"
+}
+
+pub fn cli_canon_binding(fp string, controller_id string, cred_id string, ts int) string {
+    << "{\"agent_pub_fp\":" + json.quote(&fp) +
+        ",\"controller_id\":" + json.quote(&controller_id) +
+        ",\"cred_id\":" + json.quote(&cred_id) +
+        ",\"timestamp\":" + strconv.itoa(ts) + "}"
+}
+
+pub fn cli_canon_agent_cert(aid string, akv int, fp string, controller_id string, ckv int, cred_id string, exp int, iat int, lbl string, scopes &[]string) string {
+    << "{\"agent_id\":" + json.quote(&aid) +
+        ",\"agent_key_version\":" + strconv.itoa(akv) +
+        ",\"agent_pub_fp\":" + json.quote(&fp) +
+        ",\"controller_id\":" + json.quote(&controller_id) +
+        ",\"controller_key_version\":" + strconv.itoa(ckv) +
+        ",\"cred_id\":" + json.quote(&cred_id) +
+        ",\"expires_at\":" + strconv.itoa(exp) +
+        ",\"issued_at\":" + strconv.itoa(iat) +
+        ",\"kind\":\"agent_cert\"" +
+        ",\"label\":" + json.quote(&lbl) +
+        ",\"scopes\":" + cli_scopes_json_array(scopes) + "}"
+}
+
+pub fn cli_canon_adoption(aid string, fp string, controller_id string, ts int) string {
+    << "{\"agent_id\":" + json.quote(&aid) +
+        ",\"agent_pub_fp\":" + json.quote(&fp) +
+        ",\"controller_id\":" + json.quote(&controller_id) +
+        ",\"timestamp\":" + strconv.itoa(ts) + "}"
+}
+
+pub fn cmd_ctl(opts &CliOpts, args []string) int {
+    if args.len < 1 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl <cred|agents|grant|suspend|resume|revoke|policy|soul|rules> ...", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    $rest := []string{}
+    for i in 1:args.len { rest.push(args[i] + "") }
+
+    if sub == "cred" {
+        if rest.len < 1 || rest[0] != "issue" {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl cred issue [--label ...] [--scopes all|csv] [--ttl 30d] [--out <file>]", 0, EXIT_USAGE)
+        }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        $lbl := ""
+        $scopes_in := "all"
+        $ttl_s := "30d"
+        $out_path := ""
+        $i := 1
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--label" && i + 1 < rest.len {
+                i += 1
+                lbl = rest[i] + ""
+            } else if a == "--scopes" && i + 1 < rest.len {
+                i += 1
+                scopes_in = rest[i] + ""
+            } else if a == "--ttl" && i + 1 < rest.len {
+                i += 1
+                ttl_s = rest[i] + ""
+            } else if a == "--out" && i + 1 < rest.len {
+                i += 1
+                out_path = rest[i] + ""
+            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown cred issue flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
+        sr := normalize_cli_scopes(&scopes_in)
+        if !sr.ok { << emit_err(opts, "ERR_USAGE", 0, "invalid scopes: " + scopes_in, 0, EXIT_USAGE) }
+        ttl := parse_ttl_seconds(&ttl_s)
+        if ttl < 0 { << emit_err(opts, "ERR_USAGE", 0, "invalid ttl: " + ttl_s, 0, EXIT_USAGE) }
+        iat := time.now_time().unix()
+        $exp := 0
+        if ttl > 0 { exp = iat + ttl }
+        ul := new_ulid() or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        cid := "cred_" + ul
+        canon_pl := cli_canon_enrollment(cfg.agent_id + "", cfg.key_version, cid + "", exp, iat, lbl + "", &sr.scopes)
+        csig := sign_pss_message(&priv, &canon_pl) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        voucher := "{\"payload\":" + canon_pl + ",\"controller_sig\":" + json.quote(&csig) + "}\n"
+        if out_path.len > 0 {
+            write_atomic_mode(out_path + "", &voucher, 384) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            if opts.json_mode {
+                println("{\"ok\":true,\"cred_id\":" + json.quote(&cid) + ",\"controller_id\":" + json.quote(&cfg.agent_id) + ",\"out\":" + json.quote(&out_path) + ",\"expires_at\":" + strconv.itoa(exp) + "}")
+            } else {
+                println("issued enrollment credential " + cid + " -> " + out_path)
+            }
+        } else {
+            println(strings.trim_space(&voucher))
+        }
+        << EXIT_OK
+    }
+
+    if sub == "agents" {
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        empty := ""
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        if opts.json_mode {
+            println(r.body)
+            << EXIT_OK
+        }
+        ldoc := json.parse(&r.body)
+        if !ldoc.ok() || !ldoc.has(ldoc.root(), "agents") || !ldoc.is_list(ldoc.get(ldoc.root(), "agents")) {
+            println(r.body)
+            << EXIT_OK
+        }
+        arr := ldoc.get(ldoc.root(), "agents")
+        for ai in 0:ldoc.count(arr) {
+            el := ldoc.at(arr, ai)
+            if !ldoc.is_dict(el) { -> }
+            aid_s := json_str_or(&ldoc, ldoc.get(el, "agent_id"), "")
+            nm_s := json_str_or(&ldoc, ldoc.get(el, "name"), "")
+            lb_s := json_str_or(&ldoc, ldoc.get(el, "label"), "")
+            ost_s := json_str_or(&ldoc, ldoc.get(el, "ownership_status"), "")
+            ast_s := json_str_or(&ldoc, ldoc.get(el, "agent_status"), "")
+            scs_s := json_encode_or(&ldoc, ldoc.get(el, "scopes"), "[]")
+            $nm_part := ""
+            if nm_s.len > 0 { nm_part = " name=" + json.quote(&nm_s) }
+            $lb_part := ""
+            if lb_s.len > 0 { lb_part = " label=" + json.quote(&lb_s) }
+            println(aid_s + nm_part + lb_part + " status=" + ast_s + "/" + ost_s + " scopes=" + scs_s)
+        }
+        << EXIT_OK
+    }
+
+    if sub == "grant" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl grant <agent_id> [--scopes ...] [--ttl 30d] [--label ...] [--proof <file>]", 0, EXIT_USAGE) }
+        aid := rest[0] + ""
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        $lbl := ""
+        $scopes_in := "all"
+        $ttl_s := "30d"
+        $proof_path := ""
+        $i := 1
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--label" && i + 1 < rest.len {
+                i += 1
+                lbl = rest[i] + ""
+            } else if a == "--scopes" && i + 1 < rest.len {
+                i += 1
+                scopes_in = rest[i] + ""
+            } else if a == "--ttl" && i + 1 < rest.len {
+                i += 1
+                ttl_s = rest[i] + ""
+            } else if a == "--proof" && i + 1 < rest.len {
+                i += 1
+                proof_path = rest[i] + ""
+            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown grant flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
+        sr := normalize_cli_scopes(&scopes_in)
+        if !sr.ok { << emit_err(opts, "ERR_USAGE", 0, "invalid scopes: " + scopes_in, 0, EXIT_USAGE) }
+        ttl := parse_ttl_seconds(&ttl_s)
+        if ttl < 0 { << emit_err(opts, "ERR_USAGE", 0, "invalid ttl: " + ttl_s, 0, EXIT_USAGE) }
+
+        afk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, aid + "")
+        if !afk.ok { << emit_err(opts, afk.err_code + "", 0, afk.err_msg + "", 0, afk.exit_code) }
+        afp := pubkey_fingerprint(&afk.pub_pem)
+        iat := time.now_time().unix()
+        $exp := 0
+        if ttl > 0 { exp = iat + ttl }
+        ul := new_ulid() or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        cid := "cred_" + ul
+        canon_cert := cli_canon_agent_cert(aid + "", afk.key_version, afp + "", cfg.agent_id + "", cfg.key_version, cid + "", exp, iat, lbl + "", &sr.scopes)
+        csig := sign_pss_message(&priv, &canon_cert) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+
+        $body := "{\"payload\":" + canon_cert + ",\"controller_sig\":" + json.quote(&csig)
+        if proof_path.len > 0 {
+            praw := os.read(proof_path + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            body = body + ",\"adoption_proof\":" + strings.trim_space(&praw)
+        }
+        body = body + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/ctl/agents/" + aid + "/credential", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "suspend" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl suspend <agent_id> [--reason ...]", 0, EXIT_USAGE) }
+        aid := rest[0] + ""
+        $reason := ""
+        if rest.len >= 3 && rest[1] == "--reason" { reason = rest[2] + "" }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        body := "{\"reason\":" + json.quote(&reason) + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/ctl/agents/" + aid + "/suspend", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "resume" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl resume <agent_id>", 0, EXIT_USAGE) }
+        aid := rest[0] + ""
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        body := "{}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/ctl/agents/" + aid + "/resume", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "revoke" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl revoke <agent_id> [--successor <id>] [--reason ...] --confirm", 0, EXIT_USAGE) }
+        aid := rest[0] + ""
+        $succ := ""
+        $reason := ""
+        $confirm := false
+        $i := 1
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--confirm" { confirm = true }
+            else if a == "--successor" && i + 1 < rest.len {
+                i += 1
+                succ = rest[i] + ""
+            } else if a == "--reason" && i + 1 < rest.len {
+                i += 1
+                reason = rest[i] + ""
+            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown revoke flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
+        if !confirm { << emit_err(opts, "ERR_CONFIRM_REQUIRED", 0, "permanent revocation requires --confirm", 0, EXIT_USAGE) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        $succ_json := "null"
+        if succ.len > 0 { succ_json = json.quote(&succ) }
+        body := "{\"successor_id\":" + succ_json + ",\"reason\":" + json.quote(&reason) + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/ctl/agents/" + aid + "/revoke", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "policy" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl policy <agent_id> [--name ...] [--dm-policy ...] [--accept-email true|false] [--clear-webhook]", 0, EXIT_USAGE) }
+        aid := rest[0] + ""
+        $has_name := false
+        $aname := ""
+        $has_dmp := false
+        $dmp := ""
+        $has_ae := false
+        $ae := false
+        $clear_wh := false
+        $i := 1
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--name" && i + 1 < rest.len {
+                i += 1
+                has_name = true
+                aname = rest[i] + ""
+            } else if a == "--dm-policy" && i + 1 < rest.len {
+                i += 1
+                has_dmp = true
+                dmp = rest[i] + ""
+            } else if a == "--accept-email" && i + 1 < rest.len {
+                i += 1
+                has_ae = true
+                ae = (rest[i] == "true" || rest[i] == "1")
+            } else if a == "--clear-webhook" { clear_wh = true }
+            else { << emit_err(opts, "ERR_USAGE", 0, "unknown policy flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        $parts := []string{}
+        if has_name { parts.push("\"name\":" + json.quote(&aname)) }
+        if has_dmp { parts.push("\"dm_policy\":" + json.quote(&dmp)) }
+        if has_ae {
+            $ae_s := "false"
+            if ae { ae_s = "true" }
+            parts.push("\"accept_email\":" + ae_s)
+        }
+        if clear_wh { parts.push("\"clear_webhook\":true") }
+        body := "{" + join_ref(&parts, ",") + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PUT", "/v1/ctl/agents/" + aid + "/policy", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "soul" || sub == "rules" {
+        << cmd_ctl_doc(opts, sub + "", rest)
+    }
+
+    << emit_err(opts, "ERR_USAGE", 0, "unknown ctl subcommand: " + sub, 0, EXIT_USAGE)
+}
+
+pub fn cmd_claim_proof(opts &CliOpts, args []string) int {
+    if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext claim-proof <controller_id> [--out <file>]", 0, EXIT_USAGE) }
+    cid := args[0] + ""
+    if !is_valid_agent_id(cid + "") { << emit_err(opts, "ERR_USAGE", 0, "invalid controller_id", 0, EXIT_USAGE) }
+    $out_path := ""
+    if args.len >= 3 && args[1] == "--out" { out_path = args[2] + "" }
+
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    pub_pem := encode_spki_public_pem(&priv.public) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+    fp := pubkey_fingerprint(&pub_pem)
+    ts := time.now_time().unix()
+    pl := cli_canon_adoption(cfg.agent_id + "", fp + "", cid + "", ts)
+    asig := sign_pss_message(&priv, &pl) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+    proof := "{\"payload\":" + pl + ",\"agent_sig\":" + json.quote(&asig) + "}\n"
+    if out_path.len > 0 {
+        write_atomic_mode(out_path + "", &proof, 384) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        if opts.json_mode {
+            println("{\"ok\":true,\"agent_id\":" + json.quote(&cfg.agent_id) + ",\"controller_id\":" + json.quote(&cid) + ",\"out\":" + json.quote(&out_path) + "}")
+        } else {
+            println("wrote adoption proof -> " + out_path)
+        }
+    } else {
+        println(strings.trim_space(&proof))
+    }
+    << EXIT_OK
+}
+
+pub fn cli_find_key_for_ver(doc &json.Doc, want_ver int, cur_ver int, cur_pem &string) string {
+    if want_ver == cur_ver { << cur_pem + "" }
+    rt := doc.root()
+    if !doc.has(rt, "key_history") || !doc.is_list(doc.get(rt, "key_history")) { << "" }
+    kh := doc.get(rt, "key_history")
+    for i in 0:doc.count(kh) {
+        el := doc.at(kh, i)
+        if doc.is_dict(el) && json_int_or(doc, doc.get(el, "version"), 0) == want_ver {
+            << json_str_or(doc, doc.get(el, "public_key_pem"), "")
+        }
+    }
+    << ""
+}
+
+fn cli_verify_agent_rotations(cdoc &json.Doc, cid string, cur_ver int, cur_pem &string, errs $&[]string) {
+    rt := cdoc.root()
+    if !cdoc.has(rt, "key_history") || !cdoc.is_list(cdoc.get(rt, "key_history")) { << }
+    kh := cdoc.get(rt, "key_history")
+    cnt := doc_count(cdoc, kh)
+    for i in 0:cnt {
+        el := cdoc.at(kh, i)
+        if !cdoc.is_dict(el) { -> }
+        osig := json_str_or(cdoc, cdoc.get(el, "rotated_by_old_sig"), "")
+        nsig := json_str_or(cdoc, cdoc.get(el, "rotated_by_new_sig"), "")
+        if osig.len > 0 && nsig.len > 0 {
+            old_pem := json_str_or(cdoc, cdoc.get(el, "public_key_pem"), "")
+            vu := json_int_or(cdoc, cdoc.get(el, "valid_until"), 0)
+            old_v := json_int_or(cdoc, cdoc.get(el, "version"), 0)
+            next_pem := cli_find_key_for_ver(cdoc, old_v + 1, cur_ver, cur_pem)
+            old_pk := decode_spki_public_pem(&old_pem) or (err) {
+                errs.push("invalid historical controller key")
+                ->
+            }
+            if next_pem.len == 0 {
+                errs.push("missing next controller key in chain")
+                ->
+            }
+            next_pk := decode_spki_public_pem(&next_pem) or (err) {
+                errs.push("invalid next controller key")
+                ->
+            }
+            $matched := false
+            for dt in -2:3 {
+                cand := "{\"agent_id\":" + json.quote(&cid) + ",\"key_version\":" + strconv.itoa(old_v + 1) + ",\"new_public_key_pem\":" + json.quote(&next_pem) + ",\"timestamp\":" + strconv.itoa(vu + dt) + "}"
+                if verify_pss_message(&old_pk, &cand, osig + "") && verify_pss_message(&next_pk, &cand, nsig + "") {
+                    matched = true
+                    <-
+                }
+            }
+            if !matched {
+                errs.push("controller key rotation signature link v" + strconv.itoa(old_v) + "->v" + strconv.itoa(old_v + 1) + " failed")
+            }
+        }
+    }
+}
+
+fn cli_verify_pem_sig(pem &string, msg &string, sig string) bool {
+    pk := decode_spki_public_pem(pem) or (err) { << false }
+    << verify_pss_message(&pk, msg, sig)
+}
+
+fn doc_count(doc &json.Doc, n int) int {
+    << doc.count(n)
+}
+
+pub fn cmd_verify(opts &CliOpts, args []string) int {
+    if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext verify <agent_id>", 0, EXIT_USAGE) }
+    aid := args[0] + ""
+    if !is_valid_agent_id(aid + "") { << emit_err(opts, "ERR_USAGE", 0, "invalid agent_id", 0, EXIT_USAGE) }
+
+    api_base := resolve_api_base(opts, "")
+    cfg_opt := load_config_or_base(opts, api_base + "")
+    afk := fetch_agent_key(cfg_opt.api_base + "", opts.timeout_sec, aid + "")
+    if !afk.ok { << emit_err(opts, afk.err_code + "", 0, afk.err_msg + "", 0, afk.exit_code) }
+
+    adoc := json.parse(&afk.raw_json)
+    if !adoc.ok() { << emit_err(opts, "ERR_CRYPTO", 0, "invalid agent json", 0, EXIT_CRYPTO) }
+    ar := adoc.root()
+    $errs := []string{}
+    if afk.status != "active" {
+        errs.push("agent status is " + afk.status)
+    }
+
+    now := time.now_time().unix()
+    if !adoc.has(ar, "ownership") || adoc.is_null(adoc.get(ar, "ownership")) {
+        $valid := errs.len == 0
+        $vs := "false"
+        if valid { vs = "true" }
+        $err_qs := []string{}
+        for i in 0:errs.len { err_qs.push(json.quote(&errs[i])) }
+        if opts.json_mode {
+            println("{\"chain_valid\":" + vs + ",\"autonomous\":true,\"agent_id\":" + json.quote(&aid) + ",\"agent_status\":" + json.quote(&afk.status) + ",\"errors\":[" + join_ref(&err_qs, ",") + "]}")
+        } else {
+            println("agent_id=" + aid + " autonomous=true chain_valid=" + vs + " status=" + afk.status)
+        }
+        if valid { << EXIT_OK }
+        << EXIT_CRYPTO
+    }
+
+    on := adoc.get(ar, "ownership")
+    ctrl_id := json_str_or(&adoc, adoc.get(on, "controller_id"), "")
+    ckv := json_int_or(&adoc, adoc.get(on, "controller_key_version"), 0)
+    cid := json_str_or(&adoc, adoc.get(on, "cred_id"), "")
+    kind := json_str_or(&adoc, adoc.get(on, "kind"), "")
+    lbl := json_str_or(&adoc, adoc.get(on, "label"), "")
+    ost := json_str_or(&adoc, adoc.get(on, "status"), "")
+    iat := json_int_or(&adoc, adoc.get(on, "issued_at"), 0)
+    exp := json_int_or(&adoc, adoc.get(on, "expires_at"), 0)
+    csig := json_str_or(&adoc, adoc.get(on, "controller_sig"), "")
+    absig := json_str_or(&adoc, adoc.get(on, "agent_binding_sig"), "")
+
+    $scopes := []string{}
+    if adoc.has(on, "scopes") && adoc.is_list(adoc.get(on, "scopes")) {
+        sa := adoc.get(on, "scopes")
+        for i in 0:adoc.count(sa) { scopes.push(json_str_or(&adoc, adoc.at(sa, i), "")) }
+    }
+
+    if ost != "active" { errs.push("ownership status is " + ost) }
+    if exp > 0 && now > exp { errs.push("credential expired") }
+
+    cfk := fetch_agent_key(cfg_opt.api_base + "", opts.timeout_sec, ctrl_id + "")
+    $cst := "unknown"
+    if !cfk.ok {
+        errs.push("failed fetching controller " + ctrl_id + ": " + cfk.err_msg)
+    } else {
+        cst = cfk.status + ""
+        if cfk.status != "active" { errs.push("controller status is " + cfk.status) }
+        cdoc := json.parse(&cfk.raw_json)
+        if !cdoc.ok() {
+            errs.push("invalid controller json")
+        } else {
+            cr := cdoc.root()
+            if cdoc.has(cr, "ownership") && !cdoc.is_null(cdoc.get(cr, "ownership")) {
+                errs.push("controller itself has ownership (violates 1-hop hierarchy)")
+            }
+            cli_verify_agent_rotations(&cdoc, ctrl_id + "", cfk.key_version, &cfk.pub_pem, $&errs)
+            cpem := cli_find_key_for_ver(&cdoc, ckv, cfk.key_version, &cfk.pub_pem)
+            if cpem.len == 0 {
+                errs.push("controller key version v" + strconv.itoa(ckv) + " missing")
+            } else {
+                $canon_pl := ""
+                if kind == "enrollment" {
+                    canon_pl = cli_canon_enrollment(ctrl_id + "", ckv, cid + "", exp, iat, lbl + "", &scopes)
+                } else if kind == "agent_cert" {
+                    pl := adoc.get(on, "payload")
+                    akv := json_int_or(&adoc, adoc.get(pl, "agent_key_version"), 0)
+                    afp := json_str_or(&adoc, adoc.get(pl, "agent_pub_fp"), "")
+                    apem_ver := cli_find_key_for_ver(&adoc, akv, afk.key_version, &afk.pub_pem)
+                    if apem_ver.len == 0 {
+                        errs.push("agent_cert agent_key_version v" + strconv.itoa(akv) + " missing from agent")
+                    } else if pubkey_fingerprint(&apem_ver) != afp {
+                        errs.push("agent_cert fingerprint does not match agent key")
+                    }
+                    canon_pl = cli_canon_agent_cert(aid + "", akv, afp + "", ctrl_id + "", ckv, cid + "", exp, iat, lbl + "", &scopes)
+                } else {
+                    errs.push("unknown ownership kind: " + kind)
+                }
+                if canon_pl.len > 0 && !cli_verify_pem_sig(&cpem, &canon_pl, csig + "") {
+                    errs.push("controller_sig verification failed")
+                }
+            }
+            // Verify roster entry in controller.managed_agents[]
+            $in_roster := false
+            if cdoc.has(cr, "managed_agents") && cdoc.is_list(cdoc.get(cr, "managed_agents")) {
+                arr := cdoc.get(cr, "managed_agents")
+                for i in 0:cdoc.count(arr) {
+                    el := cdoc.at(arr, i)
+                    if cdoc.is_dict(el) && json_str_or(&cdoc, cdoc.get(el, "agent_id"), "") == aid &&
+                       json_str_or(&cdoc, cdoc.get(el, "cred_id"), "") == cid {
+                        in_roster = true
+                        <-
+                    }
+                }
+            }
+            if !in_roster { errs.push("agent credential not listed in controller managed_agents roster") }
+        }
+    }
+
+    if adoc.has(on, "agent_binding") && !adoc.is_null(adoc.get(on, "agent_binding")) {
+        ab := adoc.get(on, "agent_binding")
+        ab_fp := json_str_or(&adoc, adoc.get(ab, "agent_pub_fp"), "")
+        ab_ts := json_int_or(&adoc, adoc.get(ab, "timestamp"), 0)
+        $bind_pem := ""
+        if pubkey_fingerprint(&afk.pub_pem) == ab_fp {
+            bind_pem = afk.pub_pem + ""
+        } else if adoc.has(ar, "key_history") && adoc.is_list(adoc.get(ar, "key_history")) {
+            kh := adoc.get(ar, "key_history")
+            for i in 0:adoc.count(kh) {
+                el := adoc.at(kh, i)
+                kpem := json_str_or(&adoc, adoc.get(el, "public_key_pem"), "")
+                if pubkey_fingerprint(&kpem) == ab_fp {
+                    bind_pem = kpem
+                    <-
+                }
+            }
+        }
+        if bind_pem.len == 0 {
+            errs.push("agent_binding fingerprint key missing from agent")
+        } else {
+            $canon_b := ""
+            if kind == "enrollment" {
+                canon_b = cli_canon_binding(ab_fp + "", ctrl_id + "", cid + "", ab_ts)
+            } else {
+                canon_b = cli_canon_adoption(aid + "", ab_fp + "", ctrl_id + "", ab_ts)
+            }
+            if !cli_verify_pem_sig(&bind_pem, &canon_b, absig + "") {
+                errs.push("agent_binding_sig verification failed")
+            }
+        }
+    }
+
+    valid := errs.len == 0
+    $vs := "false"
+    if valid { vs = "true" }
+    $err_qs := []string{}
+    for i in 0:errs.len { err_qs.push(json.quote(&errs[i])) }
+    if opts.json_mode {
+        println("{\"chain_valid\":" + vs +
+            ",\"autonomous\":false" +
+            ",\"controller_id\":" + json.quote(&ctrl_id) +
+            ",\"controller_status\":" + json.quote(&cst) +
+            ",\"cred_id\":" + json.quote(&cid) +
+            ",\"kind\":" + json.quote(&kind) +
+            ",\"scopes\":" + cli_scopes_json_array(&scopes) +
+            ",\"expires_at\":" + strconv.itoa(exp) +
+            ",\"agent_id\":" + json.quote(&aid) +
+            ",\"agent_status\":" + json.quote(&afk.status) +
+            ",\"ownership_status\":" + json.quote(&ost) +
+            ",\"errors\":[" + join_ref(&err_qs, ",") + "]}")
+    } else {
+        println("chain_valid=" + vs + " controller_id=" + ctrl_id + " -> cred_id=" + cid + " (" + kind + ") -> agent_id=" + aid + " status=" + ost)
+        for i in 0:errs.len { println("  error: " + errs[i]) }
+    }
+    if valid { << EXIT_OK }
+    << EXIT_CRYPTO
+}

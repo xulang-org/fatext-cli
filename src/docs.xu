@@ -109,12 +109,12 @@ fn cli_verify_doc_and_extract(
         sdoc := json.parse(&fk.raw_json)
         if !sdoc.ok() { << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "corrupt signer agent json") }
         signer_pem = cli_find_key_for_ver(&sdoc, signer_kv, fk.key_version, &fk.pub_pem)
-    } else if signed_by == "human" {
-        hfk := fetch_human_key(api_base + "", opts.timeout_sec, signer_id + "")
-        if !hfk.ok { << doc_verify_fail(hfk.err_code + "", hfk.exit_code, hfk.err_msg + "") }
-        hdoc := json.parse(&hfk.raw_json)
-        if !hdoc.ok() { << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "corrupt signer human json") }
-        signer_pem = cli_find_key_for_ver(&hdoc, signer_kv, hfk.key_version, &hfk.pub_pem)
+    } else if signed_by == "controller" {
+        cfk := fetch_agent_key(api_base + "", opts.timeout_sec, signer_id + "")
+        if !cfk.ok { << doc_verify_fail(cfk.err_code + "", cfk.exit_code, cfk.err_msg + "") }
+        cdoc := json.parse(&cfk.raw_json)
+        if !cdoc.ok() { << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "corrupt signer controller json") }
+        signer_pem = cli_find_key_for_ver(&cdoc, signer_kv, cfk.key_version, &cfk.pub_pem)
     } else {
         << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "unknown document signed_by: " + signed_by)
     }
@@ -206,34 +206,34 @@ fn build_signed_doc_put_body(
         if !afk.ok {
             << empty_api_err(false, afk.err_code + "", afk.err_msg + "")
         }
-        $has_human := false
-        $hid := ""
-        $hkv := 1
-        $hpem := ""
+        $has_ctrl := false
+        $cid := ""
+        $ckv := 1
+        $cpem := ""
         adoc := json.parse(&afk.raw_json)
         if adoc.ok() && adoc.has(adoc.root(), "ownership") && !adoc.is_null(adoc.get(adoc.root(), "ownership")) {
             on := adoc.get(adoc.root(), "ownership")
             if adoc.is_dict(on) {
-                oh := json_str_or(&adoc, adoc.get(on, "human_id"), "")
-                if oh.len > 0 {
-                    hfk := fetch_human_key(api_base + "", timeout_sec, oh + "")
-                    if !hfk.ok {
-                        << empty_api_err(false, hfk.err_code + "", "failed fetching owning human key: " + hfk.err_msg)
+                oc := json_str_or(&adoc, adoc.get(on, "controller_id"), "")
+                if oc.len > 0 {
+                    cfk := fetch_agent_key(api_base + "", timeout_sec, oc + "")
+                    if !cfk.ok {
+                        << empty_api_err(false, cfk.err_code + "", "failed fetching controller key: " + cfk.err_msg)
                     }
-                    has_human = true
-                    hid = oh
-                    hkv = hfk.key_version
-                    hpem = hfk.pub_pem + ""
+                    has_ctrl = true
+                    cid = oc
+                    ckv = cfk.key_version
+                    cpem = cfk.pub_pem + ""
                 }
             }
         }
-        if has_human {
-            hpk := decode_spki_public_pem(&hpem) or (err) {
+        if has_ctrl {
+            cpk := decode_spki_public_pem(&cpem) or (err) {
                 << empty_api_err(false, "ERR_CRYPTO", err.msg())
             }
             env_json = encrypt_doc_envelope(
                 agent_id + "", kind + "", next_ver, csha + "", plaintext,
-                afk.key_version, &afk.pk, true, hid + "", hkv, &hpk
+                afk.key_version, &afk.pk, true, cid + "", ckv, &cpk
             ) or (err) {
                 << empty_api_err(false, "ERR_CRYPTO", err.msg())
             }
@@ -491,9 +491,9 @@ pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
     << emit_err(opts, "ERR_USAGE", 0, "unknown " + kind + " subcommand: " + sub, 0, EXIT_USAGE)
 }
 
-pub fn cmd_human_doc(opts &CliOpts, kind string, args []string) int {
+pub fn cmd_ctl_doc(opts &CliOpts, kind string, args []string) int {
     if args.len < 2 {
-        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human " + kind + " <set|get|pull|status|lock|unlock|rm> <agent_id> ...", 0, EXIT_USAGE)
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl " + kind + " <set|get|pull|status|lock|unlock|rm> <agent_id> ...", 0, EXIT_USAGE)
     }
     sub := args[0] + ""
     aid := args[1] + ""
@@ -503,8 +503,8 @@ pub fn cmd_human_doc(opts &CliOpts, kind string, args []string) int {
     $rest := []string{}
     for i in 2:args.len { rest.push(args[i] + "") }
 
-    hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
 
     if sub == "set" {
         $vis := "public"
@@ -528,7 +528,7 @@ pub fn cmd_human_doc(opts &CliOpts, kind string, args []string) int {
                 has_text = true
                 text_val = rest[i] + ""
             } else if strings.has_prefix(&a, "-") && a != "-" {
-                << emit_err(opts, "ERR_USAGE", 0, "unknown human " + kind + " set flag: " + a, 0, EXIT_USAGE)
+                << emit_err(opts, "ERR_USAGE", 0, "unknown ctl " + kind + " set flag: " + a, 0, EXIT_USAGE)
             } else {
                 file_arg = a
             }
@@ -544,14 +544,14 @@ pub fn cmd_human_doc(opts &CliOpts, kind string, args []string) int {
                 << emit_err(opts, "ERR_CONFIG", 0, "failed reading file " + file_arg + ": " + err.msg(), 0, EXIT_CONFIG)
             }
         } else {
-            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human " + kind + " set <agent_id> [<file|->] [--text <str>] [--public|--private] [--lock|--unlock]", 0, EXIT_USAGE)
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl " + kind + " set <agent_id> [<file|->] [--text <str>] [--public|--private] [--lock|--unlock]", 0, EXIT_USAGE)
         }
         if content.len > 65536 {
             << emit_err(opts, "ERR_USAGE", 0, "document exceeds 65536 bytes", 0, EXIT_USAGE)
         }
 
         empty := ""
-        cur_r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "GET", "/v1/humans/agents/" + aid + "/docs/" + kind, &empty, "")
+        cur_r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents/" + aid + "/docs/" + kind, &empty, "")
         $next_ver := 1
         if cur_r.ok {
             cdoc := json.parse(&cur_r.body)
@@ -563,13 +563,13 @@ pub fn cmd_human_doc(opts &CliOpts, kind string, args []string) int {
         }
 
         built := build_signed_doc_put_body(
-            hc.api_base + "", opts.timeout_sec, aid + "", kind + "",
-            next_ver, vis + "", locked, fmt + "", &content, &priv, hc.human_id + "", hc.key_version
+            cfg.api_base + "", opts.timeout_sec, aid + "", kind + "",
+            next_ver, vis + "", locked, fmt + "", &content, &priv, cfg.agent_id + "", cfg.key_version
         )
         if !built.ok {
             << emit_err(opts, built.err_code + "", 0, built.err_msg + "", 0, EXIT_CRYPTO)
         }
-        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "PUT", "/v1/humans/agents/" + aid + "/docs/" + kind, &built.body, "")
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PUT", "/v1/ctl/agents/" + aid + "/docs/" + kind, &built.body, "")
         if !r.ok { << handle_api_fail(opts, &r) }
         if opts.json_mode {
             println(r.body)
@@ -590,21 +590,21 @@ pub fn cmd_human_doc(opts &CliOpts, kind string, args []string) int {
                 i += 1
                 out_path = rest[i] + ""
             } else {
-                << emit_err(opts, "ERR_USAGE", 0, "unknown human " + kind + " " + sub + " flag: " + a, 0, EXIT_USAGE)
+                << emit_err(opts, "ERR_USAGE", 0, "unknown ctl " + kind + " " + sub + " flag: " + a, 0, EXIT_USAGE)
             }
             i += 1
         }
         empty := ""
-        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "GET", "/v1/humans/agents/" + aid + "/docs/" + kind, &empty, "")
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents/" + aid + "/docs/" + kind, &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
-        dv := cli_verify_doc_and_extract(opts, hc.api_base + "", "human", hc.human_id + "", hc.home + "", hc.key_version, true, &priv, &r.body)
+        dv := cli_verify_doc_and_extract(opts, cfg.api_base + "", "controller", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &r.body)
         if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
         << emit_doc_output(opts, kind + "", out_path + "", &dv)
     }
 
     if sub == "status" {
         empty := ""
-        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "GET", "/v1/humans/agents/" + aid + "/docs", &empty, "")
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents/" + aid + "/docs", &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
         doc_status_print(opts, &r.body)
         << EXIT_OK
@@ -612,20 +612,20 @@ pub fn cmd_human_doc(opts &CliOpts, kind string, args []string) int {
 
     if sub == "lock" || sub == "unlock" {
         empty := ""
-        cur_r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "GET", "/v1/humans/agents/" + aid + "/docs/" + kind, &empty, "")
+        cur_r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents/" + aid + "/docs/" + kind, &empty, "")
         if !cur_r.ok { << handle_api_fail(opts, &cur_r) }
-        dv := cli_verify_doc_and_extract(opts, hc.api_base + "", "human", hc.human_id + "", hc.home + "", hc.key_version, true, &priv, &cur_r.body)
+        dv := cli_verify_doc_and_extract(opts, cfg.api_base + "", "controller", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &cur_r.body)
         if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
         next_ver := dv.version + 1
         new_locked := sub == "lock"
         built := build_signed_doc_put_body(
-            hc.api_base + "", opts.timeout_sec, aid + "", kind + "",
-            next_ver, dv.visibility + "", new_locked, dv.format + "", &dv.content, &priv, hc.human_id + "", hc.key_version
+            cfg.api_base + "", opts.timeout_sec, aid + "", kind + "",
+            next_ver, dv.visibility + "", new_locked, dv.format + "", &dv.content, &priv, cfg.agent_id + "", cfg.key_version
         )
         if !built.ok {
             << emit_err(opts, built.err_code + "", 0, built.err_msg + "", 0, EXIT_CRYPTO)
         }
-        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "PUT", "/v1/humans/agents/" + aid + "/docs/" + kind, &built.body, "")
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PUT", "/v1/ctl/agents/" + aid + "/docs/" + kind, &built.body, "")
         if !r.ok { << handle_api_fail(opts, &r) }
         if opts.json_mode {
             println(r.body)
@@ -637,11 +637,11 @@ pub fn cmd_human_doc(opts &CliOpts, kind string, args []string) int {
 
     if sub == "rm" || sub == "delete" {
         empty := ""
-        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "DELETE", "/v1/humans/agents/" + aid + "/docs/" + kind, &empty, "")
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/ctl/agents/" + aid + "/docs/" + kind, &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
         if opts.json_mode { println(r.body) } else { println("deleted " + kind + " for " + aid) }
         << EXIT_OK
     }
 
-    << emit_err(opts, "ERR_USAGE", 0, "unknown human " + kind + " subcommand: " + sub, 0, EXIT_USAGE)
+    << emit_err(opts, "ERR_USAGE", 0, "unknown ctl " + kind + " subcommand: " + sub, 0, EXIT_USAGE)
 }

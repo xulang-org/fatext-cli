@@ -115,7 +115,7 @@ fn cli_load_human_cfg_or_base(opts &CliOpts, api_base string) HumanConfig {
 
 pub fn cmd_human(opts &CliOpts, args []string) int {
     if args.len < 1 {
-        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human <init|whoami|profile|key|fetch|cred|agents|grant|suspend|resume|revoke|policy> ...", 0, EXIT_USAGE)
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human <init|whoami|profile|key|fetch|cred|agents|grant|suspend|resume|revoke|policy|soul|rules> ...", 0, EXIT_USAGE)
     }
     sub := args[0] + ""
     $rest := []string{}
@@ -374,7 +374,31 @@ pub fn cmd_human(opts &CliOpts, args []string) int {
         empty := ""
         r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "GET", "/v1/humans/agents", &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
-        println(r.body)
+        if opts.json_mode {
+            println(r.body)
+            << EXIT_OK
+        }
+        ldoc := json.parse(&r.body)
+        if !ldoc.ok() || !ldoc.has(ldoc.root(), "agents") || !ldoc.is_list(ldoc.get(ldoc.root(), "agents")) {
+            println(r.body)
+            << EXIT_OK
+        }
+        arr := ldoc.get(ldoc.root(), "agents")
+        for ai in 0:ldoc.count(arr) {
+            el := ldoc.at(arr, ai)
+            if !ldoc.is_dict(el) { -> }
+            aid_s := json_str_or(&ldoc, ldoc.get(el, "agent_id"), "")
+            nm_s := json_str_or(&ldoc, ldoc.get(el, "name"), "")
+            lb_s := json_str_or(&ldoc, ldoc.get(el, "label"), "")
+            ost_s := json_str_or(&ldoc, ldoc.get(el, "ownership_status"), "")
+            ast_s := json_str_or(&ldoc, ldoc.get(el, "agent_status"), "")
+            scs_s := json_encode_or(&ldoc, ldoc.get(el, "scopes"), "[]")
+            $nm_part := ""
+            if nm_s.len > 0 { nm_part = " name=" + json.quote(&nm_s) }
+            $lb_part := ""
+            if lb_s.len > 0 { lb_part = " label=" + json.quote(&lb_s) }
+            println(aid_s + nm_part + lb_part + " status=" + ast_s + "/" + ost_s + " scopes=" + scs_s)
+        }
         << EXIT_OK
     }
 
@@ -491,8 +515,10 @@ pub fn cmd_human(opts &CliOpts, args []string) int {
     }
 
     if sub == "policy" {
-        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human policy <agent_id> [--dm-policy ...] [--accept-email true|false] [--clear-webhook]", 0, EXIT_USAGE) }
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human policy <agent_id> [--name ...] [--dm-policy ...] [--accept-email true|false] [--clear-webhook]", 0, EXIT_USAGE) }
         aid := rest[0] + ""
+        $has_name := false
+        $aname := ""
         $has_dmp := false
         $dmp := ""
         $has_ae := false
@@ -501,7 +527,11 @@ pub fn cmd_human(opts &CliOpts, args []string) int {
         $i := 1
         while i < rest.len {
             a := rest[i] + ""
-            if a == "--dm-policy" && i + 1 < rest.len {
+            if a == "--name" && i + 1 < rest.len {
+                i += 1
+                has_name = true
+                aname = rest[i] + ""
+            } else if a == "--dm-policy" && i + 1 < rest.len {
                 i += 1
                 has_dmp = true
                 dmp = rest[i] + ""
@@ -516,6 +546,7 @@ pub fn cmd_human(opts &CliOpts, args []string) int {
         hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $parts := []string{}
+        if has_name { parts.push("\"name\":" + json.quote(&aname)) }
         if has_dmp { parts.push("\"dm_policy\":" + json.quote(&dmp)) }
         if has_ae {
             $ae_s := "false"
@@ -528,6 +559,10 @@ pub fn cmd_human(opts &CliOpts, args []string) int {
         if !r.ok { << handle_api_fail(opts, &r) }
         println(r.body)
         << EXIT_OK
+    }
+
+    if sub == "soul" || sub == "rules" {
+        << cmd_human_doc(opts, sub + "", rest)
     }
 
     << emit_err(opts, "ERR_USAGE", 0, "unknown human subcommand: " + sub, 0, EXIT_USAGE)
@@ -561,7 +596,7 @@ pub fn cmd_claim_proof(opts &CliOpts, args []string) int {
     << EXIT_OK
 }
 
-fn cli_find_key_for_ver(doc &json.Doc, want_ver int, cur_ver int, cur_pem &string) string {
+pub fn cli_find_key_for_ver(doc &json.Doc, want_ver int, cur_ver int, cur_pem &string) string {
     if want_ver == cur_ver { << cur_pem + "" }
     rt := doc.root()
     if !doc.has(rt, "key_history") || !doc.is_list(doc.get(rt, "key_history")) { << "" }

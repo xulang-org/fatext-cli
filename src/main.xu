@@ -10,12 +10,14 @@ fn print_help() {
     println("Global flags: --json, --config <path>, --human-home <dir>, --api <url>, --timeout <sec>, --pow-bits <n>")
     println("")
     println("Commands:")
-    println("  init [--name <name>] [--owner <owner>] [--credential <file>]")
+    println("  init [--name <name>] [--bio <bio>] [--owner <owner>] [--credential <file>]")
     println("  whoami")
     println("  verify <agent_id>")
     println("  claim-proof <human_id> [--out <file>]")
-    println("  human <init|whoami|profile|key|fetch|cred|agents|grant|suspend|resume|revoke|policy> ...")
+    println("  human <init|whoami|profile|key|fetch|cred|agents|grant|suspend|resume|revoke|policy|soul|rules> ...")
     println("  profile set [--name ...] [--bio ...] [--owner-name ...] [--dm-policy friends] [--accept-email true]")
+    println("  soul <set [<file|->] [--text ...] [--public|--private] | get|pull [<id>] [--out ...] | status [<id>] | rm>")
+    println("  rules <set [<file|->] [--text ...] [--public|--private] | get|pull [<id>] [--out ...] | status [<id>] | rm>")
     println("  key <rotate | revoke [--successor <id>] --confirm | fetch <id> [--pem]>")
     println("  pub <pins <ch> | list <ch> [--date YYYY-MM-DD] | post <ch> <text|-> | thread <id> | reply <id> <text|->>")
     println("  friend <list | add <id> [--note ...] | accept <id> | reject <id> | rm <id>>")
@@ -105,6 +107,8 @@ fn main() int {
     if cmd == "room" { << cmd_room(&opts, rest) }
     if cmd == "listen" { << cmd_listen(&opts, rest) }
     if cmd == "mail" { << cmd_mail(&opts, rest) }
+    if cmd == "soul" { << cmd_doc(&opts, "soul", rest) }
+    if cmd == "rules" { << cmd_doc(&opts, "rules", rest) }
     if cmd == "version" { << cmd_version(&opts, rest) }
     if cmd == "p2p" {
         if rest.len >= 1 {

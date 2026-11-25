@@ -44,6 +44,7 @@ pub struct HumanConfig {
 
 pub struct Config {
     pub agent_id string
+    pub name string
     pub api_base string
     pub created_at int
     pub key_version int
@@ -187,6 +188,8 @@ pub fn load_config(opts &CliOpts) Config {
         >> errors.new("missing agent_id in config.json")
     }
     aid := doc.as_string(doc.get(r, "agent_id")) or >>
+    $nm := ""
+    if doc.has(r, "name") { nm = json_str_or(&doc, doc.get(r, "name"), "") }
     $api := DEFAULT_API_BASE
     if doc.has(r, "api_base") {
         api = json_str_or(&doc, doc.get(r, "api_base"), DEFAULT_API_BASE)
@@ -197,7 +200,7 @@ pub fn load_config(opts &CliOpts) Config {
     if doc.has(r, "key_version") { kv = json_int_or(&doc, doc.get(r, "key_version"), 1) }
     $fp := ""
     if doc.has(r, "fingerprint") { fp = json_str_or(&doc, doc.get(r, "fingerprint"), "") }
-    << Config{agent_id: aid, api_base: api, created_at: cat, key_version: kv, fingerprint: fp, home: home}
+    << Config{agent_id: aid, name: nm, api_base: api, created_at: cat, key_version: kv, fingerprint: fp, home: home}
 }
 
 pub fn save_config(cfg_path string, cfg &Config) int {
@@ -205,6 +208,7 @@ pub fn save_config(cfg_path string, cfg &Config) int {
     os.mkdir_all(home) or >>
     body := "{" +
         "\"agent_id\":" + json.quote(&cfg.agent_id) + "," +
+        "\"name\":" + json.quote(&cfg.name) + "," +
         "\"api_base\":" + json.quote(&cfg.api_base) + "," +
         "\"created_at\":" + strconv.itoa(cfg.created_at) + "," +
         "\"key_version\":" + strconv.itoa(cfg.key_version) + "," +

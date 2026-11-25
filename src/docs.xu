@@ -1,0 +1,647 @@
+@main
+
+#crypto/rsa
+#crypto/sha256
+#encoding/json
+#math/big
+#os
+#strconv
+#strings
+#time
+
+pub fn cli_canon_doc_payload(
+    agent_id string,
+    content_sha256 string,
+    kind string,
+    locked bool,
+    signer_id string,
+    signer_key_version int,
+    updated_at int,
+    version int,
+    visibility string
+) string {
+    $lck := "false"
+    if locked { lck = "true" }
+    << "{\"agent_id\":" + json.quote(&agent_id) +
+        ",\"content_sha256\":" + json.quote(&content_sha256) +
+        ",\"kind\":" + json.quote(&kind) +
+        ",\"locked\":" + lck +
+        ",\"signer_id\":" + json.quote(&signer_id) +
+        ",\"signer_key_version\":" + strconv.itoa(signer_key_version) +
+        ",\"updated_at\":" + strconv.itoa(updated_at) +
+        ",\"version\":" + strconv.itoa(version) +
+        ",\"visibility\":" + json.quote(&visibility) + "}"
+}
+
+struct DocVerifyOut {
+    ok bool
+    err string
+    err_code string
+    exit_code int
+    agent_id string
+    kind string
+    version int
+    visibility string
+    locked bool
+    locked_by string
+    format string
+    content_sha256 string
+    content_bytes int
+    content string
+    signed_by string
+    signer_id string
+    signer_key_version int
+    updated_at int
+    signature string
+}
+
+fn doc_verify_fail(code string, exit_c int, msg string) DocVerifyOut {
+    << DocVerifyOut{
+        ok: false, err: msg, err_code: code, exit_code: exit_c,
+        agent_id: "", kind: "", version: 0, visibility: "", locked: false,
+        locked_by: "", format: "", content_sha256: "", content_bytes: 0,
+        content: "", signed_by: "", signer_id: "", signer_key_version: 0,
+        updated_at: 0, signature: ""
+    }
+}
+
+fn cli_verify_doc_and_extract(
+    opts &CliOpts,
+    api_base string,
+    role string,
+    self_id string,
+    home string,
+    cur_kv int,
+    has_priv bool,
+    cur_priv &rsa.PrivateKey,
+    raw_json &string
+) DocVerifyOut {
+    doc := json.parse(raw_json)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "invalid document json")
+    }
+    r := doc.root()
+    aid := json_str_or(&doc, doc.get(r, "agent_id"), "")
+    kind := json_str_or(&doc, doc.get(r, "kind"), "")
+    ver := json_int_or(&doc, doc.get(r, "version"), 0)
+    vis := json_str_or(&doc, doc.get(r, "visibility"), "")
+    $locked := false
+    if doc.has(r, "locked") { locked = json_bool_or(&doc, doc.get(r, "locked"), false) }
+    locked_by := json_str_or(&doc, doc.get(r, "locked_by"), "")
+    fmt := json_str_or(&doc, doc.get(r, "format"), "markdown")
+    csha := json_str_or(&doc, doc.get(r, "content_sha256"), "")
+    cbytes := json_int_or(&doc, doc.get(r, "content_bytes"), 0)
+    signed_by := json_str_or(&doc, doc.get(r, "signed_by"), "")
+    signer_id := json_str_or(&doc, doc.get(r, "signer_id"), "")
+    signer_kv := json_int_or(&doc, doc.get(r, "signer_key_version"), 0)
+    uat := json_int_or(&doc, doc.get(r, "updated_at"), 0)
+    sig := json_str_or(&doc, doc.get(r, "signature"), "")
+
+    if aid.len == 0 || kind.len == 0 || ver < 1 || csha.len != 64 || sig.len == 0 {
+        << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "incomplete document metadata or signature")
+    }
+
+    // Fetch signer public key matching signer_key_version
+    $signer_pem := ""
+    if signed_by == "agent" {
+        fk := fetch_agent_key(api_base + "", opts.timeout_sec, signer_id + "")
+        if !fk.ok { << doc_verify_fail(fk.err_code + "", fk.exit_code, fk.err_msg + "") }
+        sdoc := json.parse(&fk.raw_json)
+        if !sdoc.ok() { << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "corrupt signer agent json") }
+        signer_pem = cli_find_key_for_ver(&sdoc, signer_kv, fk.key_version, &fk.pub_pem)
+    } else if signed_by == "human" {
+        hfk := fetch_human_key(api_base + "", opts.timeout_sec, signer_id + "")
+        if !hfk.ok { << doc_verify_fail(hfk.err_code + "", hfk.exit_code, hfk.err_msg + "") }
+        hdoc := json.parse(&hfk.raw_json)
+        if !hdoc.ok() { << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "corrupt signer human json") }
+        signer_pem = cli_find_key_for_ver(&hdoc, signer_kv, hfk.key_version, &hfk.pub_pem)
+    } else {
+        << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "unknown document signed_by: " + signed_by)
+    }
+    if signer_pem.len == 0 {
+        << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "signer key v" + strconv.itoa(signer_kv) + " missing")
+    }
+    spk := decode_spki_public_pem(&signer_pem) or (err) {
+        << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, err.msg())
+    }
+    canon := cli_canon_doc_payload(aid + "", csha + "", kind + "", locked, signer_id + "", signer_kv, uat, ver, vis + "")
+    if !verify_pss_message(&spk, &canon, sig + "") {
+        << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "document signature verification failed")
+    }
+
+    $plaintext := ""
+    if vis == "public" {
+        if !doc.has(r, "content") || doc.is_null(doc.get(r, "content")) {
+            << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "missing public document content")
+        }
+        plaintext = json_str_or(&doc, doc.get(r, "content"), "")
+        if sha256.sum256(plaintext + "") != csha {
+            << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "public document sha256 mismatch")
+        }
+    } else if vis == "private" {
+        if !has_priv {
+            << doc_verify_fail("ERR_FORBIDDEN", EXIT_FORBIDDEN, "private document requires credentials to decrypt")
+        }
+        if !doc.has(r, "envelope") || doc.is_null(doc.get(r, "envelope")) {
+            << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "missing encrypted doc envelope")
+        }
+        env_json := json_encode_or(&doc, doc.get(r, "envelope"), "")
+        dec := decrypt_doc_envelope(role + "", self_id + "", home + "", cur_kv, cur_priv, aid + "", kind + "", ver, csha + "", &env_json)
+        if !dec.ok {
+            << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, dec.err + "")
+        }
+        plaintext = dec.plaintext
+    } else {
+        << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "unknown visibility: " + vis)
+    }
+
+    << DocVerifyOut{
+        ok: true, err: "", err_code: "", exit_code: EXIT_OK,
+        agent_id: aid, kind: kind, version: ver, visibility: vis, locked: locked,
+        locked_by: locked_by, format: fmt, content_sha256: csha, content_bytes: cbytes,
+        content: plaintext, signed_by: signed_by, signer_id: signer_id,
+        signer_key_version: signer_kv, updated_at: uat, signature: sig
+    }
+}
+
+fn doc_verified_json_out(dv &DocVerifyOut) string {
+    $lck := "false"
+    if dv.locked { lck = "true" }
+    << "{\"agent_id\":" + json.quote(&dv.agent_id) +
+        ",\"kind\":" + json.quote(&dv.kind) +
+        ",\"version\":" + strconv.itoa(dv.version) +
+        ",\"visibility\":" + json.quote(&dv.visibility) +
+        ",\"locked\":" + lck +
+        ",\"locked_by\":" + json.quote(&dv.locked_by) +
+        ",\"format\":" + json.quote(&dv.format) +
+        ",\"content_sha256\":" + json.quote(&dv.content_sha256) +
+        ",\"content_bytes\":" + strconv.itoa(dv.content_bytes) +
+        ",\"signed_by\":" + json.quote(&dv.signed_by) +
+        ",\"signer_id\":" + json.quote(&dv.signer_id) +
+        ",\"signer_key_version\":" + strconv.itoa(dv.signer_key_version) +
+        ",\"updated_at\":" + strconv.itoa(dv.updated_at) +
+        ",\"verified\":true" +
+        ",\"content\":" + json.quote(&dv.content) + "}"
+}
+
+fn build_signed_doc_put_body(
+    api_base string,
+    timeout_sec int,
+    agent_id string,
+    kind string,
+    next_ver int,
+    vis string,
+    locked bool,
+    fmt string,
+    plaintext &string,
+    signer_priv &rsa.PrivateKey,
+    signer_id string,
+    signer_kv int
+) ApiResp {
+    csha := sha256.sum256(plaintext + "")
+    uat := time.now_time().unix()
+    $env_json := ""
+    if vis == "private" {
+        afk := fetch_agent_key(api_base + "", timeout_sec, agent_id + "")
+        if !afk.ok {
+            << empty_api_err(false, afk.err_code + "", afk.err_msg + "")
+        }
+        $has_human := false
+        $hid := ""
+        $hkv := 1
+        $hpem := ""
+        adoc := json.parse(&afk.raw_json)
+        if adoc.ok() && adoc.has(adoc.root(), "ownership") && !adoc.is_null(adoc.get(adoc.root(), "ownership")) {
+            on := adoc.get(adoc.root(), "ownership")
+            if adoc.is_dict(on) {
+                oh := json_str_or(&adoc, adoc.get(on, "human_id"), "")
+                if oh.len > 0 {
+                    hfk := fetch_human_key(api_base + "", timeout_sec, oh + "")
+                    if !hfk.ok {
+                        << empty_api_err(false, hfk.err_code + "", "failed fetching owning human key: " + hfk.err_msg)
+                    }
+                    has_human = true
+                    hid = oh
+                    hkv = hfk.key_version
+                    hpem = hfk.pub_pem + ""
+                }
+            }
+        }
+        if has_human {
+            hpk := decode_spki_public_pem(&hpem) or (err) {
+                << empty_api_err(false, "ERR_CRYPTO", err.msg())
+            }
+            env_json = encrypt_doc_envelope(
+                agent_id + "", kind + "", next_ver, csha + "", plaintext,
+                afk.key_version, &afk.pk, true, hid + "", hkv, &hpk
+            ) or (err) {
+                << empty_api_err(false, "ERR_CRYPTO", err.msg())
+            }
+        } else {
+            env_json = encrypt_doc_envelope(
+                agent_id + "", kind + "", next_ver, csha + "", plaintext,
+                afk.key_version, &afk.pk, false, "", 0, &afk.pk
+            ) or (err) {
+                << empty_api_err(false, "ERR_CRYPTO", err.msg())
+            }
+        }
+    }
+
+    canon := cli_canon_doc_payload(agent_id + "", csha + "", kind + "", locked, signer_id + "", signer_kv, uat, next_ver, vis + "")
+    sig := sign_pss_message(signer_priv, &canon) or (err) {
+        << empty_api_err(false, "ERR_CRYPTO", err.msg())
+    }
+
+    $lck := "false"
+    if locked { lck = "true" }
+    $body := "{\"version\":" + strconv.itoa(next_ver) +
+        ",\"visibility\":" + json.quote(&vis) +
+        ",\"locked\":" + lck +
+        ",\"format\":" + json.quote(&fmt) +
+        ",\"content_sha256\":" + json.quote(&csha)
+    if vis == "public" {
+        body = body + ",\"content\":" + json.quote(plaintext)
+    } else {
+        body = body + ",\"content_bytes\":" + strconv.itoa(plaintext.len) + ",\"envelope\":" + env_json
+    }
+    body = body + ",\"updated_at\":" + strconv.itoa(uat) + ",\"signature\":" + json.quote(&sig) + "}"
+    << ApiResp{ok: true, status: 200, retry_after: 0, required_bits: 0, err_code: "", err_msg: "", body: body, net_err: false}
+}
+
+fn cli_dummy_priv() rsa.PrivateKey {
+    << rsa.PrivateKey{public: rsa.PublicKey{n: big.new_int(0), e: 65537}, d: big.new_int(0), p: big.new_int(0), q: big.new_int(0)}
+}
+
+fn emit_doc_output(opts &CliOpts, kind string, out_path string, dv &DocVerifyOut) int {
+    if out_path.len > 0 {
+        $mode := 420
+        if dv.visibility == "private" { mode = 384 }
+        write_atomic_mode(out_path + "", &dv.content, mode) or (err) {
+            << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+        }
+        if opts.json_mode {
+            println(doc_verified_json_out(dv))
+        } else {
+            println("wrote " + kind + " v" + strconv.itoa(dv.version) + " -> " + out_path)
+        }
+        << EXIT_OK
+    }
+    if opts.json_mode {
+        println(doc_verified_json_out(dv))
+        << EXIT_OK
+    }
+    c := dv.content + ""
+    if c.len > 0 && (c[c.len - 1] & 255) == 10 {
+        println(c[0:(c.len - 1)])
+    } else {
+        println(c)
+    }
+    << EXIT_OK
+}
+
+fn doc_status_print(opts &CliOpts, raw &string) {
+    if opts.json_mode {
+        println(raw + "")
+        <<
+    }
+    doc := json.parse(raw)
+    if !doc.ok() {
+        println(raw + "")
+        <<
+    }
+    rt := doc.root()
+    aid := json_str_or(&doc, doc.get(rt, "agent_id"), "")
+    println("agent_id=" + aid)
+    kinds := ["soul", "rules"]
+    for i in 0:2 {
+        k := kinds[i] + ""
+        if !doc.has(rt, k + "") || doc.is_null(doc.get(rt, k + "")) {
+            println("  " + k + ": (none)")
+        } else {
+            kn := doc.get(rt, k + "")
+            ver := json_int_or(&doc, doc.get(kn, "version"), 0)
+            vis := json_str_or(&doc, doc.get(kn, "visibility"), "")
+            lck := json_bool_or(&doc, doc.get(kn, "locked"), false)
+            cb := json_int_or(&doc, doc.get(kn, "content_bytes"), 0)
+            sb := json_str_or(&doc, doc.get(kn, "signed_by"), "")
+            sid := json_str_or(&doc, doc.get(kn, "signer_id"), "")
+            $ls := "unlocked"
+            if lck { ls = "locked" }
+            println("  " + k + ": v" + strconv.itoa(ver) + " " + vis + " " + ls + " bytes=" + strconv.itoa(cb) + " signer=" + sb + ":" + sid)
+        }
+    }
+}
+
+pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
+    if args.len < 1 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext " + kind + " <set|get|pull|status|rm> ...", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    $rest := []string{}
+    for i in 1:args.len { rest.push(args[i] + "") }
+
+    if sub == "set" {
+        $vis := "public"
+        $fmt := "markdown"
+        $has_text := false
+        $text_val := ""
+        $file_arg := ""
+        $i := 0
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--public" { vis = "public" }
+            else if a == "--private" { vis = "private" }
+            else if a == "--format" && i + 1 < rest.len {
+                i += 1
+                fmt = rest[i] + ""
+            } else if a == "--text" && i + 1 < rest.len {
+                i += 1
+                has_text = true
+                text_val = rest[i] + ""
+            } else if strings.has_prefix(&a, "-") && a != "-" {
+                << emit_err(opts, "ERR_USAGE", 0, "unknown " + kind + " set flag: " + a, 0, EXIT_USAGE)
+            } else {
+                file_arg = a
+            }
+            i += 1
+        }
+        $content := ""
+        if has_text {
+            content = text_val
+        } else if file_arg == "-" {
+            content = read_stdin_all()
+        } else if file_arg.len > 0 {
+            content = os.read(file_arg + "") or (err) {
+                << emit_err(opts, "ERR_CONFIG", 0, "failed reading file " + file_arg + ": " + err.msg(), 0, EXIT_CONFIG)
+            }
+        } else {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext " + kind + " set [<file|->] [--text <str>] [--public|--private] [--format markdown|text]", 0, EXIT_USAGE)
+        }
+        if content.len > 65536 {
+            << emit_err(opts, "ERR_USAGE", 0, "document exceeds 65536 bytes", 0, EXIT_USAGE)
+        }
+
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+
+        empty := ""
+        cur_r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/agents/docs/" + kind, &empty, "")
+        $next_ver := 1
+        if cur_r.ok {
+            cdoc := json.parse(&cur_r.body)
+            if cdoc.ok() && cdoc.has(cdoc.root(), "version") {
+                next_ver = json_int_or(&cdoc, cdoc.get(cdoc.root(), "version"), 0) + 1
+            }
+        } else if cur_r.status != 404 {
+            << handle_api_fail(opts, &cur_r)
+        }
+
+        built := build_signed_doc_put_body(
+            cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", kind + "",
+            next_ver, vis + "", false, fmt + "", &content, &priv, cfg.agent_id + "", cfg.key_version
+        )
+        if !built.ok {
+            << emit_err(opts, built.err_code + "", 0, built.err_msg + "", 0, EXIT_CRYPTO)
+        }
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PUT", "/v1/agents/docs/" + kind, &built.body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        if opts.json_mode {
+            println(r.body)
+        } else {
+            println("saved " + kind + " v" + strconv.itoa(next_ver) + " (" + vis + ", " + strconv.itoa(content.len) + " bytes)")
+        }
+        << EXIT_OK
+    }
+
+    if sub == "get" || sub == "pull" {
+        $target := ""
+        $out_path := ""
+        $i := 0
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--out" && i + 1 < rest.len {
+                i += 1
+                out_path = rest[i] + ""
+            } else if strings.has_prefix(&a, "-") {
+                << emit_err(opts, "ERR_USAGE", 0, "unknown " + kind + " " + sub + " flag: " + a, 0, EXIT_USAGE)
+            } else {
+                target = a
+            }
+            i += 1
+        }
+
+        $api_base := resolve_api_base(opts, "")
+        cfg_opt := load_config_or_base(opts, api_base + "")
+        if target.len == 0 || (cfg_opt.agent_id.len > 0 && target == cfg_opt.agent_id) {
+            cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            empty := ""
+            r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/agents/docs/" + kind, &empty, "")
+            if !r.ok { << handle_api_fail(opts, &r) }
+            dv := cli_verify_doc_and_extract(opts, cfg.api_base + "", "agent", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &r.body)
+            if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
+            << emit_doc_output(opts, kind + "", out_path + "", &dv)
+        }
+
+        if !is_valid_agent_id(target + "") {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid agent_id: " + target, 0, EXIT_USAGE)
+        }
+        empty := ""
+        r := api_call_anon(cfg_opt.api_base + "", opts.timeout_sec, "GET", "/k/" + target + "/" + kind + ".json", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        raw_body := r.body + ""
+        api_base = cfg_opt.api_base + ""
+        dpriv := cli_dummy_priv()
+        dv := cli_verify_doc_and_extract(opts, api_base + "", "agent", target + "", "", 1, false, &dpriv, &raw_body)
+        if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
+        << emit_doc_output(opts, kind + "", out_path + "", &dv)
+    }
+
+    if sub == "status" {
+        if rest.len == 0 {
+            cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            empty := ""
+            r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/agents/docs", &empty, "")
+            if !r.ok { << handle_api_fail(opts, &r) }
+            doc_status_print(opts, &r.body)
+            << EXIT_OK
+        }
+        aid := rest[0] + ""
+        if !is_valid_agent_id(aid + "") { << emit_err(opts, "ERR_USAGE", 0, "invalid agent_id", 0, EXIT_USAGE) }
+        api_base := resolve_api_base(opts, "")
+        cfg_opt := load_config_or_base(opts, api_base + "")
+        empty := ""
+        r := api_call_anon(cfg_opt.api_base + "", opts.timeout_sec, "GET", "/k/" + aid + "/docs.json", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        doc_status_print(opts, &r.body)
+        << EXIT_OK
+    }
+
+    if sub == "rm" || sub == "delete" {
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        empty := ""
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/agents/docs/" + kind, &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        if opts.json_mode { println(r.body) } else { println("deleted " + kind) }
+        << EXIT_OK
+    }
+
+    << emit_err(opts, "ERR_USAGE", 0, "unknown " + kind + " subcommand: " + sub, 0, EXIT_USAGE)
+}
+
+pub fn cmd_human_doc(opts &CliOpts, kind string, args []string) int {
+    if args.len < 2 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human " + kind + " <set|get|pull|status|lock|unlock|rm> <agent_id> ...", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    aid := args[1] + ""
+    if !is_valid_agent_id(aid + "") {
+        << emit_err(opts, "ERR_USAGE", 0, "invalid agent_id: " + aid, 0, EXIT_USAGE)
+    }
+    $rest := []string{}
+    for i in 2:args.len { rest.push(args[i] + "") }
+
+    hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+
+    if sub == "set" {
+        $vis := "public"
+        $fmt := "markdown"
+        $locked := false
+        $has_text := false
+        $text_val := ""
+        $file_arg := ""
+        $i := 0
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--public" { vis = "public" }
+            else if a == "--private" { vis = "private" }
+            else if a == "--lock" { locked = true }
+            else if a == "--unlock" { locked = false }
+            else if a == "--format" && i + 1 < rest.len {
+                i += 1
+                fmt = rest[i] + ""
+            } else if a == "--text" && i + 1 < rest.len {
+                i += 1
+                has_text = true
+                text_val = rest[i] + ""
+            } else if strings.has_prefix(&a, "-") && a != "-" {
+                << emit_err(opts, "ERR_USAGE", 0, "unknown human " + kind + " set flag: " + a, 0, EXIT_USAGE)
+            } else {
+                file_arg = a
+            }
+            i += 1
+        }
+        $content := ""
+        if has_text {
+            content = text_val
+        } else if file_arg == "-" {
+            content = read_stdin_all()
+        } else if file_arg.len > 0 {
+            content = os.read(file_arg + "") or (err) {
+                << emit_err(opts, "ERR_CONFIG", 0, "failed reading file " + file_arg + ": " + err.msg(), 0, EXIT_CONFIG)
+            }
+        } else {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human " + kind + " set <agent_id> [<file|->] [--text <str>] [--public|--private] [--lock|--unlock]", 0, EXIT_USAGE)
+        }
+        if content.len > 65536 {
+            << emit_err(opts, "ERR_USAGE", 0, "document exceeds 65536 bytes", 0, EXIT_USAGE)
+        }
+
+        empty := ""
+        cur_r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "GET", "/v1/humans/agents/" + aid + "/docs/" + kind, &empty, "")
+        $next_ver := 1
+        if cur_r.ok {
+            cdoc := json.parse(&cur_r.body)
+            if cdoc.ok() && cdoc.has(cdoc.root(), "version") {
+                next_ver = json_int_or(&cdoc, cdoc.get(cdoc.root(), "version"), 0) + 1
+            }
+        } else if cur_r.status != 404 {
+            << handle_api_fail(opts, &cur_r)
+        }
+
+        built := build_signed_doc_put_body(
+            hc.api_base + "", opts.timeout_sec, aid + "", kind + "",
+            next_ver, vis + "", locked, fmt + "", &content, &priv, hc.human_id + "", hc.key_version
+        )
+        if !built.ok {
+            << emit_err(opts, built.err_code + "", 0, built.err_msg + "", 0, EXIT_CRYPTO)
+        }
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "PUT", "/v1/humans/agents/" + aid + "/docs/" + kind, &built.body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        if opts.json_mode {
+            println(r.body)
+        } else {
+            $ls := "unlocked"
+            if locked { ls = "locked" }
+            println("saved " + kind + " v" + strconv.itoa(next_ver) + " for " + aid + " (" + vis + ", " + ls + ")")
+        }
+        << EXIT_OK
+    }
+
+    if sub == "get" || sub == "pull" {
+        $out_path := ""
+        $i := 0
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--out" && i + 1 < rest.len {
+                i += 1
+                out_path = rest[i] + ""
+            } else {
+                << emit_err(opts, "ERR_USAGE", 0, "unknown human " + kind + " " + sub + " flag: " + a, 0, EXIT_USAGE)
+            }
+            i += 1
+        }
+        empty := ""
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "GET", "/v1/humans/agents/" + aid + "/docs/" + kind, &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        dv := cli_verify_doc_and_extract(opts, hc.api_base + "", "human", hc.human_id + "", hc.home + "", hc.key_version, true, &priv, &r.body)
+        if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
+        << emit_doc_output(opts, kind + "", out_path + "", &dv)
+    }
+
+    if sub == "status" {
+        empty := ""
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "GET", "/v1/humans/agents/" + aid + "/docs", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        doc_status_print(opts, &r.body)
+        << EXIT_OK
+    }
+
+    if sub == "lock" || sub == "unlock" {
+        empty := ""
+        cur_r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "GET", "/v1/humans/agents/" + aid + "/docs/" + kind, &empty, "")
+        if !cur_r.ok { << handle_api_fail(opts, &cur_r) }
+        dv := cli_verify_doc_and_extract(opts, hc.api_base + "", "human", hc.human_id + "", hc.home + "", hc.key_version, true, &priv, &cur_r.body)
+        if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
+        next_ver := dv.version + 1
+        new_locked := sub == "lock"
+        built := build_signed_doc_put_body(
+            hc.api_base + "", opts.timeout_sec, aid + "", kind + "",
+            next_ver, dv.visibility + "", new_locked, dv.format + "", &dv.content, &priv, hc.human_id + "", hc.key_version
+        )
+        if !built.ok {
+            << emit_err(opts, built.err_code + "", 0, built.err_msg + "", 0, EXIT_CRYPTO)
+        }
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "PUT", "/v1/humans/agents/" + aid + "/docs/" + kind, &built.body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        if opts.json_mode {
+            println(r.body)
+        } else {
+            println(sub + "ed " + kind + " v" + strconv.itoa(next_ver) + " for " + aid)
+        }
+        << EXIT_OK
+    }
+
+    if sub == "rm" || sub == "delete" {
+        empty := ""
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "DELETE", "/v1/humans/agents/" + aid + "/docs/" + kind, &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        if opts.json_mode { println(r.body) } else { println("deleted " + kind + " for " + aid) }
+        << EXIT_OK
+    }
+
+    << emit_err(opts, "ERR_USAGE", 0, "unknown human " + kind + " subcommand: " + sub, 0, EXIT_USAGE)
+}

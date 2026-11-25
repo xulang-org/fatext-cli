@@ -28,6 +28,7 @@ fn print_help() {
     println("  mail <pull [--delete] | rm <mail_id>>")
     println("  p2p <listen [--allow-friends-only] [--expose <ports>] [--stdio] | connect <id> [--forward L:R]>")
     println("  version [--check]")
+    println("  update [--check] [--force] [--version <ver>] [--prefix <dir>] [--archive <file>]")
 }
 
 fn main() int {
@@ -57,7 +58,7 @@ fn main() int {
         } else if a == "--pow-bits" && i + 1 < argv.len {
             i += 1
             opts.pow_bits_override = parse_int_or(&args_or(&argv, i), 0)
-        } else if a == "--version" || a == "-V" {
+        } else if (a == "--version" || a == "-V") && pos.len == 0 {
             if opts.json_mode {
                 println("{\"version\":" + "\"" + CLI_VERSION + "\",\"target\":\"" + BUILD_TARGET + "\",\"commit\":\"" + BUILD_COMMIT + "\"}")
             } else {
@@ -106,6 +107,7 @@ fn main() int {
     if cmd == "soul" { << cmd_doc(&opts, "soul", rest) }
     if cmd == "rules" { << cmd_doc(&opts, "rules", rest) }
     if cmd == "version" { << cmd_version(&opts, rest) }
+    if cmd == "update" || cmd == "up" { << cmd_update(&opts, rest) }
     if cmd == "p2p" {
         if rest.len >= 1 {
             sub := rest[0] + ""

@@ -11,8 +11,10 @@ End-to-end integration test suite for fatext-cli:
 import base64
 import hashlib
 import http.server
+import io
 import json
 import os
+import platform as py_platform
 import queue
 import re
 import shutil
@@ -21,6 +23,7 @@ import socketserver
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -1076,7 +1079,214 @@ def run_suite_b():
         srv.shutdown()
         srv.server_close()
 
+    run_self_update_tests()
     print("[Suite B] PASSED")
+
+
+def run_self_update_tests():
+    print("[Suite B/update] Testing fatext update (--check, RSA-PSS+SHA256 verification, self-replace, guards, offline archive)...")
+    sys_n = py_platform.system().lower()
+    mach = py_platform.machine().lower()
+    os_part = "macos" if sys_n == "darwin" else ("windows" if sys_n.startswith("win") else sys_n)
+    arch_part = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(mach, mach)
+    target_plat = f"{os_part}-{arch_part}"
+    asset_name = f"fatext-v1.2.0-{target_plat}.tar.gz"
+
+    with tempfile.TemporaryDirectory(prefix="fatext-update-test-") as td:
+        priv_p = os.path.join(td, "official.priv.pem")
+        pub_p = os.path.join(td, "official.pub.pem")
+        subprocess.run(
+            ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", priv_p],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["openssl", "pkey", "-in", priv_p, "-pubout", "-out", pub_p],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        with open(pub_p, "r", encoding="utf-8") as f:
+            official_pub_pem = f.read()
+
+        def sign_pss_b64(data: bytes) -> str:
+            msg_p = os.path.join(td, "sign_msg.bin")
+            with open(msg_p, "wb") as f:
+                f.write(data)
+            res = subprocess.run(
+                [
+                    "openssl", "dgst", "-sha256",
+                    "-sigopt", "rsa_padding_mode:pss",
+                    "-sigopt", "rsa_pss_saltlen:32",
+                    "-sigopt", "rsa_mgf1_md:sha256",
+                    "-sign", priv_p, msg_p,
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+            )
+            return base64.b64encode(res.stdout).decode("ascii")
+
+        def make_tar_gz(ver_str: str) -> bytes:
+            script_body = (
+                f"#!/usr/bin/env sh\n"
+                f"if [ \"$1\" = \"--version\" ]; then\n"
+                f"  echo \"fatext {ver_str} ({os_part}/{arch_part}, test000)\"\n"
+                f"  exit 0\n"
+                f"fi\n"
+                f"echo \"mock fatext {ver_str}\"\n"
+            ).encode("utf-8")
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+                ti = tarfile.TarInfo(name="fatext")
+                ti.size = len(script_body)
+                ti.mode = 0o755
+                tf.addfile(ti, io.BytesIO(script_body))
+            return buf.getvalue()
+
+        good_tar = make_tar_gz("1.2.0")
+        good_sha = hashlib.sha256(good_tar).hexdigest()
+        sums_bytes = f"{good_sha}  {asset_name}\n".encode("utf-8")
+        good_sig = sign_pss_b64(sums_bytes)
+
+        mock_cfg = {
+            "tar": good_tar,
+            "sums": sums_bytes,
+            "sig": good_sig,
+        }
+
+        class UpdateHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == "/.well-known/fatext.json":
+                    body = json.dumps({
+                        "version": "3.0",
+                        "cli": {"min_version": "1.0.0", "latest_version": "1.2.0"},
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if self.path == "/k/ftx_fatextoffice.json":
+                    body = json.dumps({
+                        "agent_id": "ftx_fatextoffice",
+                        "status": "active",
+                        "key_version": 1,
+                        "created_at": 1700000000,
+                        "current_public_key_pem": official_pub_pem,
+                        "revision": 0,
+                        "profile": {"name": "fatext Official"},
+                        "extensions": {},
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if self.path == "/dl/SHA256SUMS":
+                    b = mock_cfg["sums"]
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/dl/SHA256SUMS.sig":
+                    b = mock_cfg["sig"].encode("ascii")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == f"/dl/{asset_name}":
+                    b = mock_cfg["tar"]
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), UpdateHandler)
+        port = srv.server_address[1]
+        api_url = f"http://127.0.0.1:{port}"
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            # 1. --check --json
+            rc, out, err = run_cli(["--json", "update", "--check"], api_url=api_url)
+            assert_eq(rc, 0, f"update --check failed: {err}")
+            chk = json.loads(out.strip())
+            assert_eq(chk["status"], "update_available", "update --check status")
+            assert_eq(chk["latest_version"], "1.2.0", "update --check latest_version")
+
+            # 2. Tampered SHA256SUMS.sig -> exit 8 (EXIT_CRYPTO)
+            prefix_bad = os.path.join(td, "prefix_bad")
+            os.makedirs(prefix_bad, exist_ok=True)
+            mock_cfg["sig"] = base64.b64encode(b"\x00" * 256).decode("ascii")
+            rc, _, err = run_cli(["--json", "update", "--prefix", prefix_bad], api_url=api_url)
+            assert_eq(rc, 8, f"tampered sig should exit 8: {err}")
+            assert_true(not os.path.exists(os.path.join(prefix_bad, "fatext")), "no binary on tampered sig")
+
+            # 3. Tampered archive bytes (SHA256 mismatch) -> exit 8 (EXIT_CRYPTO)
+            mock_cfg["sig"] = good_sig
+            mock_cfg["tar"] = make_tar_gz("9.9.9")
+            rc, _, err = run_cli(["--json", "update", "--prefix", prefix_bad], api_url=api_url)
+            assert_eq(rc, 8, f"tampered archive should exit 8: {err}")
+            assert_true(not os.path.exists(os.path.join(prefix_bad, "fatext")), "no binary on SHA256 mismatch")
+
+            # 4. Valid remote verified install with --prefix
+            mock_cfg["tar"] = good_tar
+            prefix_ok = os.path.join(td, "prefix_ok")
+            os.makedirs(prefix_ok, exist_ok=True)
+            rc, out, err = run_cli(["--json", "update", "--prefix", prefix_ok], api_url=api_url)
+            assert_eq(rc, 0, f"update --prefix failed: {err}")
+            ures = json.loads(out.strip())
+            assert_eq(ures["updated"], True, "updated true")
+            assert_eq(ures["verified"], True, "verified true")
+            assert_eq(ures["version"], "1.2.0", "installed version")
+            ver_out = subprocess.check_output([os.path.join(prefix_ok, "fatext"), "--version"], text=True).strip()
+            assert_true("fatext 1.2.0" in ver_out, f"prefix binary --version: {ver_out}")
+
+            # 5. Real in-place self-update outside .git checkout
+            self_dir = os.path.join(td, "self_bin")
+            os.makedirs(self_dir, exist_ok=True)
+            self_bin = os.path.join(self_dir, "fatext")
+            shutil.copy2(CLI_BIN, self_bin)
+            os.chmod(self_bin, 0o755)
+            p_self = subprocess.run(
+                [self_bin, "--api", api_url, "--json", "update"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
+            )
+            assert_eq(p_self.returncode, 0, f"in-place self-update failed: {p_self.stderr}")
+            sres = json.loads(p_self.stdout.strip())
+            assert_eq(sres["version"], "1.2.0", "in-place updated version")
+            ver_self = subprocess.check_output([self_bin, "--version"], text=True).strip()
+            assert_true("fatext 1.2.0" in ver_self, f"replaced binary --version: {ver_self}")
+
+            # 6. Git checkout safety guard refuses overwriting CLI_BIN directly
+            rc, _, err = run_cli(["--json", "update"], api_url=api_url)
+            assert_eq(rc, 10, f"git checkout guard should exit 10: {err}")
+
+            # 7. Offline --archive + --version install
+            arch_file = os.path.join(td, "offline.tar.gz")
+            with open(arch_file, "wb") as f:
+                f.write(good_tar)
+            prefix_off = os.path.join(td, "prefix_off")
+            os.makedirs(prefix_off, exist_ok=True)
+            rc, out, err = run_cli(
+                ["--json", "update", "--archive", arch_file, "--version", "1.2.0", "--prefix", prefix_off],
+                api_url=api_url,
+            )
+            assert_eq(rc, 0, f"offline --archive install failed: {err}")
+            ores = json.loads(out.strip())
+            assert_eq(ores["verified"], False, "offline archive verified=false")
+            assert_eq(ores["version"], "1.2.0", "offline version")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 def main():

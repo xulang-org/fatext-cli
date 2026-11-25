@@ -1,0 +1,714 @@
+@main
+
+#archive/tar
+#archive/zip
+#compress/gzip
+#crypto/rsa
+#crypto/sha256
+#encoding/json
+#errors
+#net/http
+#os
+#os/exec
+#path/filepath
+#strconv
+#strings
+
+const UPDATE_MAX_BYTES = 134217728
+const TERM_BAR_CELLS = 24
+const TERM_SIZE_WIDTH = 11
+const TERM_PERCENT_WIDTH = 5
+const TERM_CHAR_DEVICE_MIN = 8192
+const TERM_CHAR_DEVICE_MAX = 16384
+
+fn print_update_help() {
+    println("Usage: fatext update [flags]")
+    println("")
+    println("Check or self-update the fatext CLI binary with RSA-PSS + SHA-256 verification.")
+    println("")
+    println("Flags:")
+    println("  --check             Check latest version without downloading or modifying binary")
+    println("  --force             Reinstall or downgrade even if current version is up to date")
+    println("  --version <VER>     Install a specific SemVer release (e.g. 1.2.0 or v1.2.0)")
+    println("  --prefix <DIR>      Install binary into <DIR>/fatext instead of replacing self")
+    println("  --archive <PATH>    Install offline from local .tar.gz/.zip (requires --version)")
+    println("  -h, --help          Show this help")
+}
+
+fn update_format_size(bytes int) string {
+    if bytes < 1024 { << strconv.itoa(bytes) + " B" }
+    $unit := 1024
+    $label := " KiB"
+    if bytes >= 1048576 {
+        unit = 1048576
+        label = " MiB"
+    }
+    tenths := bytes * 10 / unit
+    << strconv.itoa(tenths / 10) + "." + strconv.itoa(tenths % 10) + label
+}
+
+fn term_interactive() bool {
+    if xu_target_os() == 2 { << true }
+    info := os.stat("/dev/stdout") or (err) { << false }
+    if info.mode < TERM_CHAR_DEVICE_MIN { << false }
+    << info.mode < TERM_CHAR_DEVICE_MAX
+}
+
+fn term_write_raw(data string) bool {
+    if xu_target_os() == 2 {
+        $console := os.create("CONOUT$$") or (err) { << false }
+        console.write(data) or (err) {
+            console.close() or (err2) { << true }
+            << false
+        }
+        console.close() or (err) { << true }
+        << true
+    }
+    os_fd_write(1, data) or (err) { << false }
+    << true
+}
+
+fn term_pad_left(text &string, width int) string {
+    $out := ""
+    $i := text.len
+    while i < width {
+        out = " " + out
+        i += 1
+    }
+    << out + text + ""
+}
+
+fn update_download_progress(received int, total int) {
+    if !term_interactive() { << }
+    $percent_text := "??%"
+    $total_text := "?"
+    $filled := 0
+    if total > 0 {
+        $percent := received * 100 / total
+        if percent > 100 { percent = 100 }
+        percent_text = strconv.itoa(percent) + "%"
+        total_text = update_format_size(total)
+        filled = percent * TERM_BAR_CELLS / 100
+    }
+    $bar := ""
+    for i in 0:TERM_BAR_CELLS {
+        if i < filled { bar = bar + "#" } else { bar = bar + "-" }
+    }
+    rec_s := update_format_size(received)
+    line := "fatext update: [" + bar + "] " + term_pad_left(&rec_s, TERM_SIZE_WIDTH) + " / " + term_pad_left(&total_text, TERM_SIZE_WIDTH) + " (" + term_pad_left(&percent_text, TERM_PERCENT_WIDTH) + ")"
+    term_write_raw("\r" + line)
+}
+
+fn update_progress_end() {
+    if !term_interactive() { << }
+    term_write_raw("\n")
+}
+
+fn update_exists(path string) bool {
+    os.stat(path) or (err) { << false }
+    << true
+}
+
+fn update_real_path(path &string) string {
+    $pending := filepath.to_slash(path)
+    if !filepath.is_abs(&pending) { pending = os.getwd() + "/" + pending }
+    $done := ""
+    $start := 0
+    $links := 0
+    if pending.len >= 2 && pending[1] == 58 {
+        done = pending[0:2] + ""
+        start = 2
+    }
+    while start < pending.len {
+        if pending[start] == 47 {
+            if done.len == 0 { done = "/" }
+            start = start + 1
+            ->
+        }
+        $end := start
+        while end < pending.len && pending[end] != 47 { end = end + 1 }
+        part := pending[start:end] + ""
+        start = end
+        if part == "." { -> }
+        if part == ".." {
+            done = filepath.dir(&done)
+            ->
+        }
+        next := filepath.join([done + "", part])
+        link := os.readlink(next + "") or (err) {
+            done = next + ""
+            ->
+        }
+        links = links + 1
+        if links > 40 { >> errors.new("too many path symlinks") }
+        rest := pending[start:pending.len] + ""
+        if filepath.is_abs(&link) { pending = link + rest }
+        else { pending = filepath.join([done + "", link]) + rest }
+        done = ""
+        start = 0
+        if pending.len >= 2 && pending[1] == 58 {
+            done = pending[0:2] + ""
+            start = 2
+        }
+    }
+    << done
+}
+
+fn is_ascii_digit(c int) bool {
+    << c >= 48 && c <= 57
+}
+
+fn is_pre_char(c int) bool {
+    << is_ascii_digit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46
+}
+
+fn validate_release_semver(raw &string) string {
+    $s := strings.trim_space(raw)
+    if strings.has_prefix(&s, "v") || strings.has_prefix(&s, "V") {
+        s = s[1:s.len] + ""
+    }
+    if s.len == 0 || s.len > 64 { >> errors.new("invalid release version '" + raw + "'") }
+    $core := s + ""
+    $pre := ""
+    dash := strings.index_of(&s, "-")
+    if dash >= 0 {
+        core = s[0:dash] + ""
+        pre = s[(dash + 1):s.len] + ""
+        if pre.len == 0 { >> errors.new("invalid prerelease tag in '" + raw + "'") }
+        for i in 0:pre.len {
+            if !is_pre_char(pre[i] & 255) { >> errors.new("invalid release version '" + raw + "'") }
+        }
+    }
+    parts := strings.split(&core, ".")
+    if parts.len != 3 { >> errors.new("invalid SemVer '" + raw + "' (expected X.Y.Z)") }
+    for i in 0:3 {
+        p := parts[i] + ""
+        if p.len == 0 { >> errors.new("invalid SemVer '" + raw + "'") }
+        for j in 0:p.len {
+            if !is_ascii_digit(p[j] & 255) { >> errors.new("invalid SemVer '" + raw + "'") }
+        }
+    }
+    << s
+}
+
+fn semver_cmp(a &string, b &string) int {
+    if semver_lt(a, b) { << -1 }
+    if semver_lt(b, a) { << 1 }
+    << 0
+}
+
+fn supported_platform(platform &string) bool {
+    p := platform + ""
+    << p == "macos-arm64" || p == "macos-x64" || p == "linux-x64" || p == "linux-arm64" || p == "windows-x64" || p == "windows-arm64"
+}
+
+fn entry_path(dest &string, name &string) string {
+    if name.len == 0 || name[0] == 47 || name[0] == 92 {
+        >> errors.new("unsafe archive path")
+    }
+    for i in 0:name.len {
+        if name[i] == 0 || name[i] == 92 || name[i] == 58 {
+            >> errors.new("unsafe archive path: " + name)
+        }
+    }
+    parts := strings.split(name, "/")
+    for i in 0:parts.len {
+        if parts[i] == ".." { >> errors.new("unsafe archive path: " + name) }
+    }
+    clean := filepath.clean(name)
+    if clean == "." { >> errors.new("empty archive path") }
+    << dest + "/" + clean
+}
+
+fn write_archive_entry(dest &string, name &string, body &string, directory bool, mode int) int {
+    path := entry_path(dest, name) or >>
+    if directory {
+        os.mkdir_all(path) or >>
+        << 0
+    }
+    parent := filepath.dir(&path)
+    os.mkdir_all(parent) or >>
+    os.write(path + "", body + "") or >>
+    if xu_target_os() != 2 {
+        os.chmod(path, mode & 511) or >>
+    }
+    << 0
+}
+
+fn extract_archive(data &string, dest &string, is_windows bool) int {
+    if is_windows {
+        zip.comment(data) or >>
+        $reader := zip.new_reader(data)
+        for _ in 0:100000 {
+            entry := reader.next() or (err) {
+                if err.msg() == "EOF" { << 0 }
+                >> err
+            }
+            name := entry.name + ""
+            directory := strings.has_suffix(&name, "/")
+            write_archive_entry(dest, &name, &entry.body, directory, 420) or >>
+        }
+        >> errors.new("too many ZIP entries")
+    }
+    $compressed := gzip.new_reader(data + "")
+    plain := compressed.read_all() or >>
+    $reader := tar.new_reader(&plain)
+    for _ in 0:100000 {
+        entry := reader.next() or (err) {
+            if err.msg() == "EOF" { << 0 }
+            >> err
+        }
+        if entry.typeflag != 0 && entry.typeflag != tar.TYPE_REG && entry.typeflag != tar.TYPE_DIR {
+            >> errors.new("unsupported archive entry: " + entry.name)
+        }
+        write_archive_entry(dest, &entry.name, &entry.body, entry.typeflag == tar.TYPE_DIR, entry.mode) or >>
+    }
+    >> errors.new("too many tar entries")
+}
+
+fn find_extracted_binary(dest &string, bin_name &string) string {
+    direct := dest + "/" + bin_name
+    if update_exists(direct + "") && !os.is_dir(direct + "") {
+        << direct
+    }
+    entries := os.entries(dest + "") or (err) {
+        >> errors.new("cannot inspect extracted package: " + err.msg())
+    }
+    for i in 0:entries.len {
+        nm := entries[i].name + ""
+        cand := dest + "/" + nm + "/" + bin_name
+        if update_exists(cand + "") && !os.is_dir(cand + "") {
+            << cand
+        }
+    }
+    >> errors.new("extracted archive does not contain binary '" + bin_name + "'")
+}
+
+fn verify_candidate_binary_version(bin_path &string, expected_version &string) int {
+    $cmd := exec.command(bin_path + "", "--version")
+    out := cmd.output() or (err) {
+        >> errors.new("downloaded binary failed '--version' check: " + err.msg())
+    }
+    trimmed := strings.trim_space(&out)
+    prefix := "fatext "
+    if !strings.has_prefix(&trimmed, prefix) {
+        >> errors.new("unexpected '--version' output from downloaded binary: " + trimmed)
+    }
+    $end := prefix.len
+    while end < trimmed.len {
+        c := trimmed[end] & 255
+        if c == 32 || c == 9 || c == 10 || c == 13 { <- }
+        end += 1
+    }
+    raw_ver := trimmed[prefix.len:end] + ""
+    got := validate_release_semver(&raw_ver) or >>
+    if got != expected_version + "" {
+        >> errors.new("downloaded binary version '" + got + "' != expected '" + expected_version + "'")
+    }
+    << 0
+}
+
+fn strip_trailing_slash(s &string) string {
+    $out := s + ""
+    while out.len > 1 && strings.has_suffix(&out, "/") {
+        out = out[0:(out.len - 1)] + ""
+    }
+    << out
+}
+
+struct DownloadResult {
+    status int
+    body string
+}
+
+fn update_http_get_raw(raw_url string, timeout_ns int, show_progress bool) DownloadResult {
+    $cl := http.new_client()
+    cl.set_timeout(timeout_ns)
+    cl.max_response_bytes = UPDATE_MAX_BYTES
+    if show_progress {
+        cl.set_download_progress(update_download_progress)
+    }
+    extra := "User-Agent: fatext-cli/" + CLI_VERSION + "\r\n"
+    empty := ""
+    resp := cl.do_extra("GET", raw_url, extra, &empty) or (err) {
+        if show_progress { update_progress_end() }
+        >> err
+    }
+    if show_progress { update_progress_end() }
+    << DownloadResult{status: resp.status_code(), body: resp.body()}
+}
+
+fn lookup_sha256sum(sums_text &string, filename &string) string {
+    lines := strings.split(sums_text, "\n")
+    for i in 0:lines.len {
+        line := strings.trim_space(&lines[i])
+        if line.len < 66 { -> }
+        $sp := -1
+        for k in 0:line.len {
+            c := line[k] & 255
+            if c == 32 || c == 9 {
+                sp = k
+                <-
+            }
+        }
+        if sp != 64 { -> }
+        digest := strings.to_lower(&(line[0:64] + ""))
+        $rest := strings.trim_space(&(line[sp:line.len] + ""))
+        if strings.has_prefix(&rest, "*") {
+            rest = rest[1:rest.len] + ""
+        }
+        if strings.has_prefix(&rest, "./") {
+            rest = rest[2:rest.len] + ""
+        }
+        if rest == filename + "" {
+            << digest
+        }
+    }
+    << ""
+}
+
+fn verify_and_download_archive(
+    api_base &string,
+    timeout_sec int,
+    target_version &string,
+    platform &string,
+    ext &string,
+    req_explicit_ver bool,
+    show_progress bool
+) string {
+    $dl_timeout_sec := timeout_sec
+    if dl_timeout_sec < 60 { dl_timeout_sec = 60 }
+    timeout_ns := dl_timeout_sec * 1000000000
+    dl_base := strip_trailing_slash(api_base) + "/dl"
+
+    // 1. Fetch & self-verify ftx_fatextoffice official key
+    fk := fetch_agent_key(api_base + "", timeout_sec, "ftx_fatextoffice")
+    if !fk.ok || !fk.self_sig_valid || fk.status != "active" {
+        >> errors.new("failed to verify active official ftx_fatextoffice public key: " + fk.err_msg)
+    }
+
+    // 2. Fetch SHA256SUMS + SHA256SUMS.sig and verify RSA-PSS signature
+    sums_res := update_http_get_raw(dl_base + "/SHA256SUMS", timeout_ns, false) or >>
+    if sums_res.status != 200 {
+        >> errors.new("failed to fetch SHA256SUMS (HTTP " + strconv.itoa(sums_res.status) + ")")
+    }
+    sig_res := update_http_get_raw(dl_base + "/SHA256SUMS.sig", timeout_ns, false) or >>
+    if sig_res.status != 200 {
+        >> errors.new("failed to fetch SHA256SUMS.sig (HTTP " + strconv.itoa(sig_res.status) + ")")
+    }
+    if !verify_pss_message(&fk.pk, &sums_res.body, sig_res.body + "") {
+        >> errors.new("CRYPTO_VERIFY_FAILED: invalid RSA-PSS signature on SHA256SUMS")
+    }
+
+    // 3. Download release archive (try versioned asset name first, fallback to rolling name if unpinned)
+    $asset := "fatext-v" + target_version + "-" + platform + ext
+    if !show_progress {
+        // silent in JSON/non-TTY mode
+    } else {
+        println("fatext update: downloading " + dl_base + "/" + asset + "...")
+    }
+    $pkg_res := update_http_get_raw(dl_base + "/" + asset, timeout_ns, show_progress) or >>
+    if pkg_res.status == 404 && !req_explicit_ver {
+        asset = "fatext-" + platform + ext
+        if show_progress {
+            println("fatext update: downloading " + dl_base + "/" + asset + "...")
+        }
+        pkg_res = update_http_get_raw(dl_base + "/" + asset, timeout_ns, show_progress) or >>
+    }
+    if pkg_res.status != 200 {
+        >> errors.new("failed to download " + asset + " (HTTP " + strconv.itoa(pkg_res.status) + ")")
+    }
+
+    // 4. Verify SHA-256 digest of archive against signed SHA256SUMS manifest
+    expected_sha := lookup_sha256sum(&sums_res.body, &asset)
+    if expected_sha.len != 64 {
+        >> errors.new("CRYPTO_VERIFY_FAILED: checksum entry for '" + asset + "' missing in signed SHA256SUMS")
+    }
+    actual_sha := sha256.sum256(pkg_res.body + "")
+    if actual_sha != expected_sha {
+        >> errors.new("CRYPTO_VERIFY_FAILED: SHA256 mismatch for " + asset + " (expected " + expected_sha + ", got " + actual_sha + ")")
+    }
+
+    << pkg_res.body
+}
+
+fn try_remove_file(path string) {
+    os.remove(path) or (err) { << }
+}
+
+fn try_rename_file(src string, dst string) {
+    os.rename(src, dst) or (err) { << }
+}
+
+fn install_extracted_binary(extracted_bin &string, target_path &string) int {
+    if xu_target_os() == 2 {
+        backup := target_path + ".old"
+        if update_exists(backup + "") {
+            try_remove_file(backup + "")
+        }
+        $had_old := false
+        if update_exists(target_path + "") {
+            os.rename(target_path + "", backup + "") or >>
+            had_old = true
+        }
+        os.rename(extracted_bin + "", target_path + "") or (err) {
+            if had_old {
+                try_rename_file(backup + "", target_path + "")
+            }
+            >> err
+        }
+        << 0
+    }
+    os.rename(extracted_bin + "", target_path + "") or >>
+    << 0
+}
+
+fn update_cleanup_dir(path &string) {
+    os.remove_all(path + "") or (err) { << }
+}
+
+fn stage_and_replace_binary(
+    archive_data &string,
+    target_path &string,
+    target_version &string,
+    is_windows bool,
+    bin_name &string
+) int {
+    target_dir := filepath.dir(target_path)
+    os.mkdir_all(target_dir + "") or >>
+    stage := os.mkdir_temp(target_dir + "", ".fatext-update-") or >>
+    pkg_dir := stage + "/pkg"
+    os.mkdir_all(pkg_dir + "") or (err) {
+        update_cleanup_dir(&stage)
+        >> err
+    }
+
+    extract_archive(archive_data, &pkg_dir, is_windows) or (err) {
+        update_cleanup_dir(&stage)
+        >> err
+    }
+    extracted_bin := find_extracted_binary(&pkg_dir, bin_name) or (err) {
+        update_cleanup_dir(&stage)
+        >> err
+    }
+    if !is_windows {
+        os.chmod(extracted_bin + "", 493) or (err) {
+            update_cleanup_dir(&stage)
+            >> err
+        }
+    }
+    verify_candidate_binary_version(&extracted_bin, target_version) or (err) {
+        update_cleanup_dir(&stage)
+        >> err
+    }
+    install_extracted_binary(&extracted_bin, target_path) or (err) {
+        update_cleanup_dir(&stage)
+        >> err
+    }
+    update_cleanup_dir(&stage)
+    << 0
+}
+
+struct LatestDiscovery {
+    ok bool
+    err_code string
+    http_status int
+    err_msg string
+    net_err bool
+    min_version string
+    latest_version string
+}
+
+fn fetch_latest_cli_discovery(opts &CliOpts, api_base &string) LatestDiscovery {
+    empty := ""
+    r := api_call_anon(api_base + "", opts.timeout_sec, "GET", "/.well-known/fatext.json", &empty, "")
+    if !r.ok {
+        << LatestDiscovery{ok: false, err_code: r.err_code, http_status: r.status, err_msg: r.err_msg, net_err: r.net_err, min_version: "", latest_version: ""}
+    }
+    doc := json.parse(&r.body)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << LatestDiscovery{ok: false, err_code: "ERR_ERR", http_status: r.status, err_msg: "invalid discovery json", net_err: false, min_version: "", latest_version: ""}
+    }
+    rt := doc.root()
+    $min_v := ""
+    $latest_v := ""
+    if doc.has(rt, "cli") {
+        cn := doc.get(rt, "cli")
+        if doc.is_dict(cn) {
+            if doc.has(cn, "min_version") { min_v = json_str_or(&doc, doc.get(cn, "min_version"), "") }
+            if doc.has(cn, "latest_version") { latest_v = json_str_or(&doc, doc.get(cn, "latest_version"), "") }
+        }
+    }
+    if latest_v.len == 0 {
+        latest_v = min_v + ""
+    }
+    if latest_v.len == 0 {
+        << LatestDiscovery{ok: false, err_code: "ERR_NOT_FOUND", http_status: 404, err_msg: "discovery json missing cli.latest_version / cli.min_version", net_err: false, min_version: "", latest_version: ""}
+    }
+    << LatestDiscovery{ok: true, err_code: "", http_status: 200, err_msg: "", net_err: false, min_version: min_v, latest_version: latest_v}
+}
+
+pub fn cmd_update(opts &CliOpts, args []string) int {
+    $check_only := false
+    $force := false
+    $req_version := ""
+    $req_prefix := ""
+    $archive_path := ""
+
+    $i := 0
+    while i < args.len {
+        a := args[i] + ""
+        if a == "--help" || a == "-h" {
+            print_update_help()
+            << EXIT_OK
+        } else if a == "--check" {
+            check_only = true
+        } else if a == "--force" {
+            force = true
+        } else if a == "--version" || a == "--prefix" || a == "--archive" {
+            if i + 1 >= args.len {
+                << emit_err(opts, "ERR_USAGE", 0, a + " requires an argument", 0, EXIT_USAGE)
+            }
+            val := args[i + 1] + ""
+            if a == "--version" { req_version = val }
+            else if a == "--prefix" { req_prefix = val }
+            else if a == "--archive" { archive_path = val }
+            i += 1
+        } else {
+            << emit_err(opts, "ERR_USAGE", 0, "unknown option '" + a + "'", 0, EXIT_USAGE)
+        }
+        i += 1
+    }
+
+    if archive_path.len > 0 && req_version.len == 0 {
+        << emit_err(opts, "ERR_USAGE", 0, "--archive requires --version", 0, EXIT_USAGE)
+    }
+
+    $explicit_ver := req_version.len > 0
+    if explicit_ver {
+        req_version = validate_release_semver(&req_version) or (err) {
+            << emit_err(opts, "ERR_USAGE", 0, err.msg(), 0, EXIT_USAGE)
+        }
+    }
+
+    platform := strings.replace_all(&BUILD_TARGET, "/", "-")
+    if !supported_platform(&platform) {
+        << emit_err(opts, "ERR_ERR", 0, "unsupported host platform (" + platform + ")", 0, EXIT_ERR)
+    }
+    is_windows := (xu_target_os() == 2) || strings.has_prefix(&platform, "windows-")
+    $ext := ".tar.gz"
+    $bin_name := "fatext"
+    if is_windows {
+        ext = ".zip"
+        bin_name = "fatext.exe"
+    }
+
+    $target_path := ""
+    if req_prefix.len > 0 {
+        prefix_abs := update_real_path(&req_prefix) or (err) {
+            << emit_err(opts, "ERR_ERR", 0, err.msg(), 0, EXIT_ERR)
+        }
+        target_path = prefix_abs + "/" + bin_name
+    } else {
+        argv := os.argv()
+        if argv.len == 0 {
+            << emit_err(opts, "ERR_ERR", 0, "cannot determine executable path", 0, EXIT_ERR)
+        }
+        exe_looked := exec.look_path(argv[0] + "") or (err) {
+            << emit_err(opts, "ERR_ERR", 0, "cannot locate executable: " + err.msg(), 0, EXIT_ERR)
+        }
+        target_path = update_real_path(&exe_looked) or (err) {
+            << emit_err(opts, "ERR_ERR", 0, err.msg(), 0, EXIT_ERR)
+        }
+    }
+
+    target_dir := filepath.dir(&target_path)
+    parent_dir := filepath.dir(&target_dir)
+    if !check_only && req_prefix.len == 0 && (update_exists(target_dir + "/.git") || update_exists(parent_dir + "/.git")) {
+        << emit_err(opts, "ERR_CONFIG", 0, "refusing to overwrite a git development checkout; use --prefix DIR to install elsewhere", 0, EXIT_CONFIG)
+    }
+
+    api_base := resolve_api_base(opts, "")
+    cfg_opt := load_config_or_base(opts, api_base + "")
+    eff_api := cfg_opt.api_base + ""
+
+    $target_version := req_version + ""
+    if target_version.len == 0 {
+        disc := fetch_latest_cli_discovery(opts, &eff_api)
+        if !disc.ok {
+            if disc.net_err {
+                << emit_err(opts, disc.err_code, 0, disc.err_msg, 0, EXIT_NET)
+            }
+            ec := map_http_exit_code(disc.http_status, disc.err_code)
+            << emit_err(opts, disc.err_code, disc.http_status, disc.err_msg, 0, ec)
+        }
+        target_version = validate_release_semver(&disc.latest_version) or (err) {
+            << emit_err(opts, "ERR_ERR", 0, err.msg(), 0, EXIT_ERR)
+        }
+    }
+
+    cmp := semver_cmp(&target_version, &CLI_VERSION)
+    if check_only {
+        $status := "up_to_date"
+        if cmp > 0 { status = "update_available" }
+        if opts.json_mode {
+            println("{\"ok\":true,\"current_version\":" + json.quote(&CLI_VERSION) + ",\"latest_version\":" + json.quote(&target_version) + ",\"platform\":" + json.quote(&platform) + ",\"status\":" + json.quote(&status) + "}")
+        } else {
+            println("fatext update: current version: " + CLI_VERSION + " (" + platform + ")")
+            println("fatext update: latest version:  " + target_version)
+            if cmp > 0 {
+                println("fatext update: update available! Run 'fatext update' to upgrade.")
+            } else {
+                println("fatext update: already up to date.")
+            }
+        }
+        << EXIT_OK
+    }
+
+    if cmp <= 0 && !force && req_prefix.len == 0 {
+        if opts.json_mode {
+            println("{\"ok\":true,\"current_version\":" + json.quote(&CLI_VERSION) + ",\"latest_version\":" + json.quote(&target_version) + ",\"platform\":" + json.quote(&platform) + ",\"status\":\"up_to_date\",\"updated\":false}")
+        } else {
+            println("fatext update: already up to date (" + CLI_VERSION + "); use --force to reinstall or downgrade")
+        }
+        << EXIT_OK
+    }
+
+    $archive_data := ""
+    $verified := false
+    if archive_path.len > 0 {
+        if !opts.json_mode {
+            println("fatext update: reading " + archive_path + "...")
+        }
+        archive_data = os.read(archive_path + "") or (err) {
+            << emit_err(opts, "ERR_NOT_FOUND", 0, "cannot read archive '" + archive_path + "': " + err.msg(), 0, EXIT_NOT_FOUND)
+        }
+    } else {
+        archive_data = verify_and_download_archive(
+            &eff_api, opts.timeout_sec, &target_version, &platform, &ext, explicit_ver, !opts.json_mode
+        ) or (err) {
+            msg := err.msg()
+            if strings.has_prefix(&msg, "CRYPTO_VERIFY_FAILED:") || strings.contains(&msg, "ftx_fatextoffice") {
+                << emit_err(opts, "ERR_CRYPTO", 0, msg, 0, EXIT_CRYPTO)
+            }
+            if strings.contains(&msg, "(HTTP 404)") {
+                << emit_err(opts, "ERR_NOT_FOUND", 404, msg, 0, EXIT_NOT_FOUND)
+            }
+            << emit_err(opts, "ERR_NET", 0, msg, 0, EXIT_NET)
+        }
+        verified = true
+    }
+
+    stage_and_replace_binary(&archive_data, &target_path, &target_version, is_windows, &bin_name) or (err) {
+        << emit_err(opts, "ERR_ERR", 0, err.msg(), 0, EXIT_ERR)
+    }
+
+    if opts.json_mode {
+        $ver_s := "false"
+        if verified { ver_s = "true" }
+        println("{\"ok\":true,\"previous_version\":" + json.quote(&CLI_VERSION) + ",\"version\":" + json.quote(&target_version) + ",\"target\":" + json.quote(&platform) + ",\"path\":" + json.quote(&target_path) + ",\"verified\":" + ver_s + ",\"updated\":true}")
+    } else {
+        println("fatext update: successfully updated to " + target_version + " (" + platform + ") at " + target_path)
+    }
+    << EXIT_OK
+}

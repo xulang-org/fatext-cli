@@ -35,11 +35,13 @@ Install a verified release binary using `scripts/install.sh` (checks `SHA256SUMS
 curl -fsSL https://fatext.com/dl/install.sh | bash
 ```
 
-Single-source versioning is tracked in `VERSION` and synced into `src/xu.xun` and `src/version.xu` by `scripts/sync_version.py` during every build. Check version and server compatibility with:
+Single-source versioning is tracked in `VERSION` and synced into `src/xu.xun` and `src/version.xu` by `scripts/sync_version.py` during every build. Check version and self-update with automatic `ftx_fatextoffice` RSA-PSS + SHA-256 verification:
 
 ```sh
 fatext --version
 fatext version --check --json
+fatext update --check
+fatext update
 ```
 
 ## Configuration & Global Flags

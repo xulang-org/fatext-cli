@@ -106,6 +106,22 @@ pub fn api_call_anon(api_base string, timeout_sec int, method string, path_and_q
     << api_call(api_base, timeout_sec, "", &dummy, false, method, path_and_query, body, extra_headers)
 }
 
+pub fn api_call_human(api_base string, timeout_sec int, human_id string, priv &rsa.PrivateKey, signed bool, method string, path_and_query string, body &string, extra_headers string) ApiResp {
+    $extra := extra_headers + ""
+    if signed {
+        ts := strconv.itoa(time.now_time().unix())
+        sig := sign_http_request(priv, method + "", path_and_query + "", ts + "", body) or (err) {
+            << empty_api_err(false, "ERR_CRYPTO", err.msg())
+        }
+        if human_id.len > 0 {
+            extra = extra + "X-Human-Id: " + human_id + "\r\n"
+        }
+        extra = extra + "X-Timestamp: " + ts + "\r\n"
+        extra = extra + "X-Signature: " + sig + "\r\n"
+    }
+    << api_call(api_base, timeout_sec, "", priv, false, method, path_and_query, body, extra)
+}
+
 fn big_zero() big.Int {
     << big.new_int(0)
 }
@@ -151,6 +167,29 @@ pub fn fetch_agent_key(api_base string, timeout_sec int, agent_id string) Fetche
     status := json_str_or(&doc, doc.get(rt, "status"), "active")
     kv := json_int_or(&doc, doc.get(rt, "key_version"), 1)
     << FetchedKey{ok: true, exit_code: 0, err_code: "", err_msg: "", agent_id: agent_id + "", status: status, key_version: kv, pub_pem: pem_s + "", pk: pk, raw_json: r.body + "", self_sig_valid: true}
+}
+
+pub fn fetch_human_key(api_base string, timeout_sec int, human_id string) FetchedKey {
+    empty := ""
+    r := api_call_anon(api_base, timeout_sec, "GET", "/h/" + human_id + ".json", &empty, "")
+    $dummy_pk := rsa.PublicKey{n: big_zero(), e: 65537}
+    if !r.ok {
+        $ec := map_http_exit_code(r.status, r.err_code + "")
+        if r.net_err { ec = EXIT_NET }
+        << FetchedKey{ok: false, exit_code: ec, err_code: r.err_code + "", err_msg: r.err_msg + "", agent_id: human_id + "", status: "", key_version: 0, pub_pem: "", pk: dummy_pk, raw_json: "", self_sig_valid: false}
+    }
+    doc := json.parse(&r.body)
+    if !doc.ok() {
+        << FetchedKey{ok: false, exit_code: EXIT_CRYPTO, err_code: "ERR_CRYPTO", err_msg: "invalid human identity json", agent_id: human_id + "", status: "", key_version: 0, pub_pem: "", pk: dummy_pk, raw_json: r.body + "", self_sig_valid: false}
+    }
+    rt := doc.root()
+    pem_s := json_str_or(&doc, doc.get(rt, "current_public_key_pem"), "")
+    pk := decode_spki_public_pem(&pem_s) or (err) {
+        << FetchedKey{ok: false, exit_code: EXIT_CRYPTO, err_code: "ERR_CRYPTO", err_msg: err.msg(), agent_id: human_id + "", status: "", key_version: 0, pub_pem: pem_s + "", pk: dummy_pk, raw_json: r.body + "", self_sig_valid: false}
+    }
+    status := json_str_or(&doc, doc.get(rt, "status"), "active")
+    kv := json_int_or(&doc, doc.get(rt, "key_version"), 1)
+    << FetchedKey{ok: true, exit_code: 0, err_code: "", err_msg: "", agent_id: human_id + "", status: status, key_version: kv, pub_pem: pem_s + "", pk: pk, raw_json: r.body + "", self_sig_valid: true}
 }
 
 pub struct SseConn {

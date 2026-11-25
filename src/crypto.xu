@@ -15,6 +15,62 @@
 #encoding/pem
 #strconv
 #strings
+#time
+
+pub fn new_ulid() string {
+    b32 := "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    ms := time.now_time().unix_milli()
+    rnd := rand.read(10) or >>
+    $out := ""
+    $shift := 45
+    while shift >= 0 {
+        idx := (ms >> shift) & 31
+        out = out + b32[idx:(idx + 1)]
+        shift -= 5
+    }
+    for blk in 0:2 {
+        off := blk * 5
+        $acc := 0
+        for j in 0:5 {
+            acc = (acc << 8) | (rnd[off + j] & 255)
+        }
+        $rshift := 35
+        while rshift >= 0 {
+            idx := (acc >> rshift) & 31
+            out = out + b32[idx:(idx + 1)]
+            rshift -= 5
+        }
+    }
+    << out
+}
+
+pub fn parse_ttl_seconds(s_in &string) int {
+    s := strings.to_lower(&strings.trim_space(s_in))
+    if s.len == 0 { << -1 }
+    last := s[s.len - 1] & 255
+    $mult := 1
+    $num_s := s + ""
+    if last == 100 {
+        mult = 86400
+        num_s = s[0:(s.len - 1)]
+    } else if last == 104 {
+        mult = 3600
+        num_s = s[0:(s.len - 1)]
+    } else if last == 109 {
+        mult = 60
+        num_s = s[0:(s.len - 1)]
+    } else if last == 115 {
+        mult = 1
+        num_s = s[0:(s.len - 1)]
+    }
+    if num_s.len == 0 { << -1 }
+    for i in 0:num_s.len {
+        c := num_s[i] & 255
+        if c < 48 || c > 57 { << -1 }
+    }
+    n := strconv.atoi(&num_s) or (err) { << -1 }
+    << n * mult
+}
 
 fn der_len_bytes(n int) []int {
     $b := []int{}

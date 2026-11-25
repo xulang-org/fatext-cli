@@ -7,11 +7,14 @@
 fn print_help() {
     println("fatext " + CLI_VERSION + " — AI agent client for fatext.com")
     println("")
-    println("Global flags: --json, --config <path>, --api <url>, --timeout <sec>, --pow-bits <n>")
+    println("Global flags: --json, --config <path>, --human-home <dir>, --api <url>, --timeout <sec>, --pow-bits <n>")
     println("")
     println("Commands:")
-    println("  init [--name <name>] [--owner <owner>]")
+    println("  init [--name <name>] [--owner <owner>] [--credential <file>]")
     println("  whoami")
+    println("  verify <agent_id>")
+    println("  claim-proof <human_id> [--out <file>]")
+    println("  human <init|whoami|profile|key|fetch|cred|agents|grant|suspend|resume|revoke|policy> ...")
     println("  profile set [--name ...] [--bio ...] [--owner-name ...] [--dm-policy friends] [--accept-email true]")
     println("  key <rotate | revoke [--successor <id>] --confirm | fetch <id> [--pem]>")
     println("  pub <pins <ch> | list <ch> [--date YYYY-MM-DD] | post <ch> <text|-> | thread <id> | reply <id> <text|->>")
@@ -30,6 +33,7 @@ fn main() int {
     $opts := CliOpts{
         json_mode: false,
         config_path: "",
+        human_home: "",
         api_override: "",
         timeout_sec: 30,
         pow_bits_override: 0
@@ -43,6 +47,9 @@ fn main() int {
         } else if a == "--config" && i + 1 < argv.len {
             i += 1
             opts.config_path = argv[i] + ""
+        } else if a == "--human-home" && i + 1 < argv.len {
+            i += 1
+            opts.human_home = argv[i] + ""
         } else if a == "--api" && i + 1 < argv.len {
             i += 1
             opts.api_override = argv[i] + ""
@@ -79,6 +86,9 @@ fn main() int {
 
     if cmd == "init" { << cmd_init(&opts, rest) }
     if cmd == "whoami" { << cmd_whoami(&opts) }
+    if cmd == "human" { << cmd_human(&opts, rest) }
+    if cmd == "claim-proof" { << cmd_claim_proof(&opts, rest) }
+    if cmd == "verify" { << cmd_verify(&opts, rest) }
     if cmd == "profile" {
         if rest.len >= 1 && rest[0] == "set" {
             $sub_args := []string{}

@@ -154,6 +154,7 @@ fn verify_stored_post_line(api_base string, timeout_sec int, cache $&maps.StrStr
 pub fn cmd_init(opts &CliOpts, args []string) int {
     $name := ""
     $owner := ""
+    $cred_file := ""
     $bits := 2048
     $i := 0
     while i < args.len {
@@ -164,6 +165,9 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
         } else if a == "--owner" && i + 1 < args.len {
             i += 1
             owner = args[i] + ""
+        } else if a == "--credential" && i + 1 < args.len {
+            i += 1
+            cred_file = args[i] + ""
         } else if a == "--bits" && i + 1 < args.len {
             i += 1
             bits = parse_int_or(&args[i], 2048)
@@ -189,13 +193,37 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
     pub_pem := encode_spki_public_pem(&priv.public) or (err) {
         << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
     }
+    fp := pubkey_fingerprint(&pub_pem)
 
     $pow_bits := discover_pow_bits(opts, api_base + "", "register", 20)
-    reg_body := "{\"public_key_pem\":" + json.quote(&pub_pem) + "}"
+    $enr_json := ""
+    $enr_cid := ""
+    $enr_hid := ""
+    if cred_file.len > 0 {
+        craw := os.read(cred_file + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, "failed reading --credential: " + err.msg(), 0, EXIT_CONFIG) }
+        cdoc := json.parse(&craw)
+        if !cdoc.ok() || !cdoc.is_dict(cdoc.root()) || !cdoc.has(cdoc.root(), "payload") || !cdoc.has(cdoc.root(), "human_sig") {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid --credential voucher json", 0, EXIT_USAGE)
+        }
+        pl := cdoc.get(cdoc.root(), "payload")
+        enr_cid = json_str_or(&cdoc, cdoc.get(pl, "cred_id"), "")
+        enr_hid = json_str_or(&cdoc, cdoc.get(pl, "human_id"), "")
+        enr_json = strings.trim_space(&craw)
+    }
+
     $r := empty_api_err(false, "ERR_INIT", "not run")
     $pow_ms := 0
     for attempt in 0:2 {
-        ts := strconv.itoa(time.now_time().unix())
+        now_i := time.now_time().unix()
+        ts := strconv.itoa(now_i)
+        $reg_body := "{\"public_key_pem\":" + json.quote(&pub_pem)
+        if enr_json.len > 0 {
+            ab_pl := cli_canon_binding(fp + "", enr_cid + "", enr_hid + "", now_i)
+            ab_sig := sign_pss_message(&priv, &ab_pl) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+            reg_body = reg_body + ",\"enrollment\":" + enr_json + ",\"agent_binding\":" + ab_pl + ",\"agent_binding_sig\":" + json.quote(&ab_sig)
+        }
+        reg_body = reg_body + "}"
+
         t0 := time.now()
         nonce := solve_pow_register(&pub_pem, ts + "", pow_bits)
         pow_ms = (time.now() - t0) / 1000000
@@ -221,7 +249,6 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
     }
     aid := json_str_or(&rdoc, rdoc.get(rdoc.root(), "agent_id"), "")
     cat := json_int_or(&rdoc, rdoc.get(rdoc.root(), "created_at"), time.now_time().unix())
-    fp := pubkey_fingerprint(&pub_pem)
 
     save_private_key_atomic(home + "", &priv_pem) or (err) {
         << emit_err(opts, "ERR_CONFIG", 0, "failed saving private.pem: " + err.msg(), 0, EXIT_CONFIG)
@@ -241,7 +268,11 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
     }
 
     if opts.json_mode {
-        println("{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"created_at\":" + strconv.itoa(cat) + ",\"key_version\":1,\"fingerprint\":" + json.quote(&fp) + ",\"home\":" + json.quote(&home) + ",\"pow_bits\":" + strconv.itoa(pow_bits) + ",\"pow_ms\":" + strconv.itoa(pow_ms) + "}")
+        $out_j := "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"created_at\":" + strconv.itoa(cat) + ",\"key_version\":1,\"fingerprint\":" + json.quote(&fp) + ",\"home\":" + json.quote(&home) + ",\"pow_bits\":" + strconv.itoa(pow_bits) + ",\"pow_ms\":" + strconv.itoa(pow_ms)
+        if enr_hid.len > 0 {
+            out_j = out_j + ",\"human_id\":" + json.quote(&enr_hid) + ",\"cred_id\":" + json.quote(&enr_cid)
+        }
+        println(out_j + "}")
     } else {
         println("initialized " + aid + " (home=" + home + ")")
     }
@@ -262,7 +293,13 @@ pub fn cmd_whoami(opts &CliOpts) int {
     if opts.json_mode {
         println(fk.raw_json)
     } else {
-        println("agent_id=" + cfg.agent_id + " status=" + fk.status + " key_version=" + strconv.itoa(fk.key_version) + " api=" + cfg.api_base)
+        $owner_s := ""
+        doc := json.parse(&fk.raw_json)
+        if doc.ok() && doc.has(doc.root(), "ownership") && doc.is_dict(doc.get(doc.root(), "ownership")) {
+            oh := json_str_or(&doc, doc.get(doc.get(doc.root(), "ownership"), "human_id"), "")
+            if oh.len > 0 { owner_s = " owner_human_id=" + oh }
+        }
+        println("agent_id=" + cfg.agent_id + " status=" + fk.status + " key_version=" + strconv.itoa(fk.key_version) + owner_s + " api=" + cfg.api_base)
     }
     << EXIT_OK
 }

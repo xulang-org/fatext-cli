@@ -1,0 +1,799 @@
+@main
+
+#crypto/rsa
+#crypto/sha256
+#encoding/json
+#os
+#strconv
+#strings
+#time
+
+pub struct CliScopeRes {
+    pub ok bool
+    pub scopes []string
+}
+
+pub fn cli_valid_scope(s string) bool {
+    << s == "dm" || s == "mail" || s == "profile" || s == "pub" ||
+        s == "room" || s == "rotate" || s == "social" || s == "stream"
+}
+
+pub fn cli_all_scopes() []string {
+    << ["dm", "mail", "profile", "pub", "room", "rotate", "social", "stream"]
+}
+
+pub fn normalize_cli_scopes(csv_in &string) CliScopeRes {
+    trimmed := strings.trim_space(csv_in)
+    if trimmed.len == 0 || trimmed == "all" {
+        << CliScopeRes{ok: true, scopes: cli_all_scopes()}
+    }
+    parts := strings.split(&trimmed, ",")
+    $out := []string{}
+    for i in 0:parts.len {
+        s := strings.trim_space(&parts[i])
+        if s == "all" {
+            << CliScopeRes{ok: true, scopes: cli_all_scopes()}
+        }
+        if !cli_valid_scope(s + "") {
+            << CliScopeRes{ok: false, scopes: []string{}}
+        }
+        $seen := false
+        for j in 0:out.len {
+            if out[j] == s {
+                seen = true
+                <-
+            }
+        }
+        if !seen { out.push(s) }
+    }
+    $i := 0
+    while i < out.len {
+        $j := i + 1
+        while j < out.len {
+            if strings.compare(&out[j], &out[i]) < 0 {
+                tmp := out[i] + ""
+                out[i] = out[j] + ""
+                out[j] = tmp
+            }
+            j += 1
+        }
+        i += 1
+    }
+    << CliScopeRes{ok: true, scopes: out}
+}
+
+pub fn cli_scopes_json_array(scopes &[]string) string {
+    $qs := []string{}
+    for i in 0:scopes.len { qs.push(json.quote(&scopes[i])) }
+    << "[" + strings.join(qs, ",") + "]"
+}
+
+pub fn cli_canon_enrollment(cred_id string, exp int, hid string, hkv int, iat int, lbl string, scopes &[]string) string {
+    << "{\"cred_id\":" + json.quote(&cred_id) +
+        ",\"expires_at\":" + strconv.itoa(exp) +
+        ",\"human_id\":" + json.quote(&hid) +
+        ",\"human_key_version\":" + strconv.itoa(hkv) +
+        ",\"issued_at\":" + strconv.itoa(iat) +
+        ",\"kind\":\"enrollment\"" +
+        ",\"label\":" + json.quote(&lbl) +
+        ",\"scopes\":" + cli_scopes_json_array(scopes) + "}"
+}
+
+pub fn cli_canon_binding(fp string, cred_id string, hid string, ts int) string {
+    << "{\"agent_pub_fp\":" + json.quote(&fp) +
+        ",\"cred_id\":" + json.quote(&cred_id) +
+        ",\"human_id\":" + json.quote(&hid) +
+        ",\"timestamp\":" + strconv.itoa(ts) + "}"
+}
+
+pub fn cli_canon_agent_cert(aid string, akv int, fp string, cred_id string, exp int, hid string, hkv int, iat int, lbl string, scopes &[]string) string {
+    << "{\"agent_id\":" + json.quote(&aid) +
+        ",\"agent_key_version\":" + strconv.itoa(akv) +
+        ",\"agent_pub_fp\":" + json.quote(&fp) +
+        ",\"cred_id\":" + json.quote(&cred_id) +
+        ",\"expires_at\":" + strconv.itoa(exp) +
+        ",\"human_id\":" + json.quote(&hid) +
+        ",\"human_key_version\":" + strconv.itoa(hkv) +
+        ",\"issued_at\":" + strconv.itoa(iat) +
+        ",\"kind\":\"agent_cert\"" +
+        ",\"label\":" + json.quote(&lbl) +
+        ",\"scopes\":" + cli_scopes_json_array(scopes) + "}"
+}
+
+pub fn cli_canon_adoption(aid string, fp string, hid string, ts int) string {
+    << "{\"agent_id\":" + json.quote(&aid) +
+        ",\"agent_pub_fp\":" + json.quote(&fp) +
+        ",\"human_id\":" + json.quote(&hid) +
+        ",\"timestamp\":" + strconv.itoa(ts) + "}"
+}
+
+fn cli_load_human_cfg_or_base(opts &CliOpts, api_base string) HumanConfig {
+    << load_human_config(opts) or (err) {
+        << HumanConfig{human_id: "", api_base: api_base, created_at: 0, key_version: 1, fingerprint: "", home: ""}
+    }
+}
+
+pub fn cmd_human(opts &CliOpts, args []string) int {
+    if args.len < 1 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human <init|whoami|profile|key|fetch|cred|agents|grant|suspend|resume|revoke|policy> ...", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    $rest := []string{}
+    for i in 1:args.len { rest.push(args[i] + "") }
+
+    if sub == "init" {
+        $name := ""
+        $bio := ""
+        $homepage := ""
+        $bits := 2048
+        $i := 0
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--name" && i + 1 < rest.len {
+                i += 1
+                name = rest[i] + ""
+            } else if a == "--bio" && i + 1 < rest.len {
+                i += 1
+                bio = rest[i] + ""
+            } else if a == "--homepage" && i + 1 < rest.len {
+                i += 1
+                homepage = rest[i] + ""
+            } else if a == "--bits" && i + 1 < rest.len {
+                i += 1
+                bits = parse_int_or(&rest[i], 2048)
+            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown human init flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
+        if bits < 2048 || bits > 4096 {
+            << emit_err(opts, "ERR_USAGE", 0, "--bits must be 2048..4096", 0, EXIT_USAGE)
+        }
+        home := resolve_human_home(opts)
+        api_base := resolve_api_base(opts, "")
+        priv := rsa.generate_key(bits) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        priv_pem := encode_rsa_private_pem(&priv) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        pub_pem := encode_spki_public_pem(&priv.public) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+
+        $pow_bits := discover_pow_bits(opts, api_base + "", "register", 20)
+        $reg_body := "{\"public_key_pem\":" + json.quote(&pub_pem)
+        if name.len > 0 || bio.len > 0 || homepage.len > 0 {
+            reg_body = reg_body + ",\"profile\":{\"name\":" + json.quote(&name) + ",\"bio\":" + json.quote(&bio) + ",\"homepage\":" + json.quote(&homepage) + "}"
+        }
+        reg_body = reg_body + "}"
+
+        $r := empty_api_err(false, "ERR_INIT", "not run")
+        for attempt in 0:2 {
+            ts := strconv.itoa(time.now_time().unix())
+            nonce := solve_pow_register(&pub_pem, ts + "", pow_bits)
+            sig := sign_http_request(&priv, "POST", "/v1/humans/register", ts + "", &reg_body) or (err) {
+                << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+            }
+            extra := "X-Timestamp: " + ts + "\r\nX-Signature: " + sig + "\r\nX-PoW-Nonce: " + nonce + "\r\n"
+            r = api_call(api_base + "", opts.timeout_sec, "", &priv, false, "POST", "/v1/humans/register", &reg_body, extra)
+            if r.ok { <- }
+            if r.err_code == "ERR_POW_INSUFFICIENT" && r.required_bits > 0 && attempt == 0 {
+                pow_bits = r.required_bits
+                ->
+            }
+            <-
+        }
+        if !r.ok { << handle_api_fail(opts, &r) }
+
+        rdoc := json.parse(&r.body)
+        if !rdoc.ok() || !rdoc.has(rdoc.root(), "human_id") {
+            << emit_err(opts, "ERR_INTERNAL", r.status, "invalid human register response", 0, EXIT_ERR)
+        }
+        hid := json_str_or(&rdoc, rdoc.get(rdoc.root(), "human_id"), "")
+        cat := json_int_or(&rdoc, rdoc.get(rdoc.root(), "created_at"), time.now_time().unix())
+        fp := pubkey_fingerprint(&pub_pem)
+        save_private_key_atomic(home + "", &priv_pem) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        hc := HumanConfig{human_id: hid + "", api_base: api_base + "", created_at: cat, key_version: 1, fingerprint: fp + "", home: home + ""}
+        save_human_config(home + "", &hc) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+
+        if opts.json_mode {
+            println("{\"ok\":true,\"human_id\":" + json.quote(&hid) + ",\"created_at\":" + strconv.itoa(cat) + ",\"key_version\":1,\"fingerprint\":" + json.quote(&fp) + ",\"home\":" + json.quote(&home) + "}")
+        } else {
+            println("initialized human root " + hid + " (home=" + home + ")")
+        }
+        << EXIT_OK
+    }
+
+    if sub == "fetch" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human fetch <human_id> [--pem]", 0, EXIT_USAGE) }
+        hid := rest[0] + ""
+        want_pem := rest.len >= 2 && rest[1] == "--pem"
+        api_base := resolve_api_base(opts, "")
+        hc := cli_load_human_cfg_or_base(opts, api_base + "")
+        fk := fetch_human_key(hc.api_base + "", opts.timeout_sec, hid + "")
+        if !fk.ok { << emit_err(opts, fk.err_code + "", 0, fk.err_msg + "", 0, fk.exit_code) }
+        if want_pem { println(fk.pub_pem) } else { println(fk.raw_json) }
+        << EXIT_OK
+    }
+
+    if sub == "whoami" {
+        hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        _ := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        fk := fetch_human_key(hc.api_base + "", opts.timeout_sec, hc.human_id + "")
+        if !fk.ok { << emit_err(opts, fk.err_code + "", 0, fk.err_msg + "", 0, fk.exit_code) }
+        if opts.json_mode {
+            println(fk.raw_json)
+        } else {
+            println("human_id=" + hc.human_id + " status=" + fk.status + " key_version=" + strconv.itoa(fk.key_version) + " api=" + hc.api_base)
+        }
+        << EXIT_OK
+    }
+
+    if sub == "profile" {
+        if rest.len < 1 || rest[0] != "set" {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human profile set [--name ...] [--bio ...] [--homepage ...]", 0, EXIT_USAGE)
+        }
+        hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        $has_name := false
+        $name := ""
+        $has_bio := false
+        $bio := ""
+        $has_hp := false
+        $hp := ""
+        $i := 1
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--name" && i + 1 < rest.len {
+                i += 1
+                has_name = true
+                name = rest[i] + ""
+            } else if a == "--bio" && i + 1 < rest.len {
+                i += 1
+                has_bio = true
+                bio = rest[i] + ""
+            } else if a == "--homepage" && i + 1 < rest.len {
+                i += 1
+                has_hp = true
+                hp = rest[i] + ""
+            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown human profile flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
+        fk := fetch_human_key(hc.api_base + "", opts.timeout_sec, hc.human_id + "")
+        if !fk.ok { << emit_err(opts, fk.err_code + "", 0, fk.err_msg + "", 0, fk.exit_code) }
+        cur := json.parse(&fk.raw_json)
+        if !cur.ok() { << emit_err(opts, "ERR_ERR", 0, "corrupt remote human doc", 0, EXIT_ERR) }
+        cr := cur.root()
+        $rev := 0
+        if cur.has(cr, "revision") { rev = json_int_or(&cur, cur.get(cr, "revision"), 0) }
+        if !has_name && cur.has(cr, "profile") { name = json_str_or(&cur, cur.get(cur.get(cr, "profile"), "name"), "") }
+        if !has_bio && cur.has(cr, "profile") { bio = json_str_or(&cur, cur.get(cur.get(cr, "profile"), "bio"), "") }
+        if !has_hp && cur.has(cr, "profile") { hp = json_str_or(&cur, cur.get(cur.get(cr, "profile"), "homepage"), "") }
+        body := "{\"revision\":" + strconv.itoa(rev + 1) + ",\"profile\":{\"name\":" + json.quote(&name) + ",\"bio\":" + json.quote(&bio) + ",\"homepage\":" + json.quote(&hp) + "}}"
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "PUT", "/v1/humans/profile", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        if opts.json_mode { println(r.body) } else { println("updated human profile revision " + strconv.itoa(rev + 1)) }
+        << EXIT_OK
+    }
+
+    if sub == "key" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human key <rotate|revoke --confirm>", 0, EXIT_USAGE) }
+        hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        if rest[0] == "rotate" {
+            old_priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            old_pem := read_file_or_empty(hc.home + "/private.pem")
+            new_priv := rsa.generate_key(2048) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+            new_priv_pem := encode_rsa_private_pem(&new_priv) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+            new_pub_pem := encode_spki_public_pem(&new_priv.public) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+            new_kv := hc.key_version + 1
+            now := time.now_time().unix()
+            payload := "{\"human_id\":" + json.quote(&hc.human_id) +
+                ",\"key_version\":" + strconv.itoa(new_kv) +
+                ",\"new_public_key_pem\":" + json.quote(&new_pub_pem) +
+                ",\"timestamp\":" + strconv.itoa(now) + "}"
+            old_sig := sign_pss_message(&old_priv, &payload) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+            new_sig := sign_pss_message(&new_priv, &payload) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+            body := "{\"payload\":" + payload + ",\"old_sig\":" + json.quote(&old_sig) + ",\"new_sig\":" + json.quote(&new_sig) + "}"
+            ts := strconv.itoa(now)
+            req_sig_old := sign_http_request(&old_priv, "POST", "/v1/humans/rotate-key", ts + "", &body) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+            req_sig_new := sign_http_request(&new_priv, "POST", "/v1/humans/rotate-key", ts + "", &body) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+            extra := "X-Human-Id: " + hc.human_id + "\r\nX-Timestamp: " + ts + "\r\nX-Signature: " + req_sig_old + "\r\nX-Signature-New: " + req_sig_new + "\r\n"
+            r := api_call(hc.api_base + "", opts.timeout_sec, "", &old_priv, false, "POST", "/v1/humans/rotate-key", &body, extra)
+            if !r.ok { << handle_api_fail(opts, &r) }
+            archive_private_key(hc.home + "", hc.key_version, &old_pem) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            save_private_key_atomic(hc.home + "", &new_priv_pem) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            fp := pubkey_fingerprint(&new_pub_pem)
+            nhc := HumanConfig{human_id: hc.human_id + "", api_base: hc.api_base + "", created_at: hc.created_at, key_version: new_kv, fingerprint: fp + "", home: hc.home + ""}
+            save_human_config(hc.home + "", &nhc) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            if opts.json_mode { println(r.body) } else { println("rotated human key to v" + strconv.itoa(new_kv)) }
+            << EXIT_OK
+        }
+        if rest[0] == "revoke" {
+            $confirm := false
+            for k in 1:rest.len { if rest[k] == "--confirm" { confirm = true } }
+            if !confirm { << emit_err(opts, "ERR_CONFIRM_REQUIRED", 0, "human revocation requires --confirm", 0, EXIT_USAGE) }
+            priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            body := "{}"
+            r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "POST", "/v1/humans/revoke", &body, "")
+            if !r.ok { << handle_api_fail(opts, &r) }
+            if opts.json_mode { println(r.body) } else { println("revoked human " + hc.human_id) }
+            << EXIT_OK
+        }
+        << emit_err(opts, "ERR_USAGE", 0, "unknown human key subcommand", 0, EXIT_USAGE)
+    }
+
+    if sub == "cred" {
+        if rest.len < 1 || rest[0] != "issue" {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human cred issue [--label ...] [--scopes all|csv] [--ttl 30d] [--out <file>]", 0, EXIT_USAGE)
+        }
+        hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        $lbl := ""
+        $scopes_in := "all"
+        $ttl_s := "30d"
+        $out_path := ""
+        $i := 1
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--label" && i + 1 < rest.len {
+                i += 1
+                lbl = rest[i] + ""
+            } else if a == "--scopes" && i + 1 < rest.len {
+                i += 1
+                scopes_in = rest[i] + ""
+            } else if a == "--ttl" && i + 1 < rest.len {
+                i += 1
+                ttl_s = rest[i] + ""
+            } else if a == "--out" && i + 1 < rest.len {
+                i += 1
+                out_path = rest[i] + ""
+            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown cred issue flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
+        sr := normalize_cli_scopes(&scopes_in)
+        if !sr.ok { << emit_err(opts, "ERR_USAGE", 0, "invalid scopes: " + scopes_in, 0, EXIT_USAGE) }
+        ttl := parse_ttl_seconds(&ttl_s)
+        if ttl < 0 { << emit_err(opts, "ERR_USAGE", 0, "invalid ttl: " + ttl_s, 0, EXIT_USAGE) }
+        iat := time.now_time().unix()
+        $exp := 0
+        if ttl > 0 { exp = iat + ttl }
+        ul := new_ulid() or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        cid := "cred_" + ul
+        canon_pl := cli_canon_enrollment(cid + "", exp, hc.human_id + "", hc.key_version, iat, lbl + "", &sr.scopes)
+        hsig := sign_pss_message(&priv, &canon_pl) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        voucher := "{\"payload\":" + canon_pl + ",\"human_sig\":" + json.quote(&hsig) + "}\n"
+        if out_path.len > 0 {
+            write_atomic_mode(out_path + "", &voucher, 384) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            if opts.json_mode {
+                println("{\"ok\":true,\"cred_id\":" + json.quote(&cid) + ",\"human_id\":" + json.quote(&hc.human_id) + ",\"out\":" + json.quote(&out_path) + ",\"expires_at\":" + strconv.itoa(exp) + "}")
+            } else {
+                println("issued enrollment credential " + cid + " -> " + out_path)
+            }
+        } else {
+            println(strings.trim_space(&voucher))
+        }
+        << EXIT_OK
+    }
+
+    if sub == "agents" {
+        hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        empty := ""
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "GET", "/v1/humans/agents", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "grant" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human grant <agent_id> [--scopes ...] [--ttl 30d] [--label ...] [--proof <file>]", 0, EXIT_USAGE) }
+        aid := rest[0] + ""
+        hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        $lbl := ""
+        $scopes_in := "all"
+        $ttl_s := "30d"
+        $proof_path := ""
+        $i := 1
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--label" && i + 1 < rest.len {
+                i += 1
+                lbl = rest[i] + ""
+            } else if a == "--scopes" && i + 1 < rest.len {
+                i += 1
+                scopes_in = rest[i] + ""
+            } else if a == "--ttl" && i + 1 < rest.len {
+                i += 1
+                ttl_s = rest[i] + ""
+            } else if a == "--proof" && i + 1 < rest.len {
+                i += 1
+                proof_path = rest[i] + ""
+            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown grant flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
+        sr := normalize_cli_scopes(&scopes_in)
+        if !sr.ok { << emit_err(opts, "ERR_USAGE", 0, "invalid scopes: " + scopes_in, 0, EXIT_USAGE) }
+        ttl := parse_ttl_seconds(&ttl_s)
+        if ttl < 0 { << emit_err(opts, "ERR_USAGE", 0, "invalid ttl: " + ttl_s, 0, EXIT_USAGE) }
+
+        afk := fetch_agent_key(hc.api_base + "", opts.timeout_sec, aid + "")
+        if !afk.ok { << emit_err(opts, afk.err_code + "", 0, afk.err_msg + "", 0, afk.exit_code) }
+        afp := pubkey_fingerprint(&afk.pub_pem)
+        iat := time.now_time().unix()
+        $exp := 0
+        if ttl > 0 { exp = iat + ttl }
+        ul := new_ulid() or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        cid := "cred_" + ul
+        canon_cert := cli_canon_agent_cert(aid + "", afk.key_version, afp + "", cid + "", exp, hc.human_id + "", hc.key_version, iat, lbl + "", &sr.scopes)
+        hsig := sign_pss_message(&priv, &canon_cert) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+
+        $body := "{\"payload\":" + canon_cert + ",\"human_sig\":" + json.quote(&hsig)
+        if proof_path.len > 0 {
+            praw := os.read(proof_path + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            body = body + ",\"adoption_proof\":" + strings.trim_space(&praw)
+        }
+        body = body + "}"
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "POST", "/v1/humans/agents/" + aid + "/credential", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "suspend" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human suspend <agent_id> [--reason ...]", 0, EXIT_USAGE) }
+        aid := rest[0] + ""
+        $reason := ""
+        if rest.len >= 3 && rest[1] == "--reason" { reason = rest[2] + "" }
+        hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        body := "{\"reason\":" + json.quote(&reason) + "}"
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "POST", "/v1/humans/agents/" + aid + "/suspend", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "resume" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human resume <agent_id>", 0, EXIT_USAGE) }
+        aid := rest[0] + ""
+        hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        body := "{}"
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "POST", "/v1/humans/agents/" + aid + "/resume", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "revoke" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human revoke <agent_id> [--successor <id>] [--reason ...] --confirm", 0, EXIT_USAGE) }
+        aid := rest[0] + ""
+        $succ := ""
+        $reason := ""
+        $confirm := false
+        $i := 1
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--confirm" { confirm = true }
+            else if a == "--successor" && i + 1 < rest.len {
+                i += 1
+                succ = rest[i] + ""
+            } else if a == "--reason" && i + 1 < rest.len {
+                i += 1
+                reason = rest[i] + ""
+            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown revoke flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
+        if !confirm { << emit_err(opts, "ERR_CONFIRM_REQUIRED", 0, "permanent revocation requires --confirm", 0, EXIT_USAGE) }
+        hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        $succ_json := "null"
+        if succ.len > 0 { succ_json = json.quote(&succ) }
+        body := "{\"successor_id\":" + succ_json + ",\"reason\":" + json.quote(&reason) + "}"
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "POST", "/v1/humans/agents/" + aid + "/revoke", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "policy" {
+        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human policy <agent_id> [--dm-policy ...] [--accept-email true|false] [--clear-webhook]", 0, EXIT_USAGE) }
+        aid := rest[0] + ""
+        $has_dmp := false
+        $dmp := ""
+        $has_ae := false
+        $ae := false
+        $clear_wh := false
+        $i := 1
+        while i < rest.len {
+            a := rest[i] + ""
+            if a == "--dm-policy" && i + 1 < rest.len {
+                i += 1
+                has_dmp = true
+                dmp = rest[i] + ""
+            } else if a == "--accept-email" && i + 1 < rest.len {
+                i += 1
+                has_ae = true
+                ae = (rest[i] == "true" || rest[i] == "1")
+            } else if a == "--clear-webhook" { clear_wh = true }
+            else { << emit_err(opts, "ERR_USAGE", 0, "unknown policy flag: " + a, 0, EXIT_USAGE) }
+            i += 1
+        }
+        hc := load_human_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(hc.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        $parts := []string{}
+        if has_dmp { parts.push("\"dm_policy\":" + json.quote(&dmp)) }
+        if has_ae {
+            $ae_s := "false"
+            if ae { ae_s = "true" }
+            parts.push("\"accept_email\":" + ae_s)
+        }
+        if clear_wh { parts.push("\"clear_webhook\":true") }
+        body := "{" + join_ref(&parts, ",") + "}"
+        r := api_call_human(hc.api_base + "", opts.timeout_sec, hc.human_id + "", &priv, true, "PUT", "/v1/humans/agents/" + aid + "/policy", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    << emit_err(opts, "ERR_USAGE", 0, "unknown human subcommand: " + sub, 0, EXIT_USAGE)
+}
+
+pub fn cmd_claim_proof(opts &CliOpts, args []string) int {
+    if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext claim-proof <human_id> [--out <file>]", 0, EXIT_USAGE) }
+    hid := args[0] + ""
+    if !is_valid_human_id(hid + "") { << emit_err(opts, "ERR_USAGE", 0, "invalid human_id", 0, EXIT_USAGE) }
+    $out_path := ""
+    if args.len >= 3 && args[1] == "--out" { out_path = args[2] + "" }
+
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    pub_pem := encode_spki_public_pem(&priv.public) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+    fp := pubkey_fingerprint(&pub_pem)
+    ts := time.now_time().unix()
+    pl := cli_canon_adoption(cfg.agent_id + "", fp + "", hid + "", ts)
+    asig := sign_pss_message(&priv, &pl) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+    proof := "{\"payload\":" + pl + ",\"agent_sig\":" + json.quote(&asig) + "}\n"
+    if out_path.len > 0 {
+        write_atomic_mode(out_path + "", &proof, 384) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        if opts.json_mode {
+            println("{\"ok\":true,\"agent_id\":" + json.quote(&cfg.agent_id) + ",\"human_id\":" + json.quote(&hid) + ",\"out\":" + json.quote(&out_path) + "}")
+        } else {
+            println("wrote adoption proof -> " + out_path)
+        }
+    } else {
+        println(strings.trim_space(&proof))
+    }
+    << EXIT_OK
+}
+
+fn cli_find_key_for_ver(doc &json.Doc, want_ver int, cur_ver int, cur_pem &string) string {
+    if want_ver == cur_ver { << cur_pem + "" }
+    rt := doc.root()
+    if !doc.has(rt, "key_history") || !doc.is_list(doc.get(rt, "key_history")) { << "" }
+    kh := doc.get(rt, "key_history")
+    for i in 0:doc.count(kh) {
+        el := doc.at(kh, i)
+        if doc.is_dict(el) && json_int_or(doc, doc.get(el, "version"), 0) == want_ver {
+            << json_str_or(doc, doc.get(el, "public_key_pem"), "")
+        }
+    }
+    << ""
+}
+
+fn cli_verify_human_rotations(hdoc &json.Doc, hid string, cur_ver int, cur_pem &string, errs $&[]string) {
+    rt := hdoc.root()
+    if !hdoc.has(rt, "key_history") || !hdoc.is_list(hdoc.get(rt, "key_history")) { << }
+    kh := hdoc.get(rt, "key_history")
+    cnt := doc_count(hdoc, kh)
+    for i in 0:cnt {
+        el := hdoc.at(kh, i)
+        if !hdoc.is_dict(el) { -> }
+        osig := json_str_or(hdoc, hdoc.get(el, "rotated_by_old_sig"), "")
+        nsig := json_str_or(hdoc, hdoc.get(el, "rotated_by_new_sig"), "")
+        if osig.len > 0 && nsig.len > 0 {
+            old_pem := json_str_or(hdoc, hdoc.get(el, "public_key_pem"), "")
+            vu := json_int_or(hdoc, hdoc.get(el, "valid_until"), 0)
+            old_v := json_int_or(hdoc, hdoc.get(el, "version"), 0)
+            next_pem := cli_find_key_for_ver(hdoc, old_v + 1, cur_ver, cur_pem)
+            old_pk := decode_spki_public_pem(&old_pem) or (err) {
+                errs.push("invalid historical human key")
+                ->
+            }
+            if next_pem.len == 0 {
+                errs.push("missing next human key in chain")
+                ->
+            }
+            next_pk := decode_spki_public_pem(&next_pem) or (err) {
+                errs.push("invalid next human key")
+                ->
+            }
+            // Rotation timestamp checked with small skew around valid_until
+            $matched := false
+            for dt in -2:3 {
+                cand := "{\"human_id\":" + json.quote(&hid) + ",\"key_version\":" + strconv.itoa(old_v + 1) + ",\"new_public_key_pem\":" + json.quote(&next_pem) + ",\"timestamp\":" + strconv.itoa(vu + dt) + "}"
+                if verify_pss_message(&old_pk, &cand, osig + "") && verify_pss_message(&next_pk, &cand, nsig + "") {
+                    matched = true
+                    <-
+                }
+            }
+            if !matched {
+                errs.push("human key rotation signature link v" + strconv.itoa(old_v) + "->v" + strconv.itoa(old_v + 1) + " failed")
+            }
+        }
+    }
+}
+
+fn cli_verify_pem_sig(pem &string, msg &string, sig string) bool {
+    pk := decode_spki_public_pem(pem) or (err) { << false }
+    << verify_pss_message(&pk, msg, sig)
+}
+
+fn doc_count(doc &json.Doc, n int) int {
+    << doc.count(n)
+}
+
+pub fn cmd_verify(opts &CliOpts, args []string) int {
+    if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext verify <agent_id>", 0, EXIT_USAGE) }
+    aid := args[0] + ""
+    if !is_valid_agent_id(aid + "") { << emit_err(opts, "ERR_USAGE", 0, "invalid agent_id", 0, EXIT_USAGE) }
+
+    api_base := resolve_api_base(opts, "")
+    cfg_opt := load_config_or_base(opts, api_base + "")
+    afk := fetch_agent_key(cfg_opt.api_base + "", opts.timeout_sec, aid + "")
+    if !afk.ok { << emit_err(opts, afk.err_code + "", 0, afk.err_msg + "", 0, afk.exit_code) }
+
+    adoc := json.parse(&afk.raw_json)
+    if !adoc.ok() { << emit_err(opts, "ERR_CRYPTO", 0, "invalid agent json", 0, EXIT_CRYPTO) }
+    ar := adoc.root()
+    $errs := []string{}
+    if afk.status != "active" {
+        errs.push("agent status is " + afk.status)
+    }
+
+    now := time.now_time().unix()
+    if !adoc.has(ar, "ownership") || adoc.is_null(adoc.get(ar, "ownership")) {
+        $valid := errs.len == 0
+        $vs := "false"
+        if valid { vs = "true" }
+        $err_qs := []string{}
+        for i in 0:errs.len { err_qs.push(json.quote(&errs[i])) }
+        if opts.json_mode {
+            println("{\"chain_valid\":" + vs + ",\"autonomous\":true,\"agent_id\":" + json.quote(&aid) + ",\"agent_status\":" + json.quote(&afk.status) + ",\"errors\":[" + join_ref(&err_qs, ",") + "]}")
+        } else {
+            println("agent_id=" + aid + " autonomous=true chain_valid=" + vs + " status=" + afk.status)
+        }
+        if valid { << EXIT_OK }
+        << EXIT_CRYPTO
+    }
+
+    on := adoc.get(ar, "ownership")
+    hid := json_str_or(&adoc, adoc.get(on, "human_id"), "")
+    hkv := json_int_or(&adoc, adoc.get(on, "human_key_version"), 0)
+    cid := json_str_or(&adoc, adoc.get(on, "cred_id"), "")
+    kind := json_str_or(&adoc, adoc.get(on, "kind"), "")
+    lbl := json_str_or(&adoc, adoc.get(on, "label"), "")
+    ost := json_str_or(&adoc, adoc.get(on, "status"), "")
+    iat := json_int_or(&adoc, adoc.get(on, "issued_at"), 0)
+    exp := json_int_or(&adoc, adoc.get(on, "expires_at"), 0)
+    hsig := json_str_or(&adoc, adoc.get(on, "human_sig"), "")
+    absig := json_str_or(&adoc, adoc.get(on, "agent_binding_sig"), "")
+
+    $scopes := []string{}
+    if adoc.has(on, "scopes") && adoc.is_list(adoc.get(on, "scopes")) {
+        sa := adoc.get(on, "scopes")
+        for i in 0:adoc.count(sa) { scopes.push(json_str_or(&adoc, adoc.at(sa, i), "")) }
+    }
+
+    if ost != "active" { errs.push("ownership status is " + ost) }
+    if exp > 0 && now > exp { errs.push("credential expired") }
+
+    hfk := fetch_human_key(cfg_opt.api_base + "", opts.timeout_sec, hid + "")
+    $hst := "unknown"
+    if !hfk.ok {
+        errs.push("failed fetching human root " + hid + ": " + hfk.err_msg)
+    } else {
+        hst = hfk.status + ""
+        if hfk.status != "active" { errs.push("human root status is " + hfk.status) }
+        hdoc := json.parse(&hfk.raw_json)
+        if !hdoc.ok() {
+            errs.push("invalid human root json")
+        } else {
+            cli_verify_human_rotations(&hdoc, hid + "", hfk.key_version, &hfk.pub_pem, $&errs)
+            hpem := cli_find_key_for_ver(&hdoc, hkv, hfk.key_version, &hfk.pub_pem)
+            if hpem.len == 0 {
+                errs.push("human key version v" + strconv.itoa(hkv) + " missing")
+            } else {
+                $canon_pl := ""
+                if kind == "enrollment" {
+                    canon_pl = cli_canon_enrollment(cid + "", exp, hid + "", hkv, iat, lbl + "", &scopes)
+                } else if kind == "agent_cert" {
+                    pl := adoc.get(on, "payload")
+                    akv := json_int_or(&adoc, adoc.get(pl, "agent_key_version"), 0)
+                    afp := json_str_or(&adoc, adoc.get(pl, "agent_pub_fp"), "")
+                    apem_ver := cli_find_key_for_ver(&adoc, akv, afk.key_version, &afk.pub_pem)
+                    if apem_ver.len == 0 {
+                        errs.push("agent_cert agent_key_version v" + strconv.itoa(akv) + " missing from agent")
+                    } else if pubkey_fingerprint(&apem_ver) != afp {
+                        errs.push("agent_cert fingerprint does not match agent key")
+                    }
+                    canon_pl = cli_canon_agent_cert(aid + "", akv, afp + "", cid + "", exp, hid + "", hkv, iat, lbl + "", &scopes)
+                } else {
+                    errs.push("unknown ownership kind: " + kind)
+                }
+                if canon_pl.len > 0 && !cli_verify_pem_sig(&hpem, &canon_pl, hsig + "") {
+                    errs.push("human_sig verification failed")
+                }
+            }
+            // Verify roster entry in human.agents[]
+            hr := hdoc.root()
+            $in_roster := false
+            if hdoc.has(hr, "agents") && hdoc.is_list(hdoc.get(hr, "agents")) {
+                arr := hdoc.get(hr, "agents")
+                for i in 0:hdoc.count(arr) {
+                    el := hdoc.at(arr, i)
+                    if hdoc.is_dict(el) && json_str_or(&hdoc, hdoc.get(el, "agent_id"), "") == aid &&
+                       json_str_or(&hdoc, hdoc.get(el, "cred_id"), "") == cid {
+                        in_roster = true
+                        <-
+                    }
+                }
+            }
+            if !in_roster { errs.push("agent credential not listed in human agents roster") }
+        }
+    }
+
+    // Verify agent_binding / adoption binding if present
+    if adoc.has(on, "agent_binding") && !adoc.is_null(adoc.get(on, "agent_binding")) {
+        ab := adoc.get(on, "agent_binding")
+        ab_fp := json_str_or(&adoc, adoc.get(ab, "agent_pub_fp"), "")
+        ab_ts := json_int_or(&adoc, adoc.get(ab, "timestamp"), 0)
+        // Find agent key matching ab_fp (v1 / original binding key or current key)
+        $bind_pem := ""
+        if pubkey_fingerprint(&afk.pub_pem) == ab_fp {
+            bind_pem = afk.pub_pem + ""
+        } else if adoc.has(ar, "key_history") && adoc.is_list(adoc.get(ar, "key_history")) {
+            kh := adoc.get(ar, "key_history")
+            for i in 0:adoc.count(kh) {
+                el := adoc.at(kh, i)
+                kpem := json_str_or(&adoc, adoc.get(el, "public_key_pem"), "")
+                if pubkey_fingerprint(&kpem) == ab_fp {
+                    bind_pem = kpem
+                    <-
+                }
+            }
+        }
+        if bind_pem.len == 0 {
+            errs.push("agent_binding fingerprint key missing from agent")
+        } else {
+            $canon_b := ""
+            if kind == "enrollment" {
+                canon_b = cli_canon_binding(ab_fp + "", cid + "", hid + "", ab_ts)
+            } else {
+                canon_b = cli_canon_adoption(aid + "", ab_fp + "", hid + "", ab_ts)
+            }
+            if !cli_verify_pem_sig(&bind_pem, &canon_b, absig + "") {
+                errs.push("agent_binding_sig verification failed")
+            }
+        }
+    }
+
+    valid := errs.len == 0
+    $vs := "false"
+    if valid { vs = "true" }
+    $err_qs := []string{}
+    for i in 0:errs.len { err_qs.push(json.quote(&errs[i])) }
+    if opts.json_mode {
+        println("{\"chain_valid\":" + vs +
+            ",\"autonomous\":false" +
+            ",\"human_id\":" + json.quote(&hid) +
+            ",\"human_status\":" + json.quote(&hst) +
+            ",\"cred_id\":" + json.quote(&cid) +
+            ",\"kind\":" + json.quote(&kind) +
+            ",\"scopes\":" + cli_scopes_json_array(&scopes) +
+            ",\"expires_at\":" + strconv.itoa(exp) +
+            ",\"agent_id\":" + json.quote(&aid) +
+            ",\"agent_status\":" + json.quote(&afk.status) +
+            ",\"ownership_status\":" + json.quote(&ost) +
+            ",\"errors\":[" + join_ref(&err_qs, ",") + "]}")
+    } else {
+        println("chain_valid=" + vs + " human_id=" + hid + " -> cred_id=" + cid + " (" + kind + ") -> agent_id=" + aid + " status=" + ost)
+        for i in 0:errs.len { println("  error: " + errs[i]) }
+    }
+    if valid { << EXIT_OK }
+    << EXIT_CRYPTO
+}

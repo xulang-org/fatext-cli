@@ -27,9 +27,19 @@ pub const EXIT_RATE_LIMIT = 75
 pub struct CliOpts {
     pub json_mode bool
     pub config_path string
+    pub human_home string
     pub api_override string
     pub timeout_sec int
     pub pow_bits_override int
+}
+
+pub struct HumanConfig {
+    pub human_id string
+    pub api_base string
+    pub created_at int
+    pub key_version int
+    pub fingerprint string
+    pub home string
 }
 
 pub struct Config {
@@ -203,6 +213,54 @@ pub fn save_config(cfg_path string, cfg &Config) int {
     << write_atomic_mode(cfg_path, &body, 384) or >>
 }
 
+pub fn resolve_human_home(opts &CliOpts) string {
+    if opts.human_home.len > 0 {
+        << opts.human_home + ""
+    }
+    env_hh := os.getenv("FATEXT_HUMAN_HOME")
+    if env_hh.len > 0 {
+        << env_hh
+    }
+    h := os.home_dir()
+    if h.len == 0 { << ".fatext-human" }
+    << h + "/.fatext-human"
+}
+
+pub fn load_human_config(opts &CliOpts) HumanConfig {
+    home := resolve_human_home(opts)
+    cpath := home + "/human.json"
+    raw := os.read(cpath) or >>
+    doc := json.parse(&raw)
+    if !doc.ok() { >> errors.new("invalid human.json") }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "human_id") {
+        >> errors.new("missing human_id in human.json")
+    }
+    hid := doc.as_string(doc.get(r, "human_id")) or >>
+    $api := DEFAULT_API_BASE
+    if doc.has(r, "api_base") { api = json_str_or(&doc, doc.get(r, "api_base"), DEFAULT_API_BASE) }
+    api = resolve_api_base(opts, api + "")
+    cat := json_int_or(&doc, doc.get(r, "created_at"), 0)
+    $kv := 1
+    if doc.has(r, "key_version") { kv = json_int_or(&doc, doc.get(r, "key_version"), 1) }
+    $fp := ""
+    if doc.has(r, "fingerprint") { fp = json_str_or(&doc, doc.get(r, "fingerprint"), "") }
+    << HumanConfig{human_id: hid, api_base: api, created_at: cat, key_version: kv, fingerprint: fp, home: home}
+}
+
+pub fn save_human_config(home string, hc &HumanConfig) int {
+    os.mkdir_all(home + "") or >>
+    cpath := home + "/human.json"
+    body := "{" +
+        "\"human_id\":" + json.quote(&hc.human_id) + "," +
+        "\"api_base\":" + json.quote(&hc.api_base) + "," +
+        "\"created_at\":" + strconv.itoa(hc.created_at) + "," +
+        "\"key_version\":" + strconv.itoa(hc.key_version) + "," +
+        "\"fingerprint\":" + json.quote(&hc.fingerprint) +
+        "}\n"
+    << write_atomic_mode(cpath, &body, 384) or >>
+}
+
 pub fn check_private_key_perms(path string) int {
     info := os.stat(path) or >>
     if os.getenv("OS") == "Windows_NT" {
@@ -293,6 +351,25 @@ pub fn is_valid_agent_id(s string) bool {
     for i in 4:16 {
         c := s[i] & 255
         if !((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) { << false }
+    }
+    << true
+}
+
+pub fn is_valid_human_id(s string) bool {
+    if s.len != 16 || !strings.has_prefix(&s, "hum_") { << false }
+    for i in 4:16 {
+        c := s[i] & 255
+        if !((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) { << false }
+    }
+    << true
+}
+
+pub fn is_valid_cred_id(s string) bool {
+    if s.len != 31 || !strings.has_prefix(&s, "cred_") { << false }
+    for i in 5:31 {
+        c := s[i] & 255
+        ok := (c >= 48 && c <= 57) || (c >= 65 && c <= 90 && c != 73 && c != 76 && c != 79 && c != 85)
+        if !ok { << false }
     }
     << true
 }

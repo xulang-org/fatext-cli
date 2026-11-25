@@ -138,7 +138,7 @@ jobs:
           if [ -n "$SIGN_KEY" ]; then
             printf '%s\n' "$SIGN_KEY" > /tmp/sign.pem
             chmod 600 /tmp/sign.pem
-            openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sign /tmp/sign.pem -out /tmp/sums.sig SHA256SUMS
+            openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -sign /tmp/sign.pem -out /tmp/sums.sig SHA256SUMS
             openssl base64 -A -in /tmp/sums.sig -out SHA256SUMS.sig
             rm -f /tmp/sign.pem /tmp/sums.sig
           fi

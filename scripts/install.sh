@@ -58,7 +58,7 @@ echo "SHA256 verified: ${actual_sha}"
 if curl -fsSL "${BASE_URL}/SHA256SUMS.sig" -o "${tmp}/SHA256SUMS.sig" 2>/dev/null && command -v openssl >/dev/null 2>&1; then
   if curl -fsSL "${KEY_URL}" -o "${tmp}/official.pem" 2>/dev/null; then
     openssl base64 -d -A -in "${tmp}/SHA256SUMS.sig" -out "${tmp}/sig.bin" 2>/dev/null || cp "${tmp}/SHA256SUMS.sig" "${tmp}/sig.bin"
-    if openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -verify "${tmp}/official.pem" -signature "${tmp}/sig.bin" "${tmp}/SHA256SUMS" >/dev/null 2>&1; then
+    if openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -verify "${tmp}/official.pem" -signature "${tmp}/sig.bin" "${tmp}/SHA256SUMS" >/dev/null 2>&1; then
       echo "Official RSA-PSS signature verified"
     else
       echo "SHA256SUMS.sig verification failed" >&2

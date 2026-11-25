@@ -104,3 +104,48 @@ jobs:
       - name: Run Suite B CLI tests
         if: matrix.run_tests
         run: python3 scripts/test_cli.py --suite-b-only
+
+  server-integration:
+    needs: version-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fatext-cli
+
+      - uses: actions/checkout@v4
+        with:
+          repository: xulang-org/fatext
+          path: fatext
+          persist-credentials: false
+
+      - name: Download Xu toolchain (linux-x64)
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/xu"
+          curl -fsSL "https://github.com/xulang-org/xu/releases/download/${XU_VERSION}/xu-${XU_VERSION}-linux-x64.tar.gz" -o "$RUNNER_TEMP/xu.tar.gz"
+          tar -xzf "$RUNNER_TEMP/xu.tar.gz" -C "$RUNNER_TEMP/xu"
+          XU_BIN="$(find "$RUNNER_TEMP/xu" -type f -name xu | head -n 1)"
+          XU_STD="$(dirname "$(find "$RUNNER_TEMP/xu" -type f -name mod.xu -path '*/net/http/mod.xu' | head -n 1 | xargs dirname | xargs dirname)")"
+          chmod +x "$XU_BIN"
+          echo "XU_BIN=$XU_BIN" >> "$GITHUB_ENV"
+          echo "XU_STD=$XU_STD" >> "$GITHUB_ENV"
+
+      - name: Build fatext CLI and fatext-server
+        shell: bash
+        run: |
+          cd fatext-cli
+          FATEXT_BUILD_TARGET=linux-x64 python3 scripts/sync_version.py
+          mkdir -p build
+          XU_STDLIB_ROOT="$XU_STD" "$XU_BIN" build src -o build/fatext
+          cd ../fatext
+          mkdir -p build
+          XU_STDLIB_ROOT="$XU_STD" "$XU_BIN" build server -o build/fatext-server
+
+      - name: Run cross-repo CLI + Server integration suites
+        shell: bash
+        run: |
+          python3 fatext/scripts/test_ctl_chain.py
+          python3 fatext/scripts/test_docs_and_name.py
+          python3 fatext/scripts/test_logging.py
+          # Add test_server_phase2.py once XU_VERSION includes xulang-org/xu#292 (PKCS#1 + X25519 TLS 1.3).

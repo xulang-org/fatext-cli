@@ -10,6 +10,10 @@
 #strings
 #time
 
+fn emit_stdout_line(s string) {
+    os.fd_write(1, s + "\n") or (err) { << }
+}
+
 fn handle_api_fail(opts &CliOpts, r &ApiResp) int {
     if r.net_err {
         << emit_err(opts, r.err_code + "", 0, r.err_msg + "", 0, EXIT_NET)
@@ -981,7 +985,7 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
             fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, from_id + "")
             dec := decrypt_dm_frame(cfg.agent_id + "", &priv, from_id + "", &fk.pk, fk.ok, &frame_json)
             if !dec.ok {
-                println("{\"type\":\"error\",\"code\":\"decrypt_failed\",\"from\":" + json.quote(&from_id) + ",\"detail\":" + json.quote(&dec.err) + "}")
+                emit_stdout_line("{\"type\":\"error\",\"code\":\"decrypt_failed\",\"from\":" + json.quote(&from_id) + ",\"detail\":" + json.quote(&dec.err) + "}")
             } else if dec.msg_type == "room_invite" {
                 bd := json.parse(&dec.body_json)
                 if bd.ok() {
@@ -999,7 +1003,7 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
                     if stored { st_s = "true" }
                     $vs := "false"
                     if dec.verified { vs = "true" }
-                    println("{\"type\":\"room_invite\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + ",\"name\":" + json.quote(&rname) + ",\"stored\":" + st_s + ",\"verified\":" + vs + "}")
+                    emit_stdout_line("{\"type\":\"room_invite\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + ",\"name\":" + json.quote(&rname) + ",\"stored\":" + st_s + ",\"verified\":" + vs + "}")
                 }
             } else {
                 bd := json.parse(&dec.body_json)
@@ -1009,7 +1013,7 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
                 }
                 $vs := "false"
                 if dec.verified { vs = "true" }
-                println("{\"type\":\"dm\",\"from\":" + json.quote(&from_id) + ",\"ts\":" + strconv.itoa(dec.ts) + ",\"text\":" + json.quote(&txt) + ",\"conversation_state\":" + json.quote(&dec.conv_state) + ",\"verified\":" + vs + "}")
+                emit_stdout_line("{\"type\":\"dm\",\"from\":" + json.quote(&from_id) + ",\"ts\":" + strconv.itoa(dec.ts) + ",\"text\":" + json.quote(&txt) + ",\"conversation_state\":" + json.quote(&dec.conv_state) + ",\"verified\":" + vs + "}")
             }
         } else if ev.event_type == "room" {
             d := json.parse(&ev.data)
@@ -1018,14 +1022,14 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
             from_id := json_str_or(&d, d.get(d.root(), "from"), "")
             frame_json := json_encode_or(&d, d.get(d.root(), "frame"), "")
             ri := load_room_info(cfg.home + "", rid + "") or (err) {
-                println("{\"type\":\"error\",\"code\":\"missing_room_key\",\"room_id\":" + json.quote(&rid) + "}")
+                emit_stdout_line("{\"type\":\"error\",\"code\":\"missing_room_key\",\"room_id\":" + json.quote(&rid) + "}")
                 ->
             }
             rkey := base64.decode_string(ri.key_b64 + "") or (err) { -> }
             fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, from_id + "")
             dec := decrypt_room_frame(rid + "", &rkey, from_id + "", &fk.pk, fk.ok, &frame_json)
             if !dec.ok {
-                println("{\"type\":\"error\",\"code\":\"decrypt_failed\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + "}")
+                emit_stdout_line("{\"type\":\"error\",\"code\":\"decrypt_failed\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + "}")
             } else {
                 bd := json.parse(&dec.body_json)
                 $txt := dec.body_json + ""
@@ -1034,11 +1038,11 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
                 }
                 $vs := "false"
                 if dec.verified { vs = "true" }
-                println("{\"type\":\"room\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + ",\"ts\":" + strconv.itoa(dec.ts) + ",\"text\":" + json.quote(&txt) + ",\"verified\":" + vs + "}")
+                emit_stdout_line("{\"type\":\"room\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + ",\"ts\":" + strconv.itoa(dec.ts) + ",\"text\":" + json.quote(&txt) + ",\"verified\":" + vs + "}")
             }
         } else {
             // Pass through post, reply, friend, mail, system
-            println("{\"type\":" + json.quote(&ev.event_type) + ",\"data\":" + ev.data + "}")
+            emit_stdout_line("{\"type\":" + json.quote(&ev.event_type) + ",\"data\":" + ev.data + "}")
         }
         seen += 1
         if max_events > 0 && seen >= max_events { <- }

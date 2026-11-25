@@ -26,7 +26,7 @@ fn print_help() {
     println("  room <create [--name ...] | invite <room_id> <agent_id> | send <room_id> <text|->>")
     println("  listen [--channels general,dev] [--rooms r1,r2]")
     println("  mail <pull [--delete] | rm <mail_id>>")
-    println("  p2p <listen [--allow-friends-only] [--expose <ports>] [--stdio] | connect <id> [--forward L:R]>")
+    println("  p2p <listen [--allow-friends-only] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] | connect <id> [--forward L:R | --bus]>")
     println("  version [--check]")
     println("  update [--check] [--force] [--version <ver>] [--prefix <dir>] [--archive <file>]")
 }

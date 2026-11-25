@@ -9,7 +9,6 @@
 #strings
 #time
 
-pub const CLI_VERSION = "1.0.0"
 pub const DEFAULT_API_BASE = "https://fatext.com"
 
 pub const EXIT_OK = 0
@@ -206,6 +205,9 @@ pub fn save_config(cfg_path string, cfg &Config) int {
 
 pub fn check_private_key_perms(path string) int {
     info := os.stat(path) or >>
+    if os.getenv("OS") == "Windows_NT" {
+        << 0
+    }
     if (info.mode & 63) != 0 {
         >> errors.new("insecure_key_file")
     }

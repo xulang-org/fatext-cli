@@ -37,6 +37,80 @@ fn decrypt_mail_or(self_id string, priv &rsa.PrivateKey, mid string, tkv int, en
     << decrypt_mail_envelope(self_id, priv, mid, tkv, env_json) or (err) { << "" }
 }
 
+fn parse_semver3(s &string) []int {
+    $core := s + ""
+    dash := strings.index_of(&core, "-")
+    if dash >= 0 { core = core[0:dash] }
+    parts := strings.split(&core, ".")
+    $out := [0, 0, 0]
+    for i in 0:3 {
+        if i < parts.len {
+            out[i] = parse_int_or(&parts[i], 0)
+        }
+    }
+    << out
+}
+
+fn semver_lt(a &string, b &string) bool {
+    va := parse_semver3(a)
+    vb := parse_semver3(b)
+    for i in 0:3 {
+        if va[i] < vb[i] { << true }
+        if va[i] > vb[i] { << false }
+    }
+    << false
+}
+
+pub fn cmd_version(opts &CliOpts, args []string) int {
+    $check := false
+    for i in 0:args.len {
+        if args[i] == "--check" {
+            check = true
+        } else {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext version [--check]", 0, EXIT_USAGE)
+        }
+    }
+    if !check {
+        if opts.json_mode {
+            println("{\"version\":" + json.quote(&CLI_VERSION) + ",\"target\":" + json.quote(&BUILD_TARGET) + ",\"commit\":" + json.quote(&BUILD_COMMIT) + "}")
+        } else {
+            println("fatext " + CLI_VERSION + " (" + BUILD_TARGET + ", " + BUILD_COMMIT + ")")
+        }
+        << EXIT_OK
+    }
+    api_base := resolve_api_base(opts, "")
+    cfg_opt := load_config_or_base(opts, api_base + "")
+    empty := ""
+    r := api_call_anon(cfg_opt.api_base + "", opts.timeout_sec, "GET", "/.well-known/fatext.json", &empty, "")
+    if !r.ok { << handle_api_fail(opts, &r) }
+    doc := json.parse(&r.body)
+    if !doc.ok() { << emit_err(opts, "ERR_ERR", r.status, "invalid discovery json", 0, EXIT_ERR) }
+    rt := doc.root()
+    $min_v := ""
+    $latest_v := ""
+    if doc.is_dict(rt) && doc.has(rt, "cli") {
+        cn := doc.get(rt, "cli")
+        if doc.is_dict(cn) {
+            if doc.has(cn, "min_version") { min_v = json_str_or(&doc, doc.get(cn, "min_version"), "") }
+            if doc.has(cn, "latest_version") { latest_v = json_str_or(&doc, doc.get(cn, "latest_version"), "") }
+        }
+    }
+    $status := "ok"
+    $exit_c := EXIT_OK
+    if min_v.len > 0 && semver_lt(&CLI_VERSION, &min_v) {
+        status = "unsupported"
+        exit_c = EXIT_ERR
+    } else if latest_v.len > 0 && semver_lt(&CLI_VERSION, &latest_v) {
+        status = "update_available"
+    }
+    if opts.json_mode {
+        println("{\"version\":" + json.quote(&CLI_VERSION) + ",\"target\":" + json.quote(&BUILD_TARGET) + ",\"commit\":" + json.quote(&BUILD_COMMIT) + ",\"min_version\":" + json.quote(&min_v) + ",\"latest_version\":" + json.quote(&latest_v) + ",\"status\":" + json.quote(&status) + "}")
+    } else {
+        println("version=" + CLI_VERSION + " status=" + status + " min_version=" + min_v + " latest_version=" + latest_v)
+    }
+    << exit_c
+}
+
 fn verify_stored_post_line(api_base string, timeout_sec int, cache $&maps.StrStr, line &string, is_reply bool) bool {
     doc := json.parse(line)
     if !doc.ok() { << false }

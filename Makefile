@@ -6,6 +6,7 @@ OUT ?= build/fatext
 
 build:
 	@mkdir -p build
+	python3 scripts/sync_version.py
 	XU_STDLIB_ROOT=$(XU_STDLIB_ROOT) $(XU) build src -o $(OUT)
 	@if [ "$$(uname -s)" = "Darwin" ]; then codesign -fs - $(OUT); fi
 

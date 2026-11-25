@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional version tag to package (defaults to v<VERSION>)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  XU_VERSION: v0.14.0
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        run: |
+          VER="$(tr -d '[:space:]' < VERSION)"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            python3 scripts/sync_version.py --check --tag "$TAG"
+          else
+            TAG="${{ inputs.tag }}"
+            if [ -z "$TAG" ]; then TAG="v${VER}"; fi
+            python3 scripts/sync_version.py --check --tag "$TAG"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: verify-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-24.04
+            xu_asset: xu-v0.14.0-linux-x64.tar.gz
+            pkg: tar
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            xu_asset: xu-v0.14.0-linux-arm64.tar.gz
+            pkg: tar
+          - target: macos-arm64
+            os: macos-14
+            xu_asset: xu-v0.14.0-macos-arm64.tar.gz
+            pkg: tar
+          - target: macos-x64
+            os: macos-15-intel
+            xu_asset: xu-v0.14.0-macos-x64.tar.gz
+            pkg: tar
+          - target: windows-x64
+            os: windows-2022
+            xu_asset: xu-v0.14.0-windows-x64.zip
+            pkg: zip
+          - target: windows-arm64
+            os: windows-2022
+            xu_asset: xu-v0.14.0-windows-arm64.zip
+            pkg: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and archive [Unix]
+        if: matrix.pkg == 'tar'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/xu" dist stage
+          curl -fsSL "https://github.com/xulang-org/xu/releases/download/${XU_VERSION}/${{ matrix.xu_asset }}" -o "$RUNNER_TEMP/xu.tar.gz"
+          tar -xzf "$RUNNER_TEMP/xu.tar.gz" -C "$RUNNER_TEMP/xu"
+          XU_BIN="$(find "$RUNNER_TEMP/xu" -type f -name xu | head -n 1)"
+          XU_STD="$(dirname "$(find "$RUNNER_TEMP/xu" -type f -name mod.xu -path '*/net/http/mod.xu' | head -n 1 | xargs dirname | xargs dirname)")"
+          chmod +x "$XU_BIN"
+          FATEXT_BUILD_TARGET="${{ matrix.target }}" python3 scripts/sync_version.py
+          XU_STDLIB_ROOT="$XU_STD" "$XU_BIN" build src -o stage/fatext
+          if [ "$(uname -s)" = "Darwin" ]; then codesign -fs - stage/fatext; fi
+          cp LICENSE README.md CHANGELOG.md stage/
+          tar -C stage -czf "dist/fatext-${{ needs.verify-tag.outputs.tag }}-${{ matrix.target }}.tar.gz" fatext LICENSE README.md CHANGELOG.md
+          cp "dist/fatext-${{ needs.verify-tag.outputs.tag }}-${{ matrix.target }}.tar.gz" "dist/fatext-${{ matrix.target }}.tar.gz"
+
+      - name: Build and archive [Windows]
+        if: matrix.pkg == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\xu", dist, stage | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/xulang-org/xu/releases/download/${env:XU_VERSION}/${{ matrix.xu_asset }}" -OutFile "$env:RUNNER_TEMP\xu.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\xu.zip" -DestinationPath "$env:RUNNER_TEMP\xu" -Force
+          $xuBin = (Get-ChildItem -Path "$env:RUNNER_TEMP\xu" -Filter "xu.exe" -Recurse | Select-Object -First 1).FullName
+          $modXu = (Get-ChildItem -Path "$env:RUNNER_TEMP\xu" -Filter "mod.xu" -Recurse | Where-Object { $_.FullName -match 'net[\\/]http[\\/]mod\.xu$' } | Select-Object -First 1).FullName
+          $xuStd = (Get-Item $modXu).Directory.Parent.Parent.FullName
+          $env:FATEXT_BUILD_TARGET = "${{ matrix.target }}"
+          python scripts/sync_version.py
+          $env:XU_STDLIB_ROOT = $xuStd
+          if ("${{ matrix.target }}" -eq "windows-arm64") {
+            & $xuBin build --target windows/arm64 src -o stage\fatext.exe
+          } else {
+            & $xuBin build src -o stage\fatext.exe
+          }
+          Copy-Item LICENSE, README.md, CHANGELOG.md stage\
+          Compress-Archive -Path stage\* -DestinationPath "dist\fatext-${{ needs.verify-tag.outputs.tag }}-${{ matrix.target }}.zip" -Force
+          Copy-Item "dist\fatext-${{ needs.verify-tag.outputs.tag }}-${{ matrix.target }}.zip" "dist\fatext-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: [verify-tag, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Generate SHA256SUMS and optional RSA-PSS signature
+        env:
+          SIGN_KEY: ${{ secrets.FATEXT_RELEASE_SIGNING_KEY }}
+        run: |
+          cd release-assets
+          sha256sum fatext-* | sort -k2 > SHA256SUMS
+          cp ../scripts/install.sh ./install.sh
+          if [ -n "$SIGN_KEY" ]; then
+            printf '%s\n' "$SIGN_KEY" > /tmp/sign.pem
+            chmod 600 /tmp/sign.pem
+            openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sign /tmp/sign.pem -out /tmp/sums.sig SHA256SUMS
+            openssl base64 -A -in /tmp/sums.sig -out SHA256SUMS.sig
+            rm -f /tmp/sign.pem /tmp/sums.sig
+          fi
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify-tag.outputs.tag }}
+          name: "fatext-cli ${{ needs.verify-tag.outputs.tag }}"
+          generate_release_notes: true
+          files: release-assets/*

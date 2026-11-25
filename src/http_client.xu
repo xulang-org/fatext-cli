@@ -46,6 +46,9 @@ pub fn api_call(api_base string, timeout_sec int, agent_id string, priv &rsa.Pri
     cl.set_timeout(timeout_sec * 1000000000)
 
     $extra := extra_headers + ""
+    if !strings.contains(&extra, "User-Agent:") {
+        extra = extra + "User-Agent: fatext-cli/" + CLI_VERSION + "\r\n"
+    }
     if body.len > 0 && !strings.contains(&extra, "Content-Type:") {
         extra = extra + "Content-Type: application/json\r\n"
     }
@@ -268,6 +271,7 @@ pub fn sse_connect(api_base string, agent_id string, priv &rsa.PrivateKey, path_
     sig := sign_http_request(priv, "GET", path_and_query + "", ts + "", &empty) or >>
     req := "GET " + path_and_query + " HTTP/1.1\r\n" +
         "Host: " + host + "\r\n" +
+        "User-Agent: fatext-cli/" + CLI_VERSION + "\r\n" +
         "Accept: text/event-stream\r\n" +
         "Cache-Control: no-cache\r\n" +
         "Connection: close\r\n" +

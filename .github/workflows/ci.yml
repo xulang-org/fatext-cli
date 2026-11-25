@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  XU_VERSION: v0.14.0
+
+jobs:
+  version-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version metadata consistency
+        run: python3 scripts/sync_version.py --check
+
+  build-and-test:
+    needs: version-check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-24.04
+            asset: xu-v0.14.0-linux-x64.tar.gz
+            ext: ""
+            run_tests: true
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            asset: xu-v0.14.0-linux-arm64.tar.gz
+            ext: ""
+            run_tests: true
+          - target: macos-arm64
+            os: macos-14
+            asset: xu-v0.14.0-macos-arm64.tar.gz
+            ext: ""
+            run_tests: true
+          - target: macos-x64
+            os: macos-15-intel
+            asset: xu-v0.14.0-macos-x64.tar.gz
+            ext: ""
+            run_tests: true
+          - target: windows-x64
+            os: windows-2022
+            asset: xu-v0.14.0-windows-x64.zip
+            ext: ".exe"
+            run_tests: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Xu toolchain (${{ matrix.target }}) [Unix]
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/xu"
+          curl -fsSL "https://github.com/xulang-org/xu/releases/download/${XU_VERSION}/${{ matrix.asset }}" -o "$RUNNER_TEMP/xu.tar.gz"
+          tar -xzf "$RUNNER_TEMP/xu.tar.gz" -C "$RUNNER_TEMP/xu"
+          XU_BIN="$(find "$RUNNER_TEMP/xu" -type f -name xu | head -n 1)"
+          XU_STD="$(dirname "$(find "$RUNNER_TEMP/xu" -type f -name mod.xu -path '*/net/http/mod.xu' | head -n 1 | xargs dirname | xargs dirname)")"
+          chmod +x "$XU_BIN"
+          echo "XU_BIN=$XU_BIN" >> "$GITHUB_ENV"
+          echo "XU_STD=$XU_STD" >> "$GITHUB_ENV"
+
+      - name: Download Xu toolchain (${{ matrix.target }}) [Windows]
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\xu" | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/xulang-org/xu/releases/download/${env:XU_VERSION}/${{ matrix.asset }}" -OutFile "$env:RUNNER_TEMP\xu.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\xu.zip" -DestinationPath "$env:RUNNER_TEMP\xu" -Force
+          $xuBin = (Get-ChildItem -Path "$env:RUNNER_TEMP\xu" -Filter "xu.exe" -Recurse | Select-Object -First 1).FullName
+          $modXu = (Get-ChildItem -Path "$env:RUNNER_TEMP\xu" -Filter "mod.xu" -Recurse | Where-Object { $_.FullName -match 'net[\\/]http[\\/]mod\.xu$' } | Select-Object -First 1).FullName
+          $xuStd = (Get-Item $modXu).Directory.Parent.Parent.FullName
+          "XU_BIN=$xuBin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "XU_STD=$xuStd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build fatext binary [Unix]
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          FATEXT_BUILD_TARGET="${{ matrix.target }}" python3 scripts/sync_version.py
+          mkdir -p build
+          XU_STDLIB_ROOT="$XU_STD" "$XU_BIN" build src -o build/fatext
+          if [ "$(uname -s)" = "Darwin" ]; then codesign -fs - build/fatext; fi
+          ./build/fatext --version
+          ./build/fatext --help
+
+      - name: Build fatext binary [Windows]
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:FATEXT_BUILD_TARGET = "${{ matrix.target }}"
+          python scripts/sync_version.py
+          New-Item -ItemType Directory -Force build | Out-Null
+          $env:XU_STDLIB_ROOT = $env:XU_STD
+          & $env:XU_BIN build src -o build\fatext.exe
+          .\build\fatext.exe --version
+          .\build\fatext.exe --help
+
+      - name: Run Suite B CLI tests
+        if: matrix.run_tests
+        run: python3 scripts/test_cli.py --suite-b-only

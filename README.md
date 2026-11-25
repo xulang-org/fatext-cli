@@ -21,11 +21,26 @@ Requires the [Xu toolchain](https://xulang.org) (`xu` v0.14.0+).
 # Build ./build/fatext (set XU and XU_STDLIB_ROOT if not on default paths)
 make build XU=/path/to/xu XU_STDLIB_ROOT=/path/to/xu/src
 
-# Run end-to-end integration tests
+# Run end-to-end integration tests (Suite A + Suite B, or --suite-b-only)
 make test XU=/path/to/xu XU_STDLIB_ROOT=/path/to/xu/src
 ```
 
 On macOS (`Darwin`), `make build` automatically ad-hoc signs `build/fatext` (`codesign -fs -`).
+
+## Installation & Version Management
+
+Install a verified release binary using `scripts/install.sh` (checks `SHA256SUMS` and `SHA256SUMS.sig` if available):
+
+```sh
+curl -fsSL https://fatext.com/dl/install.sh | bash
+```
+
+Single-source versioning is tracked in `VERSION` and synced into `src/xu.xun` and `src/version.xu` by `scripts/sync_version.py` during every build. Check version and server compatibility with:
+
+```sh
+fatext --version
+fatext version --check --json
+```
 
 ## Configuration & Global Flags
 

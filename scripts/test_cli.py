@@ -535,6 +535,10 @@ def make_relay_handler(state: RelayState):
             if p == "/.well-known/fatext.json":
                 self._send_json(200, {
                     "version": "3.0",
+                    "cli": {
+                        "min_version": "1.0.0",
+                        "latest_version": "1.0.0",
+                    },
                     "pow": {
                         "register": {"difficulty_bits": 12},
                         "post": {"difficulty_bits": 12},
@@ -985,6 +989,89 @@ def run_suite_b():
             assert_eq(p2p_a.returncode, 0, f"p2p connect failed: {p2p_a.stderr.decode()}")
             assert_eq(p2p_b.returncode, 0, f"p2p listen failed: {b_err.decode()}")
             assert_eq(b_out, payload, f"P2P transferred {len(b_out)} bytes != expected {len(payload)} bytes")
+
+            # 7. P2P bidirectional TCP bridge (--expose <-> --forward)
+            echo_port = free_tcp_port()
+            fwd_port = free_tcp_port()
+            echo_ready = threading.Event()
+            echo_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            echo_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            echo_srv.bind(("127.0.0.1", echo_port))
+            echo_srv.listen(2)
+
+            def _run_echo():
+                echo_ready.set()
+                c, _ = echo_srv.accept()
+                with c:
+                    while True:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        c.sendall(b"ECHO:" + d)
+
+            t_echo = threading.Thread(target=_run_echo, daemon=True)
+            t_echo.start()
+            echo_ready.wait(timeout=2.0)
+
+            p2p_fwd_b = subprocess.Popen(
+                [CLI_BIN, "--api", api_url, "--json", "p2p", "listen", "--allow-friends-only", "--expose", str(echo_port), "--stun", "none"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=b_env,
+            )
+            time.sleep(0.5)
+            p2p_fwd_a = subprocess.Popen(
+                [CLI_BIN, "--api", api_url, "--json", "p2p", "connect", aid_b, "--forward", f"{fwd_port}:{echo_port}", "--stun", "none"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=a_env,
+            )
+            try:
+                deadline = time.time() + 10.0
+                got_connected = False
+                stderr_logs = []
+                while time.time() < deadline:
+                    ln = p2p_fwd_a.stderr.readline().decode("utf-8", errors="replace")
+                    if ln:
+                        stderr_logs.append(ln)
+                        if '"state":"connected"' in ln:
+                            got_connected = True
+                            break
+                    elif p2p_fwd_a.poll() is not None:
+                        break
+                    else:
+                        time.sleep(0.05)
+                assert_true(got_connected, f"p2p forward did not connect: {''.join(stderr_logs)}")
+
+                msg_bytes = b"BIDIR_P2P_TCP_TEST_" * 20
+                with socket.create_connection(("127.0.0.1", fwd_port), timeout=10.0) as cli_sock:
+                    cli_sock.sendall(msg_bytes)
+                    cli_sock.shutdown(socket.SHUT_WR)
+                    chunks = []
+                    while True:
+                        r = cli_sock.recv(4096)
+                        if not r:
+                            break
+                        chunks.append(r)
+                got_echo = b"".join(chunks)
+                assert_eq(got_echo, b"ECHO:" + msg_bytes, f"unexpected echo payload len={len(got_echo)}")
+                p2p_fwd_a.communicate(timeout=10)
+                p2p_fwd_b.communicate(timeout=10)
+                assert_eq(p2p_fwd_a.returncode, 0, "p2p forward connect exit 0")
+                assert_eq(p2p_fwd_b.returncode, 0, "p2p expose listen exit 0")
+            finally:
+                echo_srv.close()
+                if p2p_fwd_a.poll() is None:
+                    p2p_fwd_a.kill()
+                if p2p_fwd_b.poll() is None:
+                    p2p_fwd_b.kill()
+
+            # 8. Version & compatibility check
+            rc, out, err = run_cli(["--json", "version", "--check"], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"version --check failed: {err}")
+            vdoc = json.loads(out.strip())
+            assert_eq(vdoc["status"], "ok", "version --check status")
+            assert_eq(vdoc["min_version"], "1.0.0", "version --check min_version")
     finally:
         srv.shutdown()
         srv.server_close()
@@ -995,7 +1082,10 @@ def run_suite_b():
 def main():
     if not os.path.isfile(CLI_BIN):
         raise SystemExit(f"Missing CLI binary: {CLI_BIN}. Run `make build` first.")
-    run_suite_a()
+    sync_rc = subprocess.run([sys.executable, os.path.join(CLI_DIR, "scripts", "sync_version.py"), "--check"]).returncode
+    assert_eq(sync_rc, 0, "scripts/sync_version.py --check")
+    if "--suite-b-only" not in sys.argv[1:]:
+        run_suite_a()
     run_suite_b()
     print("ALL TESTS PASSED")
 

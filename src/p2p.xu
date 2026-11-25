@@ -64,6 +64,36 @@ fn net_accept_or(lfd int) int {
     << net.accept(lfd) or (err) { << -1 }
 }
 
+fn net_close_q(fd int) {
+    if fd >= 0 {
+        _ := net.conn_close(fd) or (err) { << }
+    }
+}
+
+fn net_close_write_q(fd int) {
+    if fd >= 0 {
+        _ := os.shutdown(fd, 1) or (err) { << }
+    }
+}
+
+fn net_write_q(fd int, data &string) {
+    if fd >= 0 {
+        _ := net.conn_write(fd, data) or (err) { << }
+    }
+}
+
+fn p2p_tcp_reader(tcp_fd int, out_ch chan string, eof_ch chan int) {
+    while true {
+        chunk := net.conn_read(tcp_fd, 4096) or (err) { <- }
+        if chunk.len == 0 { <- }
+        out_ch <- chunk
+    }
+    select {
+        eof_ch <- 1 {}
+        else {}
+    }
+}
+
 fn gen_sess_or() string {
     << generate_session_id() or (err) { << "s_0000000000000000" }
 }
@@ -249,7 +279,8 @@ fn p2p_punch_and_session(
     cands &[]net.UDPAddr,
     is_initiator bool,
     stdio_mode bool,
-    tcp_fd int
+    tcp_fd_in int,
+    lfd_in int
 ) int {
     pconn_deadline_q(pconn, 50000000)
     $peer_addr := net.UDPAddr{ip: "", port: 0, zone: ""}
@@ -289,10 +320,16 @@ fn p2p_punch_and_session(
                 connected = true
                 <-
             } else if opened.ptype == P2P_PKT_DATA {
-                if stdio_mode && !is_initiator && opened.seq >= expected_seq {
-                    bytes_in += opened.data.len
-                    fd_write_q(1, opened.data + "")
-                    expected_seq = opened.seq + 1
+                if opened.seq >= expected_seq {
+                    if stdio_mode && !is_initiator {
+                        bytes_in += opened.data.len
+                        fd_write_q(1, opened.data + "")
+                        expected_seq = opened.seq + 1
+                    } else if !stdio_mode && tcp_fd_in >= 0 {
+                        bytes_in += opened.data.len
+                        net_write_q(tcp_fd_in, &opened.data)
+                        expected_seq = opened.seq + 1
+                    }
                 }
                 connected = true
                 <-
@@ -308,6 +345,12 @@ fn p2p_punch_and_session(
         << EXIT_P2P
     }
     p2p_log(opts, "connected", session + "", peer_id + "", "\"path\":\"direct\"")
+
+    $tcp_fd := tcp_fd_in
+    if !stdio_mode && tcp_fd < 0 && lfd_in >= 0 {
+        tcp_fd = net_accept_or(lfd_in)
+        net_close_q(lfd_in)
+    }
 
     if stdio_mode {
         if is_initiator {
@@ -363,24 +406,85 @@ fn p2p_punch_and_session(
             }
         }
     } else if tcp_fd >= 0 {
-        // Basic bidirectional TCP-over-UDP bridge for --forward / --expose
+        // Bidirectional TCP-over-UDP bridge for --forward / --expose
+        tcp_in := chan string{cap: 32}
+        tcp_eof := chan int{cap: 1}
+        xu p2p_tcp_reader(tcp_fd, tcp_in, tcp_eof)
+
         $seq := 1
-        while true {
-            // Poll UDP side
-            pconn_deadline_q(pconn, 50000000)
+        $local_fin := false
+        $remote_fin := got_fin
+        if remote_fin {
+            net_close_write_q(tcp_fd)
+        }
+        $fin_idle := 0
+        while !(local_fin && remote_fin) {
+            $drain := !local_fin
+            $tx_err := false
+            while drain {
+                select {
+                    chunk := <-tcp_in {
+                        bytes_out += chunk.len
+                        dpkt := p2p_seal_packet(ciph, session + "", P2P_PKT_DATA, seq, &chunk) or (err) {
+                            tx_err = true
+                            <-
+                        }
+                        if tx_err { <- }
+                        _ := pconn.write_to(&dpkt, &peer_addr) or (err) {
+                            tx_err = true
+                            <-
+                        }
+                        seq += 1
+                    }
+                    else {
+                        drain = false
+                    }
+                }
+            }
+            if tx_err { <- }
+
+            if !local_fin {
+                $saw_eof := false
+                select {
+                    _ := <-tcp_eof {
+                        saw_eof = true
+                    }
+                    else {}
+                }
+                if saw_eof {
+                    local_fin = true
+                    fin_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_FIN, seq, &empty)
+                    if fin_pkt.len > 0 {
+                        for r in 0:3 { pconn_write_q(pconn, &fin_pkt, &peer_addr) }
+                    }
+                }
+            }
+
+            pconn_deadline_q(pconn, 10000000)
             upkt := read_from_or(pconn, 65535)
             if upkt.data.len > 0 {
                 opened := p2p_open_packet(ciph, session + "", &upkt.data)
                 if opened.ok {
+                    fin_idle = 0
                     if opened.ptype == P2P_PKT_DATA {
-                        bytes_in += opened.data.len
-                        _ := net.conn_write(tcp_fd, &opened.data) or (err) { <- }
+                        if opened.seq >= expected_seq {
+                            bytes_in += opened.data.len
+                            _ := net.conn_write(tcp_fd, &opened.data) or (err) { <- }
+                            expected_seq = opened.seq + 1
+                        }
                     } else if opened.ptype == P2P_PKT_FIN {
-                        <-
+                        if !remote_fin {
+                            remote_fin = true
+                            net_close_write_q(tcp_fd)
+                        }
                     }
                 }
+            } else if local_fin || remote_fin {
+                fin_idle += 1
+                if fin_idle > 200 { <- }
             }
         }
+        net_close_q(tcp_fd)
     }
 
     p2p_log(opts, "closed", session + "", peer_id + "", "\"bytes_in\":" + strconv.itoa(bytes_in) + ",\"bytes_out\":" + strconv.itoa(bytes_out))
@@ -544,7 +648,7 @@ pub fn cmd_p2p_listen(opts &CliOpts, args []string) int {
         if mode == "forward" && !stdio_mode {
             tcp_fd = net_dial_or("127.0.0.1:" + strconv.itoa(rport))
         }
-        rc := p2p_punch_and_session(opts, $&pconn, &ciph, sess + "", from_id + "", &cands, false, stdio_mode || mode == "stdio", tcp_fd)
+        rc := p2p_punch_and_session(opts, $&pconn, &ciph, sess + "", from_id + "", &cands, false, stdio_mode || mode == "stdio", tcp_fd, -1)
         pconn_close_q($&pconn)
         << rc
     }
@@ -698,15 +802,15 @@ pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
         << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
     }
 
-    $tcp_fd := -1
+    $lfd := -1
     if forward_mode {
-        lfd := net.listen("127.0.0.1:" + strconv.itoa(lport_fwd)) or (err) {
+        lfd = net.listen("127.0.0.1:" + strconv.itoa(lport_fwd)) or (err) {
             pconn_close_q($&pconn)
             << emit_err(opts, "ERR_P2P", 0, err.msg(), 0, EXIT_P2P)
         }
-        tcp_fd = net_accept_or(lfd)
     }
-    rc := p2p_punch_and_session(opts, $&pconn, &ciph, sess + "", peer_id + "", &peer_cands, true, !forward_mode, tcp_fd)
+    rc := p2p_punch_and_session(opts, $&pconn, &ciph, sess + "", peer_id + "", &peer_cands, true, !forward_mode, -1, lfd)
+    net_close_q(lfd)
     pconn_close_q($&pconn)
     << rc
 }

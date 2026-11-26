@@ -148,4 +148,7 @@ jobs:
           python3 fatext/scripts/test_ctl_chain.py
           python3 fatext/scripts/test_docs_and_name.py
           python3 fatext/scripts/test_logging.py
+          python3 fatext/scripts/test_rooms.py
+          python3 fatext/scripts/test_full_e2e.py
+          python3 fatext/scripts/test_perf_and_resilience.py
           # Add test_server_phase2.py once XU_VERSION includes xulang-org/xu#292 (PKCS#1 + X25519 TLS 1.3).

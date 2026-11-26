@@ -54,7 +54,7 @@ pub fn api_call(api_base string, timeout_sec int, agent_id string, priv &rsa.Pri
     }
     if signed {
         ts := strconv.itoa(time.now_time().unix())
-        sig := sign_http_request(priv, method + "", path_and_query + "", ts + "", body) or (err) {
+        sig := sign_http_request(priv, method + "", path_and_query + "", ts + "", body) >>> (err) {
             << empty_api_err(false, "ERR_CRYPTO", err.msg())
         }
         if agent_id.len > 0 {
@@ -65,7 +65,7 @@ pub fn api_call(api_base string, timeout_sec int, agent_id string, priv &rsa.Pri
     }
 
     full_url := api_base + path_and_query
-    resp := cl.do_extra(method, full_url, extra, body) or (err) {
+    resp := cl.do_extra(method, full_url, extra, body) >>> (err) {
         << empty_api_err(true, "ERR_NETWORK", err.msg())
     }
     st := resp.status_code()
@@ -110,6 +110,10 @@ fn big_zero() big.Int {
     << big.new_int(0)
 }
 
+pub fn dummy_rsa_pk() rsa.PublicKey {
+    << rsa.PublicKey{n: big_zero(), e: 65537}
+}
+
 pub fn discover_pow_bits(opts &CliOpts, api_base string, scope string, fallback int) int {
     if opts.pow_bits_override > 0 {
         << opts.pow_bits_override
@@ -145,7 +149,7 @@ pub fn fetch_agent_key(api_base string, timeout_sec int, agent_id string) Fetche
     }
     rt := doc.root()
     pem_s := json_str_or(&doc, doc.get(rt, "current_public_key_pem"), "")
-    pk := decode_spki_public_pem(&pem_s) or (err) {
+    pk := decode_spki_public_pem(&pem_s) >>> (err) {
         << FetchedKey{ok: false, exit_code: EXIT_CRYPTO, err_code: "ERR_CRYPTO", err_msg: err.msg(), agent_id: agent_id + "", status: "", key_version: 0, pub_pem: pem_s + "", pk: dummy_pk, raw_json: r.body + "", self_sig_valid: false}
     }
     status := json_str_or(&doc, doc.get(rt, "status"), "active")
@@ -181,25 +185,25 @@ fn strip_port(host string) string {
     << host + ""
 }
 
-fn tc_write(tc $&tls.Conn, data &string) int { << tc.write(data) or >> }
-fn nc_write(c $&net.Conn, data &string) int { << c.write(data) or >> }
-fn tc_read(tc $&tls.Conn, n int) string { << tc.read(n) or >> }
-fn nc_read(c $&net.Conn, n int) string { << c.read(n) or >> }
-fn tc_close(tc $&tls.Conn) { tc.close() or (err) { << } }
-fn nc_close(c $&net.Conn) { c.close() or (err) { << } }
+fn tc_write(tc $&tls.Conn, data &string) int { << tc.write(data) >>> }
+fn nc_write(c $&net.Conn, data &string) int { << c.write(data) >>> }
+fn tc_read(tc $&tls.Conn, n int) string { << tc.read(n) >>> }
+fn nc_read(c $&net.Conn, n int) string { << c.read(n) >>> }
+fn tc_close(tc $&tls.Conn) { tc.close() >>> (err) { << } }
+fn nc_close(c $&net.Conn) { c.close() >>> (err) { << } }
 
 fn sse_write_all(sc $&SseConn, data &string) int {
     if sc.is_tls {
-        << tc_write($&sc.tc, data) or >>
+        << tc_write($&sc.tc, data) >>>
     }
-    << nc_write($&sc.conn, data) or >>
+    << nc_write($&sc.conn, data) >>>
 }
 
 fn sse_read_chunk(sc $&SseConn) string {
     if sc.is_tls {
-        << tc_read($&sc.tc, 8192) or >>
+        << tc_read($&sc.tc, 8192) >>>
     }
-    << nc_read($&sc.conn, 8192) or >>
+    << nc_read($&sc.conn, 8192) >>>
 }
 
 pub fn sse_close(sc $&SseConn) {
@@ -225,7 +229,7 @@ fn sse_read_line(sc $&SseConn) string {
             }
             << ln
         }
-        chunk := sse_read_chunk(sc) or (err) {
+        chunk := sse_read_chunk(sc) >>> (err) {
             sc.eof = true
             rem := sc.buf + ""
             sc.buf = ""
@@ -242,33 +246,57 @@ fn sse_read_line(sc $&SseConn) string {
     << ""
 }
 
-pub fn sse_connect(api_base string, agent_id string, priv &rsa.PrivateKey, path_and_query string) SseConn {
+pub struct SseConnectOutcome {
+    pub ok bool
+    pub http_status int
+    pub err_msg string
+}
+
+pub fn empty_sse_conn() SseConn {
+    << SseConn{is_tls: false, conn: net.closed_conn(), tc: tls.closed_conn(), buf: "", eof: true}
+}
+
+fn parse_http_status_line(line &string) int {
+    parts := strings.split(line, " ")
+    if parts.len < 2 { << 0 }
+    << parse_int_or(&parts[1], 0)
+}
+
+pub fn sse_connect_into(api_base string, agent_id string, priv &rsa.PrivateKey, path_and_query string, sc $&SseConn) SseConnectOutcome {
     full := api_base + path_and_query
     $u := url.new_url()
-    u.parse(full) or >>
+    u.parse(full) >>> (err) {
+        << SseConnectOutcome{ok: false, http_status: 0, err_msg: err.msg()}
+    }
     scheme := u.scheme()
     https := scheme == "https"
     host := u.host()
     addr := dial_port_addr(host + "", https)
     sni := strip_port(host + "")
 
-    $sc := SseConn{
-        is_tls: https,
-        conn: net.closed_conn(),
-        tc: tls.closed_conn(),
-        buf: "",
-        eof: false
-    }
+    sc.is_tls = https
+    sc.conn = net.closed_conn()
+    sc.tc = tls.closed_conn()
+    sc.buf = ""
+    sc.eof = false
+
     if https {
         cfg := tls.new_config(sni)
-        sc.tc = tls.dial("tcp", addr, &cfg) or >>
+        sc.tc = tls.dial("tcp", addr, &cfg) >>> (err) {
+            << SseConnectOutcome{ok: false, http_status: 0, err_msg: err.msg()}
+        }
     } else {
-        sc.conn = net.dial_to("tcp", addr) or >>
+        sc.conn = net.dial_to("tcp", addr) >>> (err) {
+            << SseConnectOutcome{ok: false, http_status: 0, err_msg: err.msg()}
+        }
     }
 
     ts := strconv.itoa(time.now_time().unix())
     empty := ""
-    sig := sign_http_request(priv, "GET", path_and_query + "", ts + "", &empty) or >>
+    sig := sign_http_request(priv, "GET", path_and_query + "", ts + "", &empty) >>> (err) {
+        sse_close(sc)
+        << SseConnectOutcome{ok: false, http_status: 0, err_msg: err.msg()}
+    }
     req := "GET " + path_and_query + " HTTP/1.1\r\n" +
         "Host: " + host + "\r\n" +
         "User-Agent: fatext-cli/" + CLI_VERSION + "\r\n" +
@@ -278,20 +306,29 @@ pub fn sse_connect(api_base string, agent_id string, priv &rsa.PrivateKey, path_
         "X-Agent-Id: " + agent_id + "\r\n" +
         "X-Timestamp: " + ts + "\r\n" +
         "X-Signature: " + sig + "\r\n\r\n"
-    _ := sse_write_all($&sc, &req) or (err) {
-        sse_close($&sc)
-        >> err
+    _ := sse_write_all(sc, &req) >>> (err) {
+        sse_close(sc)
+        << SseConnectOutcome{ok: false, http_status: 0, err_msg: err.msg()}
     }
 
-    status_ln := sse_read_line($&sc)
-    if !strings.contains(&status_ln, " 200 ") {
-        sse_close($&sc)
-        >> errors.new("sse: HTTP error: " + status_ln)
+    status_ln := sse_read_line(sc)
+    code := parse_http_status_line(&status_ln)
+    if code != 200 {
+        sse_close(sc)
+        << SseConnectOutcome{ok: false, http_status: code, err_msg: "sse: HTTP error: " + status_ln}
     }
-    // Consume headers until empty line
     while !sc.eof {
-        hln := sse_read_line($&sc)
+        hln := sse_read_line(sc)
         if hln.len == 0 { <- }
+    }
+    << SseConnectOutcome{ok: true, http_status: 200, err_msg: ""}
+}
+
+pub fn sse_connect(api_base string, agent_id string, priv &rsa.PrivateKey, path_and_query string) SseConn {
+    $sc := empty_sse_conn()
+    res := sse_connect_into(api_base + "", agent_id + "", priv, path_and_query + "", $&sc)
+    if !res.ok {
+        >>> errors.new(res.err_msg + "")
     }
     << sc
 }

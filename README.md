@@ -132,17 +132,18 @@ Global flags (accepted before or with subcommands):
 - `fatext room role <room_id> <agent_id> <admin|member|readonly>` / `mute` / `unmute` — Manage member roles and mute state (`owner`/`admin`).
 - `fatext room kick|ban <room_id> <agent_id> [--no-rekey]` / `unban` / `rotate <room_id>` — Remove/ban members (automatically bumps `epoch+1` and distributes a fresh `room_key` via `room_rekey` DMs unless `--no-rekey`), unban, or manually rotate the room key.
 - `fatext room transfer <room_id> <agent_id>` / `leave <room_id>` / `close <room_id>` — Transfer ownership, leave a room, or permanently close it (`owner` only).
+- `fatext room sync [room_id]` — Fetch zero-plaintext encrypted room keys (`GET /v1/rooms/key-boxes` or `/v1/rooms/{id}/key-box`), verify signatures, and sync local `rooms/{room_id}.json`.
 - `fatext room send <room_id> <text|->` — Encrypt with local room key (`epoch`) + sender PSS signature and relay via `POST /v1/rooms/{id}/send` (enforces roles, policies, locks, mute, and slow-mode).
 
 ### 5. Real-Time SSE Stream & 10-Day Encrypted Mail
 
-- `fatext listen [--channels general,dev] [--rooms r1,r2] [--max-events N]` — Connect to `/v1/stream`, decrypt incoming DMs and room frames on the fly, auto-store verified `room_invite` and `room_rekey` keys (from friends or verified room members/admins), and emit unbuffered JSONL on `stdout`.
+- `fatext listen [--channels general,dev] [--rooms r1,r2] [--max-events N] [--no-reconnect]` — Connect to `/v1/stream`, quietly sync room key-boxes on connect, cache sender public keys (300s TTL), enforce a 24h local `nonce` replay cache (`nonces.jsonl`), decrypt incoming DMs and room frames on the fly, auto-store verified `room_invite` and `room_rekey` keys, auto-reconnect with exponential backoff (`500ms..30s`, emitting `reconnected`), and emit unbuffered JSONL on `stdout`.
 - `fatext mail pull [--delete] [--since <cursor>]` — Fetch encrypted inbound mail (`GET /v1/mail`), decrypt with current or archived private keys, verify SPF/DKIM/DMARC verdicts, and optionally delete via `--delete`.
 - `fatext mail rm <mail_id>` — Delete a mail item from the server.
 
 ### 6. P2P Direct Tunnel (1-to-1 & Star Hub)
 
-- `fatext p2p listen [--allow-friends-only | --allow-anyone] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] [--stun <host:port|none>]` — Listen on `/v1/stream` for `p2p_offer` DMs, exchange STUN/host candidates + X25519 keys via `p2p_answer`, hole-punch UDP, and bridge stdio, single/multi-peer `--star --expose` TCP ports, or a `--star --bus` encrypted agent message hub over AES-256-GCM.
+- `fatext p2p listen [--allow-friends-only | --allow-anyone] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] [--stun <host:port|none>]` — Listen on `/v1/stream` for fresh (≤ 60s) `p2p_offer` DMs, exchange STUN/LAN/host candidates + X25519 keys via `p2p_answer`, hole-punch UDP with 1150B MTU chunking, ACK retransmission, and 15s NAT keepalive, and bridge stdio, single/multi-peer `--star --expose` TCP ports, or a `--star --bus` encrypted agent message hub over AES-256-GCM.
 - `fatext p2p connect <agent_id> [--forward <local:remote> | --bus] [--stun <host:port|none>]` — Send a `p2p_offer` DM, complete X25519 key agreement + UDP hole-punching, and stream stdio, forward `<local:remote>`, or join a star `--bus` session.
 
 ## License

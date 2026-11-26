@@ -121,7 +121,7 @@ fn cli_verify_doc_and_extract(
     if signer_pem.len == 0 {
         << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "signer key v" + strconv.itoa(signer_kv) + " missing")
     }
-    spk := decode_spki_public_pem(&signer_pem) or (err) {
+    spk := decode_spki_public_pem(&signer_pem) >>> (err) {
         << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, err.msg())
     }
     canon := cli_canon_doc_payload(aid + "", csha + "", kind + "", locked, signer_id + "", signer_kv, uat, ver, vis + "")
@@ -228,27 +228,27 @@ fn build_signed_doc_put_body(
             }
         }
         if has_ctrl {
-            cpk := decode_spki_public_pem(&cpem) or (err) {
+            cpk := decode_spki_public_pem(&cpem) >>> (err) {
                 << empty_api_err(false, "ERR_CRYPTO", err.msg())
             }
             env_json = encrypt_doc_envelope(
                 agent_id + "", kind + "", next_ver, csha + "", plaintext,
                 afk.key_version, &afk.pk, true, cid + "", ckv, &cpk
-            ) or (err) {
+            ) >>> (err) {
                 << empty_api_err(false, "ERR_CRYPTO", err.msg())
             }
         } else {
             env_json = encrypt_doc_envelope(
                 agent_id + "", kind + "", next_ver, csha + "", plaintext,
                 afk.key_version, &afk.pk, false, "", 0, &afk.pk
-            ) or (err) {
+            ) >>> (err) {
                 << empty_api_err(false, "ERR_CRYPTO", err.msg())
             }
         }
     }
 
     canon := cli_canon_doc_payload(agent_id + "", csha + "", kind + "", locked, signer_id + "", signer_kv, uat, next_ver, vis + "")
-    sig := sign_pss_message(signer_priv, &canon) or (err) {
+    sig := sign_pss_message(signer_priv, &canon) >>> (err) {
         << empty_api_err(false, "ERR_CRYPTO", err.msg())
     }
 
@@ -276,7 +276,7 @@ fn emit_doc_output(opts &CliOpts, kind string, out_path string, dv &DocVerifyOut
     if out_path.len > 0 {
         $mode := 420
         if dv.visibility == "private" { mode = 384 }
-        write_atomic_mode(out_path + "", &dv.content, mode) or (err) {
+        write_atomic_mode(out_path + "", &dv.content, mode) >>> (err) {
             << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
         }
         if opts.json_mode {
@@ -371,7 +371,7 @@ pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
         } else if file_arg == "-" {
             content = read_stdin_all()
         } else if file_arg.len > 0 {
-            content = os.read(file_arg + "") or (err) {
+            content = os.read(file_arg + "") >>> (err) {
                 << emit_err(opts, "ERR_CONFIG", 0, "failed reading file " + file_arg + ": " + err.msg(), 0, EXIT_CONFIG)
             }
         } else {
@@ -381,8 +381,8 @@ pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
             << emit_err(opts, "ERR_USAGE", 0, "document exceeds 65536 bytes", 0, EXIT_USAGE)
         }
 
-        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
 
         empty := ""
         cur_r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/agents/docs/" + kind, &empty, "")
@@ -433,8 +433,8 @@ pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
         $api_base := resolve_api_base(opts, "")
         cfg_opt := load_config_or_base(opts, api_base + "")
         if target.len == 0 || (cfg_opt.agent_id.len > 0 && target == cfg_opt.agent_id) {
-            cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-            priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
             empty := ""
             r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/agents/docs/" + kind, &empty, "")
             if !r.ok { << handle_api_fail(opts, &r) }
@@ -459,8 +459,8 @@ pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
 
     if sub == "status" {
         if rest.len == 0 {
-            cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-            priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
             empty := ""
             r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/agents/docs", &empty, "")
             if !r.ok { << handle_api_fail(opts, &r) }
@@ -479,8 +479,8 @@ pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
     }
 
     if sub == "rm" || sub == "delete" {
-        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         empty := ""
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/agents/docs/" + kind, &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
@@ -503,8 +503,8 @@ pub fn cmd_ctl_doc(opts &CliOpts, kind string, args []string) int {
     $rest := []string{}
     for i in 2:args.len { rest.push(args[i] + "") }
 
-    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
 
     if sub == "set" {
         $vis := "public"
@@ -540,7 +540,7 @@ pub fn cmd_ctl_doc(opts &CliOpts, kind string, args []string) int {
         } else if file_arg == "-" {
             content = read_stdin_all()
         } else if file_arg.len > 0 {
-            content = os.read(file_arg + "") or (err) {
+            content = os.read(file_arg + "") >>> (err) {
                 << emit_err(opts, "ERR_CONFIG", 0, "failed reading file " + file_arg + ": " + err.msg(), 0, EXIT_CONFIG)
             }
         } else {

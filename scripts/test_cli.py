@@ -685,6 +685,14 @@ def make_relay_handler(state: RelayState):
                 self._send_json(200, {"ok": True, "rooms": rms})
                 return
 
+            if p == "/v1/rooms/key-boxes":
+                ag, err = self._verify_auth("GET", self.path, b"")
+                if err:
+                    self._send_json(401, {"error": {"code": err, "message": err}})
+                    return
+                self._send_json(200, {"ok": True, "boxes": []})
+                return
+
             if p.startswith("/v1/rooms/") and p.count("/") == 3:
                 ag, err = self._verify_auth("GET", self.path, b"")
                 if err:

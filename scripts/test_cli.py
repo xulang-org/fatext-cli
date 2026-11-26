@@ -1750,6 +1750,11 @@ def run_security_tests():
                     self.wfile.write(b)
                     return
                 if self.path == "/dl/SHA256SUMS":
+                    if redirect_sums:
+                        self.send_response(302)
+                        self.send_header("Location", "http://127.0.0.1:1/evil")
+                        self.end_headers()
+                        return
                     digest = hashlib.sha256(b"dummy-archive").hexdigest()
                     b = f"{digest}  fatext-macos-arm64.tar.gz\n{digest}  fatext-linux-x64.tar.gz\n".encode("utf-8")
                     self.send_response(200)
@@ -1760,6 +1765,10 @@ def run_security_tests():
                     return
                 self.send_response(404)
                 self.end_headers()
+
+        redirect_sums = False
+        atk_pub_der = subprocess.check_output(["openssl", "rsa", "-pubin", "-in", atk_pub, "-outform", "DER"])
+        atk_spki_fp = "SHA256:" + base64.b64encode(hashlib.sha256(atk_pub_der).digest()).decode("ascii")
 
         srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), SecMockHandler)
         port = srv.server_address[1]
@@ -1788,6 +1797,58 @@ def run_security_tests():
                 env=env_pin, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
             )
             assert_eq(res_pin.returncode, 8, f"update pin mismatch must exit 8: {res_pin.stderr}")
+
+            # Comma-separated key rotation pin matches second key and proceeds past pin check
+            env_rot = os.environ.copy()
+            env_rot["FATEXT_OFFICIAL_KEY_FP"] = f"SHA256:0000000000000000000000000000000000000000000=, {atk_spki_fp}"
+            res_rot = subprocess.run(
+                [CLI_BIN, "--api", api_url, "--json", "update", "--prefix", upd_prefix],
+                env=env_rot, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            )
+            assert_true(
+                "fingerprint mismatch" not in res_rot.stderr and "fingerprint mismatch" not in res_rot.stdout,
+                f"rotation pin should pass pin check: out={res_rot.stdout} err={res_rot.stderr}",
+            )
+
+            # Update HTTP client refuses 302 redirects (fail-closed)
+            redirect_sums = True
+            res_redir = subprocess.run(
+                [CLI_BIN, "--api", api_url, "--json", "update", "--prefix", upd_prefix],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            )
+            redirect_sums = False
+            assert_true(res_redir.returncode != 0, "302 redirect on SHA256SUMS must fail closed")
+
+            # Archive bounds: reject crafted gzip with ISIZE > 256 MiB and tar with >1000 entries
+            import gzip as pygzip
+            import io as pyio
+            import struct as pystruct
+            import tarfile as pytarfile
+
+            huge_isize_path = os.path.join(td, "huge-isize.tar.gz")
+            gz_bytes = bytearray(pygzip.compress(b"small-payload"))
+            gz_bytes[-4:] = pystruct.pack("<I", 300 * 1024 * 1024)
+            with open(huge_isize_path, "wb") as hf:
+                hf.write(gz_bytes)
+            res_isize = subprocess.run(
+                [CLI_BIN, "--api", api_url, "--json", "update", "--version", "9.9.9", "--prefix", upd_prefix, "--archive", huge_isize_path],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            )
+            assert_true(res_isize.returncode != 0, f"gzip huge ISIZE must be rejected: {res_isize.stdout}")
+
+            many_tar_path = os.path.join(td, "many-entries.tar.gz")
+            with pytarfile.open(many_tar_path, "w:gz") as tf:
+                empty_bio = pyio.BytesIO(b"")
+                for ei in range(1005):
+                    ti = pytarfile.TarInfo(name=f"e{ei}.txt")
+                    ti.size = 0
+                    empty_bio.seek(0)
+                    tf.addfile(ti, empty_bio)
+            res_many = subprocess.run(
+                [CLI_BIN, "--api", api_url, "--json", "update", "--version", "9.9.9", "--prefix", upd_prefix, "--archive", many_tar_path],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            )
+            assert_true(res_many.returncode != 0, f"tar with >1000 entries must be rejected: {res_many.stdout}")
 
             # Remote plaintext HTTP URL rejected in `fatext update`
             res_http = subprocess.run(

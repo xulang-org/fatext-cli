@@ -16,6 +16,8 @@
 #strings
 
 const UPDATE_MAX_BYTES = 134217728
+const UPDATE_MAX_UNPACKED_BYTES = 268435456
+const UPDATE_MAX_ENTRIES = 1000
 const OFFICIAL_KEY_PIN_FP = ""
 const TERM_BAR_CELLS = 24
 const TERM_SIZE_WIDTH = 11
@@ -262,13 +264,18 @@ fn write_archive_entry(dest &string, name &string, body &string, directory bool,
 }
 
 fn extract_archive(data &string, dest &string, is_windows bool) int {
+    $total_unpacked := 0
     if is_windows {
         zip.comment(data) or >>
         $reader := zip.new_reader(data)
-        for _ in 0:100000 {
+        for _ in 0:UPDATE_MAX_ENTRIES {
             entry := reader.next() or (err) {
                 if err.msg() == "EOF" { << 0 }
                 >> err
+            }
+            total_unpacked += entry.body.len
+            if total_unpacked > UPDATE_MAX_UNPACKED_BYTES {
+                >> errors.new("archive unpacked size exceeds limit")
             }
             name := entry.name + ""
             directory := strings.has_suffix(&name, "/")
@@ -276,16 +283,31 @@ fn extract_archive(data &string, dest &string, is_windows bool) int {
         }
         >> errors.new("too many ZIP entries")
     }
+    if data.len < 18 {
+        >> errors.new("invalid gzip archive")
+    }
+    n := data.len
+    isize := ((data[n - 1] & 255) << 24) | ((data[n - 2] & 255) << 16) | ((data[n - 3] & 255) << 8) | (data[n - 4] & 255)
+    if isize > UPDATE_MAX_UNPACKED_BYTES {
+        >> errors.new("gzip archive uncompressed size exceeds limit")
+    }
     $compressed := gzip.new_reader(data + "")
     plain := compressed.read_all() or >>
+    if plain.len > UPDATE_MAX_UNPACKED_BYTES {
+        >> errors.new("archive uncompressed size exceeds limit")
+    }
     $reader := tar.new_reader(&plain)
-    for _ in 0:100000 {
+    for _ in 0:UPDATE_MAX_ENTRIES {
         entry := reader.next() or (err) {
             if err.msg() == "EOF" { << 0 }
             >> err
         }
         if entry.typeflag != 0 && entry.typeflag != tar.TYPE_REG && entry.typeflag != tar.TYPE_DIR {
             >> errors.new("unsupported archive entry: " + entry.name)
+        }
+        total_unpacked += entry.body.len
+        if total_unpacked > UPDATE_MAX_UNPACKED_BYTES {
+            >> errors.new("archive unpacked size exceeds limit")
         }
         write_archive_entry(dest, &entry.name, &entry.body, entry.typeflag == tar.TYPE_DIR, entry.mode) or >>
     }
@@ -351,6 +373,7 @@ fn update_http_get_raw(raw_url string, timeout_ns int, show_progress bool) Downl
     $cl := http.new_client()
     cl.set_timeout(timeout_ns)
     cl.max_response_bytes = UPDATE_MAX_BYTES
+    cl.max_redirects = -1
     if show_progress {
         cl.set_download_progress(update_download_progress)
     }
@@ -391,6 +414,17 @@ fn lookup_sha256sum(sums_text &string, filename &string) string {
         }
     }
     << ""
+}
+
+fn matches_official_key_pin(actual_fp &string, pins_csv &string) bool {
+    parts := strings.split(pins_csv, ",")
+    for i in 0:parts.len {
+        cand := strings.trim_space(&parts[i])
+        if cand.len > 0 && cand == *actual_fp {
+            << true
+        }
+    }
+    << false
 }
 
 fn is_loopback_http_url(u &string) bool {
@@ -438,7 +472,7 @@ fn verify_and_download_archive(
     }
     if expected_fp.len > 0 {
         actual_fp := pubkey_fingerprint(&fk.pub_pem)
-        if actual_fp != expected_fp {
+        if !matches_official_key_pin(&actual_fp, &expected_fp) {
             >> errors.new("CRYPTO_VERIFY_FAILED: official key fingerprint mismatch (expected " + expected_fp + ", got " + actual_fp + ")")
         }
     }
@@ -733,6 +767,15 @@ pub fn cmd_update(opts &CliOpts, args []string) int {
     $archive_data := ""
     $verified := false
     if archive_path.len > 0 {
+        info := os.stat(archive_path + "") or (err) {
+            << emit_err(opts, "ERR_NOT_FOUND", 0, "cannot read archive '" + archive_path + "': " + err.msg(), 0, EXIT_NOT_FOUND)
+        }
+        if info.is_dir {
+            << emit_err(opts, "ERR_ERR", 0, "archive path is a directory: " + archive_path, 0, EXIT_ERR)
+        }
+        if info.size > UPDATE_MAX_BYTES {
+            << emit_err(opts, "ERR_ERR", 0, "archive exceeds max size limit (" + strconv.itoa(UPDATE_MAX_BYTES) + " bytes)", 0, EXIT_ERR)
+        }
         if !opts.json_mode {
             println("fatext update: reading " + archive_path + "...")
         }

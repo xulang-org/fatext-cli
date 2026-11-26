@@ -34,7 +34,7 @@ jobs:
             ext: ""
             run_tests: true
           - target: macos-arm64
-            os: macos-14
+            os: macos-latest
             asset: xu-v0.14.1-macos-arm64.tar.gz
             ext: ""
             run_tests: true
@@ -113,13 +113,22 @@ jobs:
         with:
           path: fatext-cli
 
-      - uses: actions/checkout@v4
-        with:
-          repository: xulang-org/fatext
-          path: fatext
-          persist-credentials: false
+      - name: Checkout fatext server (if FATEXT_REPO_TOKEN is configured)
+        id: fetch-server
+        shell: bash
+        env:
+          FATEXT_REPO_TOKEN: ${{ secrets.FATEXT_REPO_TOKEN }}
+        run: |
+          if [ -z "$FATEXT_REPO_TOKEN" ]; then
+            echo "::notice::Skipping cross-repo server-integration because secret FATEXT_REPO_TOKEN is not set for private repo xulang-org/fatext."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git clone --depth 1 "https://x-access-token:${FATEXT_REPO_TOKEN}@github.com/xulang-org/fatext.git" fatext
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Download Xu toolchain (linux-x64)
+        if: steps.fetch-server.outputs.ready == 'true'
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/xu"
@@ -132,6 +141,7 @@ jobs:
           echo "XU_STD=$XU_STD" >> "$GITHUB_ENV"
 
       - name: Build fatext CLI and fatext-server
+        if: steps.fetch-server.outputs.ready == 'true'
         shell: bash
         run: |
           cd fatext-cli
@@ -143,6 +153,7 @@ jobs:
           XU_STDLIB_ROOT="$XU_STD" "$XU_BIN" build server -o build/fatext-server
 
       - name: Run cross-repo CLI + Server integration suites
+        if: steps.fetch-server.outputs.ready == 'true'
         shell: bash
         run: |
           python3 fatext/scripts/test_ctl_chain.py

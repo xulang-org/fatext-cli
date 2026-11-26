@@ -54,7 +54,7 @@ jobs:
             xu_asset: xu-v0.14.1-linux-arm64.tar.gz
             pkg: tar
           - target: macos-arm64
-            os: macos-14
+            os: macos-latest
             xu_asset: xu-v0.14.1-macos-arm64.tar.gz
             pkg: tar
           - target: macos-x64

@@ -119,8 +119,8 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
         if rest.len < 1 || rest[0] != "issue" {
             << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl cred issue [--label ...] [--scopes all|csv] [--ttl 30d] [--out <file>]", 0, EXIT_USAGE)
         }
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $lbl := ""
         $scopes_in := "all"
         $ttl_s := "30d"
@@ -150,13 +150,13 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
         iat := time.now_time().unix()
         $exp := 0
         if ttl > 0 { exp = iat + ttl }
-        ul := new_ulid() >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        ul := new_ulid() or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         cid := "cred_" + ul
         canon_pl := cli_canon_enrollment(cfg.agent_id + "", cfg.key_version, cid + "", exp, iat, lbl + "", &sr.scopes)
-        csig := sign_pss_message(&priv, &canon_pl) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        csig := sign_pss_message(&priv, &canon_pl) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         voucher := "{\"payload\":" + canon_pl + ",\"controller_sig\":" + json.quote(&csig) + "}\n"
         if out_path.len > 0 {
-            write_atomic_mode(out_path + "", &voucher, 384) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            write_atomic_mode(out_path + "", &voucher, 384) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
             if opts.json_mode {
                 println("{\"ok\":true,\"cred_id\":" + json.quote(&cid) + ",\"controller_id\":" + json.quote(&cfg.agent_id) + ",\"out\":" + json.quote(&out_path) + ",\"expires_at\":" + strconv.itoa(exp) + "}")
             } else {
@@ -169,8 +169,8 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
     }
 
     if sub == "agents" {
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         empty := ""
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents", &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
@@ -205,8 +205,8 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
     if sub == "grant" {
         if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl grant <agent_id> [--scopes ...] [--ttl 30d] [--label ...] [--proof <file>]", 0, EXIT_USAGE) }
         aid := rest[0] + ""
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $lbl := ""
         $scopes_in := "all"
         $ttl_s := "30d"
@@ -240,14 +240,14 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
         iat := time.now_time().unix()
         $exp := 0
         if ttl > 0 { exp = iat + ttl }
-        ul := new_ulid() >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        ul := new_ulid() or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         cid := "cred_" + ul
         canon_cert := cli_canon_agent_cert(aid + "", afk.key_version, afp + "", cfg.agent_id + "", cfg.key_version, cid + "", exp, iat, lbl + "", &sr.scopes)
-        csig := sign_pss_message(&priv, &canon_cert) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        csig := sign_pss_message(&priv, &canon_cert) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
 
         $body := "{\"payload\":" + canon_cert + ",\"controller_sig\":" + json.quote(&csig)
         if proof_path.len > 0 {
-            praw := os.read(proof_path + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+            praw := os.read(proof_path + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
             body = body + ",\"adoption_proof\":" + strings.trim_space(&praw)
         }
         body = body + "}"
@@ -262,8 +262,8 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
         aid := rest[0] + ""
         $reason := ""
         if rest.len >= 3 && rest[1] == "--reason" { reason = rest[2] + "" }
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         body := "{\"reason\":" + json.quote(&reason) + "}"
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/ctl/agents/" + aid + "/suspend", &body, "")
         if !r.ok { << handle_api_fail(opts, &r) }
@@ -274,8 +274,8 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
     if sub == "resume" {
         if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl resume <agent_id>", 0, EXIT_USAGE) }
         aid := rest[0] + ""
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         body := "{}"
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/ctl/agents/" + aid + "/resume", &body, "")
         if !r.ok { << handle_api_fail(opts, &r) }
@@ -303,8 +303,8 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
             i += 1
         }
         if !confirm { << emit_err(opts, "ERR_CONFIRM_REQUIRED", 0, "permanent revocation requires --confirm", 0, EXIT_USAGE) }
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $succ_json := "null"
         if succ.len > 0 { succ_json = json.quote(&succ) }
         body := "{\"successor_id\":" + succ_json + ",\"reason\":" + json.quote(&reason) + "}"
@@ -343,8 +343,8 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
             else { << emit_err(opts, "ERR_USAGE", 0, "unknown policy flag: " + a, 0, EXIT_USAGE) }
             i += 1
         }
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $parts := []string{}
         if has_name { parts.push("\"name\":" + json.quote(&aname)) }
         if has_dmp { parts.push("\"dm_policy\":" + json.quote(&dmp)) }
@@ -375,16 +375,16 @@ pub fn cmd_claim_proof(opts &CliOpts, args []string) int {
     $out_path := ""
     if args.len >= 3 && args[1] == "--out" { out_path = args[2] + "" }
 
-    cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    pub_pem := encode_spki_public_pem(&priv.public) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    pub_pem := encode_spki_public_pem(&priv.public) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
     fp := pubkey_fingerprint(&pub_pem)
     ts := time.now_time().unix()
     pl := cli_canon_adoption(cfg.agent_id + "", fp + "", cid + "", ts)
-    asig := sign_pss_message(&priv, &pl) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+    asig := sign_pss_message(&priv, &pl) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
     proof := "{\"payload\":" + pl + ",\"agent_sig\":" + json.quote(&asig) + "}\n"
     if out_path.len > 0 {
-        write_atomic_mode(out_path + "", &proof, 384) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        write_atomic_mode(out_path + "", &proof, 384) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         if opts.json_mode {
             println("{\"ok\":true,\"agent_id\":" + json.quote(&cfg.agent_id) + ",\"controller_id\":" + json.quote(&cid) + ",\"out\":" + json.quote(&out_path) + "}")
         } else {
@@ -425,7 +425,7 @@ fn cli_verify_agent_rotations(cdoc &json.Doc, cid string, cur_ver int, cur_pem &
             vu := json_int_or(cdoc, cdoc.get(el, "valid_until"), 0)
             old_v := json_int_or(cdoc, cdoc.get(el, "version"), 0)
             next_pem := cli_find_key_for_ver(cdoc, old_v + 1, cur_ver, cur_pem)
-            old_pk := decode_spki_public_pem(&old_pem) >>> (err) {
+            old_pk := decode_spki_public_pem(&old_pem) or (err) {
                 errs.push("invalid historical controller key")
                 ->
             }
@@ -433,7 +433,7 @@ fn cli_verify_agent_rotations(cdoc &json.Doc, cid string, cur_ver int, cur_pem &
                 errs.push("missing next controller key in chain")
                 ->
             }
-            next_pk := decode_spki_public_pem(&next_pem) >>> (err) {
+            next_pk := decode_spki_public_pem(&next_pem) or (err) {
                 errs.push("invalid next controller key")
                 ->
             }
@@ -453,7 +453,7 @@ fn cli_verify_agent_rotations(cdoc &json.Doc, cid string, cur_ver int, cur_pem &
 }
 
 fn cli_verify_pem_sig(pem &string, msg &string, sig string) bool {
-    pk := decode_spki_public_pem(pem) >>> (err) { << false }
+    pk := decode_spki_public_pem(pem) or (err) { << false }
     << verify_pss_message(&pk, msg, sig)
 }
 

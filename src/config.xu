@@ -51,27 +51,27 @@ pub struct RoomInfo {
 }
 
 pub fn json_str_or(doc &json.Doc, node int, def string) string {
-    << doc.as_string(node) >>> (err) { << def }
+    << doc.as_string(node) or (err) { << def }
 }
 
 pub fn json_int_or(doc &json.Doc, node int, def int) int {
-    << doc.as_int(node) >>> (err) { << def }
+    << doc.as_int(node) or (err) { << def }
 }
 
 pub fn json_bool_or(doc &json.Doc, node int, def bool) bool {
-    << doc.as_bool(node) >>> (err) { << def }
+    << doc.as_bool(node) or (err) { << def }
 }
 
 pub fn json_encode_or(doc &json.Doc, node int, def string) string {
-    << doc.encode(node) >>> (err) { << def }
+    << doc.encode(node) or (err) { << def }
 }
 
 pub fn read_file_or_empty(path string) string {
-    << os.read(path) >>> (err) { << "" }
+    << os.read(path) or (err) { << "" }
 }
 
 pub fn parse_int_or(s &string, def int) int {
-    << strconv.atoi(s) >>> (err) { << def }
+    << strconv.atoi(s) or (err) { << def }
 }
 
 pub fn join_ref(xs &[]string, sep string) string {
@@ -85,9 +85,9 @@ pub fn join_ref(xs &[]string, sep string) string {
 
 pub fn write_atomic_mode(path string, data &string, mode int) int {
     tmp := path + ".tmp." + strconv.itoa(os.getpid())
-    os.write(tmp + "", data + "") >>>
-    os.chmod(tmp + "", mode) >>>
-    os.rename(tmp + "", path) >>>
+    os.write(tmp + "", data + "") or >>
+    os.chmod(tmp + "", mode) or >>
+    os.rename(tmp + "", path) or >>
     << 0
 }
 
@@ -168,16 +168,16 @@ pub fn resolve_api_base(opts &CliOpts, cfg_api string) string {
 pub fn load_config(opts &CliOpts) Config {
     cpath := resolve_config_path(opts)
     home := resolve_home(opts)
-    raw := os.read(cpath) >>>
+    raw := os.read(cpath) or >>
     doc := json.parse(&raw)
     if !doc.ok() {
-        >>> errors.new("invalid config.json")
+        >> errors.new("invalid config.json")
     }
     r := doc.root()
     if !doc.is_dict(r) || !doc.has(r, "agent_id") {
-        >>> errors.new("missing agent_id in config.json")
+        >> errors.new("missing agent_id in config.json")
     }
-    aid := doc.as_string(doc.get(r, "agent_id")) >>>
+    aid := doc.as_string(doc.get(r, "agent_id")) or >>
     $nm := ""
     if doc.has(r, "name") { nm = json_str_or(&doc, doc.get(r, "name"), "") }
     $api := DEFAULT_API_BASE
@@ -195,7 +195,7 @@ pub fn load_config(opts &CliOpts) Config {
 
 pub fn save_config(cfg_path string, cfg &Config) int {
     home := dirname_of(cfg_path + "")
-    os.mkdir_all(home) >>>
+    os.mkdir_all(home) or >>
     body := "{" +
         "\"agent_id\":" + json.quote(&cfg.agent_id) + "," +
         "\"name\":" + json.quote(&cfg.name) + "," +
@@ -204,50 +204,50 @@ pub fn save_config(cfg_path string, cfg &Config) int {
         "\"key_version\":" + strconv.itoa(cfg.key_version) + "," +
         "\"fingerprint\":" + json.quote(&cfg.fingerprint) +
         "}\n"
-    << write_atomic_mode(cfg_path, &body, 384) >>>
+    << write_atomic_mode(cfg_path, &body, 384) or >>
 }
 
 pub fn check_private_key_perms(path string) int {
-    info := os.stat(path) >>>
+    info := os.stat(path) or >>
     if os.getenv("OS") == "Windows_NT" {
         << 0
     }
     if (info.mode & 63) != 0 {
-        >>> errors.new("insecure_key_file")
+        >> errors.new("insecure_key_file")
     }
     << 0
 }
 
 pub fn load_private_key_checked(home string) rsa.PrivateKey {
     ppath := home + "/private.pem"
-    check_private_key_perms(ppath + "") >>>
-    pem_raw := os.read(ppath) >>>
-    << decode_rsa_private_pem(&pem_raw) >>>
+    check_private_key_perms(ppath + "") or >>
+    pem_raw := os.read(ppath) or >>
+    << decode_rsa_private_pem(&pem_raw) or >>
 }
 
 pub fn save_private_key_atomic(home string, pem_str &string) int {
-    os.mkdir_all(home + "") >>>
+    os.mkdir_all(home + "") or >>
     ppath := home + "/private.pem"
-    << write_atomic_mode(ppath, pem_str, 384) >>>
+    << write_atomic_mode(ppath, pem_str, 384) or >>
 }
 
 pub fn archive_private_key(home string, version int, pem_str &string) int {
     kdir := home + "/keys"
-    os.mkdir_all(kdir + "") >>>
+    os.mkdir_all(kdir + "") or >>
     kpath := kdir + "/private.v" + strconv.itoa(version) + ".pem"
-    << write_atomic_mode(kpath, pem_str, 384) >>>
+    << write_atomic_mode(kpath, pem_str, 384) or >>
 }
 
 pub fn load_archived_private_key(home string, version int) rsa.PrivateKey {
     kpath := home + "/keys/private.v" + strconv.itoa(version) + ".pem"
-    check_private_key_perms(kpath + "") >>>
-    pem_raw := os.read(kpath) >>>
-    << decode_rsa_private_pem(&pem_raw) >>>
+    check_private_key_perms(kpath + "") or >>
+    pem_raw := os.read(kpath) or >>
+    << decode_rsa_private_pem(&pem_raw) or >>
 }
 
 pub fn save_room_info(home string, ri &RoomInfo) int {
     rdir := home + "/rooms"
-    os.mkdir_all(rdir + "") >>>
+    os.mkdir_all(rdir + "") or >>
     rpath := rdir + "/" + ri.room_id + ".json"
     body := "{" +
         "\"room_id\":" + json.quote(&ri.room_id) + "," +
@@ -256,16 +256,16 @@ pub fn save_room_info(home string, ri &RoomInfo) int {
         "\"epoch\":" + strconv.itoa(ri.epoch) + "," +
         "\"created_at\":" + strconv.itoa(ri.created_at) +
         "}\n"
-    << write_atomic_mode(rpath, &body, 384) >>>
+    << write_atomic_mode(rpath, &body, 384) or >>
 }
 
 pub fn load_room_info(home string, room_id string) RoomInfo {
     rpath := home + "/rooms/" + room_id + ".json"
-    raw := os.read(rpath) >>>
+    raw := os.read(rpath) or >>
     doc := json.parse(&raw)
-    if !doc.ok() { >>> errors.new("invalid room file") }
+    if !doc.ok() { >> errors.new("invalid room file") }
     r := doc.root()
-    kb := doc.as_string(doc.get(r, "key")) >>>
+    kb := doc.as_string(doc.get(r, "key")) or >>
     $nm := ""
     if doc.has(r, "name") { nm = json_str_or(&doc, doc.get(r, "name"), "") }
     $ep := 1
@@ -277,7 +277,7 @@ pub fn load_room_info(home string, room_id string) RoomInfo {
 
 pub fn delete_room_info_quiet(home string, room_id string) {
     rpath := home + "/rooms/" + room_id + ".json"
-    os.remove(rpath) >>> (err) { << }
+    os.remove(rpath) or (err) { << }
 }
 
 pub fn check_and_record_nonce_in(home string, fname string, nonce_b64 string, now int) bool {
@@ -308,8 +308,8 @@ pub fn check_and_record_nonce_in(home string, fname string, nonce_b64 string, no
     }
     keep.push("{\"n\":" + json.quote(&nonce_b64) + ",\"ts\":" + strconv.itoa(now) + "}")
     out := strings.join(keep, "\n") + "\n"
-    os.mkdir_all(home + "") >>> (err) { << true }
-    _ := write_atomic_mode(npath, &out, 384) >>> (err) { << true }
+    os.mkdir_all(home + "") or (err) { << true }
+    _ := write_atomic_mode(npath, &out, 384) or (err) { << true }
     << true
 }
 
@@ -320,7 +320,7 @@ pub fn check_and_record_nonce(home string, nonce_b64 string, now int) bool {
 pub fn read_stdin_all() string {
     $out := ""
     while true {
-        chunk := os.fd_read(0, 65536) >>> (err) { <- }
+        chunk := os.fd_read(0, 65536) or (err) { <- }
         if chunk.len == 0 { <- }
         out = out + chunk
     }

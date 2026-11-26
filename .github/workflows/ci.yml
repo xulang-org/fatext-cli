@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 env:
-  XU_VERSION: v0.14.0
+  XU_VERSION: v0.14.1
 
 jobs:
   version-check:
@@ -25,27 +25,27 @@ jobs:
         include:
           - target: linux-x64
             os: ubuntu-24.04
-            asset: xu-v0.14.0-linux-x64.tar.gz
+            asset: xu-v0.14.1-linux-x64.tar.gz
             ext: ""
             run_tests: true
           - target: linux-arm64
             os: ubuntu-24.04-arm
-            asset: xu-v0.14.0-linux-arm64.tar.gz
+            asset: xu-v0.14.1-linux-arm64.tar.gz
             ext: ""
             run_tests: true
           - target: macos-arm64
             os: macos-14
-            asset: xu-v0.14.0-macos-arm64.tar.gz
+            asset: xu-v0.14.1-macos-arm64.tar.gz
             ext: ""
             run_tests: true
           - target: macos-x64
             os: macos-15-intel
-            asset: xu-v0.14.0-macos-x64.tar.gz
+            asset: xu-v0.14.1-macos-x64.tar.gz
             ext: ""
             run_tests: true
           - target: windows-x64
             os: windows-2022
-            asset: xu-v0.14.0-windows-x64.zip
+            asset: xu-v0.14.1-windows-x64.zip
             ext: ".exe"
             run_tests: false
     runs-on: ${{ matrix.os }}
@@ -149,6 +149,6 @@ jobs:
           python3 fatext/scripts/test_docs_and_name.py
           python3 fatext/scripts/test_logging.py
           python3 fatext/scripts/test_rooms.py
+          python3 fatext/scripts/test_server_phase2.py
           python3 fatext/scripts/test_full_e2e.py
           python3 fatext/scripts/test_perf_and_resilience.py
-          # Add test_server_phase2.py once XU_VERSION includes xulang-org/xu#292 (PKCS#1 + X25519 TLS 1.3).

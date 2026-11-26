@@ -11,7 +11,7 @@
 #time
 
 fn emit_stdout_line(s string) {
-    os.fd_write(1, s + "\n") >>> (err) { << }
+    os.fd_write(1, s + "\n") or (err) { << }
 }
 
 fn handle_api_fail(opts &CliOpts, r &ApiResp) int {
@@ -23,22 +23,22 @@ fn handle_api_fail(opts &CliOpts, r &ApiResp) int {
 }
 
 fn cache_get_or(cache &maps.StrStr, k string) string {
-    << cache.get(k) >>> (err) { << "" }
+    << cache.get(k) or (err) { << "" }
 }
 
 fn load_config_or_base(opts &CliOpts, api_base string) Config {
-    << load_config(opts) >>> (err) {
+    << load_config(opts) or (err) {
         << Config{agent_id: "", name: "", api_base: api_base, created_at: 0, key_version: 1, fingerprint: "", home: ""}
     }
 }
 
 fn save_room_info_q(home string, ri &RoomInfo) bool {
-    save_room_info(home, ri) >>> (err) { << false }
+    save_room_info(home, ri) or (err) { << false }
     << true
 }
 
 fn decrypt_mail_or(self_id string, priv &rsa.PrivateKey, mid string, tkv int, env_json &string) string {
-    << decrypt_mail_envelope(self_id, priv, mid, tkv, env_json) >>> (err) { << "" }
+    << decrypt_mail_envelope(self_id, priv, mid, tkv, env_json) or (err) { << "" }
 }
 
 fn parse_semver3(s &string) []int {
@@ -145,7 +145,7 @@ fn verify_stored_post_line(api_base string, timeout_sec int, cache $&maps.StrStr
         }
     }
     if pem_s.len == 0 { << false }
-    pk := decode_spki_public_pem(&pem_s) >>> (err) { << false }
+    pk := decode_spki_public_pem(&pem_s) or (err) { << false }
     bhex := sha256.sum256(body + "")
     sts := "POST\n" + path + "\n" + strconv.itoa(ts) + "\n" + bhex
     << verify_pss_message(&pk, &sts, sig + "")
@@ -195,13 +195,13 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
     cfg_path := resolve_config_path(opts)
     api_base := resolve_api_base(opts, "")
 
-    priv := rsa.generate_key(bits) >>> (err) {
+    priv := rsa.generate_key(bits) or (err) {
         << emit_err(opts, "ERR_CRYPTO", 0, "RSA keygen failed: " + err.msg(), 0, EXIT_CRYPTO)
     }
-    priv_pem := encode_rsa_private_pem(&priv) >>> (err) {
+    priv_pem := encode_rsa_private_pem(&priv) or (err) {
         << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
     }
-    pub_pem := encode_spki_public_pem(&priv.public) >>> (err) {
+    pub_pem := encode_spki_public_pem(&priv.public) or (err) {
         << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
     }
     fp := pubkey_fingerprint(&pub_pem)
@@ -211,7 +211,7 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
     $enr_cid := ""
     $enr_ctrl := ""
     if cred_file.len > 0 {
-        craw := os.read(cred_file + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, "failed reading --credential: " + err.msg(), 0, EXIT_CONFIG) }
+        craw := os.read(cred_file + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, "failed reading --credential: " + err.msg(), 0, EXIT_CONFIG) }
         cdoc := json.parse(&craw)
         if !cdoc.ok() || !cdoc.is_dict(cdoc.root()) || !cdoc.has(cdoc.root(), "payload") || !cdoc.has(cdoc.root(), "controller_sig") {
             << emit_err(opts, "ERR_USAGE", 0, "invalid --credential voucher json", 0, EXIT_USAGE)
@@ -236,7 +236,7 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
         }
         if enr_json.len > 0 {
             ab_pl := cli_canon_binding(fp + "", enr_ctrl + "", enr_cid + "", now_i)
-            ab_sig := sign_pss_message(&priv, &ab_pl) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+            ab_sig := sign_pss_message(&priv, &ab_pl) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
             reg_body = reg_body + ",\"enrollment\":" + enr_json + ",\"agent_binding\":" + ab_pl + ",\"agent_binding_sig\":" + json.quote(&ab_sig)
         }
         reg_body = reg_body + "}"
@@ -244,7 +244,7 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
         t0 := time.now()
         nonce := solve_pow_register(&pub_pem, ts + "", pow_bits)
         pow_ms = (time.now() - t0) / 1000000
-        sig := sign_http_request(&priv, "POST", "/v1/agents/register", ts + "", &reg_body) >>> (err) {
+        sig := sign_http_request(&priv, "POST", "/v1/agents/register", ts + "", &reg_body) or (err) {
             << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
         }
         extra := "X-Timestamp: " + ts + "\r\nX-Signature: " + sig + "\r\nX-PoW-Nonce: " + nonce + "\r\n"
@@ -267,11 +267,11 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
     aid := json_str_or(&rdoc, rdoc.get(rdoc.root(), "agent_id"), "")
     cat := json_int_or(&rdoc, rdoc.get(rdoc.root(), "created_at"), time.now_time().unix())
 
-    save_private_key_atomic(home + "", &priv_pem) >>> (err) {
+    save_private_key_atomic(home + "", &priv_pem) or (err) {
         << emit_err(opts, "ERR_CONFIG", 0, "failed saving private.pem: " + err.msg(), 0, EXIT_CONFIG)
     }
     cfg := Config{agent_id: aid + "", name: name + "", api_base: api_base + "", created_at: cat, key_version: 1, fingerprint: fp + "", home: home + ""}
-    save_config(cfg_path + "", &cfg) >>> (err) {
+    save_config(cfg_path + "", &cfg) or (err) {
         << emit_err(opts, "ERR_CONFIG", 0, "failed saving config.json: " + err.msg(), 0, EXIT_CONFIG)
     }
 
@@ -295,10 +295,10 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
 }
 
 pub fn cmd_whoami(opts &CliOpts) int {
-    cfg := load_config(opts) >>> (err) {
+    cfg := load_config(opts) or (err) {
         << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
     }
-    _ := load_private_key_checked(cfg.home + "") >>> (err) {
+    _ := load_private_key_checked(cfg.home + "") or (err) {
         << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
     }
     fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "")
@@ -330,10 +330,10 @@ pub fn cmd_whoami(opts &CliOpts) int {
 }
 
 pub fn cmd_profile_set(opts &CliOpts, args []string) int {
-    cfg := load_config(opts) >>> (err) {
+    cfg := load_config(opts) or (err) {
         << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
     }
-    priv := load_private_key_checked(cfg.home + "") >>> (err) {
+    priv := load_private_key_checked(cfg.home + "") or (err) {
         << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
     }
 
@@ -521,7 +521,7 @@ pub fn cmd_profile_set(opts &CliOpts, args []string) int {
 }
 
 fn save_config_quiet(cfg_path string, cfg &Config) {
-    save_config(cfg_path, cfg) >>> (err) { << }
+    save_config(cfg_path, cfg) or (err) { << }
 }
 
 pub fn cmd_key(opts &CliOpts, args []string) int {
@@ -546,13 +546,13 @@ pub fn cmd_key(opts &CliOpts, args []string) int {
         << EXIT_OK
     }
     if sub == "rotate" {
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        old_priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        old_priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         old_pem := read_file_or_empty(cfg.home + "/private.pem")
 
-        new_priv := rsa.generate_key(2048) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
-        new_priv_pem := encode_rsa_private_pem(&new_priv) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
-        new_pub_pem := encode_spki_public_pem(&new_priv.public) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        new_priv := rsa.generate_key(2048) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        new_priv_pem := encode_rsa_private_pem(&new_priv) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        new_pub_pem := encode_spki_public_pem(&new_priv.public) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         new_kv := cfg.key_version + 1
         now := time.now_time().unix()
 
@@ -560,23 +560,23 @@ pub fn cmd_key(opts &CliOpts, args []string) int {
             ",\"key_version\":" + strconv.itoa(new_kv) +
             ",\"new_public_key_pem\":" + json.quote(&new_pub_pem) +
             ",\"timestamp\":" + strconv.itoa(now) + "}"
-        old_sig := sign_pss_message(&old_priv, &payload) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
-        new_sig := sign_pss_message(&new_priv, &payload) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        old_sig := sign_pss_message(&old_priv, &payload) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        new_sig := sign_pss_message(&new_priv, &payload) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         body := "{\"payload\":" + payload + ",\"old_sig\":" + json.quote(&old_sig) + ",\"new_sig\":" + json.quote(&new_sig) + "}"
 
         ts := strconv.itoa(now)
-        req_sig_old := sign_http_request(&old_priv, "POST", "/v1/agents/rotate-key", ts + "", &body) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
-        req_sig_new := sign_http_request(&new_priv, "POST", "/v1/agents/rotate-key", ts + "", &body) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        req_sig_old := sign_http_request(&old_priv, "POST", "/v1/agents/rotate-key", ts + "", &body) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        req_sig_new := sign_http_request(&new_priv, "POST", "/v1/agents/rotate-key", ts + "", &body) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         extra := "X-Agent-Id: " + cfg.agent_id + "\r\nX-Timestamp: " + ts + "\r\nX-Signature: " + req_sig_old + "\r\nX-Signature-New: " + req_sig_new + "\r\n"
 
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &old_priv, false, "POST", "/v1/agents/rotate-key", &body, extra)
         if !r.ok { << handle_api_fail(opts, &r) }
 
-        archive_private_key(cfg.home + "", cfg.key_version, &old_pem) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        save_private_key_atomic(cfg.home + "", &new_priv_pem) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        archive_private_key(cfg.home + "", cfg.key_version, &old_pem) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        save_private_key_atomic(cfg.home + "", &new_priv_pem) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         fp := pubkey_fingerprint(&new_pub_pem)
         new_cfg := Config{agent_id: cfg.agent_id + "", name: cfg.name + "", api_base: cfg.api_base + "", created_at: cfg.created_at, key_version: new_kv, fingerprint: fp + "", home: cfg.home + ""}
-        save_config(resolve_config_path(opts), &new_cfg) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        save_config(resolve_config_path(opts), &new_cfg) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         if opts.json_mode {
             println("{\"ok\":true,\"agent_id\":" + json.quote(&cfg.agent_id) + ",\"key_version\":" + strconv.itoa(new_kv) + ",\"fingerprint\":" + json.quote(&fp) + "}")
         } else {
@@ -600,13 +600,13 @@ pub fn cmd_key(opts &CliOpts, args []string) int {
         if !confirm {
             << emit_err(opts, "ERR_CONFIRM_REQUIRED", 0, "permanent revocation requires --confirm", 0, EXIT_USAGE)
         }
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $succ_json := "null"
         if succ.len > 0 { succ_json = json.quote(&succ) }
         now := time.now_time().unix()
         payload := "{\"agent_id\":" + json.quote(&cfg.agent_id) + ",\"status\":\"revoked\",\"successor_id\":" + succ_json + ",\"timestamp\":" + strconv.itoa(now) + "}"
-        sig := sign_pss_message(&priv, &payload) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        sig := sign_pss_message(&priv, &payload) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         body := "{\"payload\":" + payload + ",\"sig\":" + json.quote(&sig) + "}"
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/agents/revoke", &body, "")
         if !r.ok { << handle_api_fail(opts, &r) }
@@ -696,8 +696,8 @@ pub fn cmd_pub(opts &CliOpts, args []string) int {
         if text.len == 0 || text.len > 4096 {
             << emit_err(opts, "ERR_USAGE", 0, "post text must be 1..4096 bytes", 0, EXIT_USAGE)
         }
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $pow_bits := discover_pow_bits(opts, cfg.api_base + "", "post", 20)
         body := "{\"text\":" + json.quote(&text) + "}"
 
@@ -708,7 +708,7 @@ pub fn cmd_pub(opts &CliOpts, args []string) int {
             t0 := time.now()
             nonce := solve_pow_post(cfg.agent_id + "", ts + "", pow_bits)
             pow_ms = (time.now() - t0) / 1000000
-            sig := sign_http_request(&priv, "POST", "/v1/channels/" + ch + "/posts", ts + "", &body) >>> (err) {
+            sig := sign_http_request(&priv, "POST", "/v1/channels/" + ch + "/posts", ts + "", &body) or (err) {
                 << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
             }
             extra := "Content-Type: application/json\r\nX-Agent-Id: " + cfg.agent_id + "\r\nX-Timestamp: " + ts + "\r\nX-Signature: " + sig + "\r\nX-PoW-Nonce: " + nonce + "\r\n"
@@ -753,8 +753,8 @@ pub fn cmd_pub(opts &CliOpts, args []string) int {
             } else { << emit_err(opts, "ERR_USAGE", 0, "unknown reply flag: " + a, 0, EXIT_USAGE) }
             i += 1
         }
-        cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $rt_json := "null"
         if reply_to.len > 0 { rt_json = json.quote(&reply_to) }
         body := "{\"text\":" + json.quote(&text) + ",\"reply_to\":" + rt_json + ",\"conversation_state\":" + json.quote(&cstate) + "}"
@@ -773,8 +773,8 @@ pub fn cmd_pub(opts &CliOpts, args []string) int {
 pub fn cmd_friend(opts &CliOpts, args []string) int {
     if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext friend <list|add|accept|reject|rm>", 0, EXIT_USAGE) }
     sub := args[0] + ""
-    cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
 
     empty := ""
     if sub == "list" {
@@ -816,8 +816,8 @@ pub fn cmd_friend(opts &CliOpts, args []string) int {
 pub fn cmd_block(opts &CliOpts, args []string) int {
     if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext block <list|add|rm>", 0, EXIT_USAGE) }
     sub := args[0] + ""
-    cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
 
     empty := ""
     if sub == "list" {
@@ -862,14 +862,14 @@ pub fn cmd_dm(opts &CliOpts, args []string) int {
     $cstate := "open"
     if args.len >= 5 && args[3] == "--state" { cstate = args[4] + "" }
 
-    cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
     fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, to_id + "")
     if !fk.ok { << emit_err(opts, fk.err_code + "", 0, fk.err_msg + "", 0, fk.exit_code) }
 
     body_json := "{\"text\":" + json.quote(&text) + "}"
     now := time.now_time().unix()
-    frame := encrypt_dm_frame(cfg.agent_id + "", &priv, to_id + "", &fk.pk, fk.key_version, "text", body_json, cstate + "", now) >>> (err) {
+    frame := encrypt_dm_frame(cfg.agent_id + "", &priv, to_id + "", &fk.pk, fk.key_version, "text", body_json, cstate + "", now) or (err) {
         << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
     }
     if frame.len > 32768 {
@@ -918,7 +918,7 @@ fn check_room_sender_valid(api_base string, timeout_sec int, self_id string, pri
 }
 
 fn load_room_info_or(home string, rid string) RoomInfo {
-    << load_room_info(home, rid) >>> (err) {
+    << load_room_info(home, rid) or (err) {
         << RoomInfo{room_id: "", name: "", key_b64: "", epoch: 0, created_at: 0}
     }
 }
@@ -928,7 +928,7 @@ fn map_set_str_int(m $&maps.StrInt, k string, v int) {
 }
 
 fn map_get_int_or(m &maps.StrInt, k string, def int) int {
-    << m.get(k) >>> (err) { << def }
+    << m.get(k) or (err) { << def }
 }
 
 fn apply_room_keybox_item(opts &CliOpts, cfg &Config, priv &rsa.PrivateKey, box_doc &json.Doc, node int) string {
@@ -1046,7 +1046,7 @@ struct RoomRekeyOutcome {
 }
 
 fn distribute_room_rekey(opts &CliOpts, cfg &Config, priv &rsa.PrivateKey, rid string, rname string, new_ep int, bump_epoch bool, recipients &[]string) RoomRekeyOutcome {
-    kb64 := random_b64(32) >>> (err) {
+    kb64 := random_b64(32) or (err) {
         << RoomRekeyOutcome{ok: false, exit_code: EXIT_CRYPTO, err_code: "ERR_CRYPTO", http_status: 0, err_msg: err.msg(), body: ""}
     }
     now := time.now_time().unix()
@@ -1057,7 +1057,7 @@ fn distribute_room_rekey(opts &CliOpts, cfg &Config, priv &rsa.PrivateKey, rid s
         fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, to_id + "")
         if !fk.ok { -> }
         body_json := "{\"epoch\":" + strconv.itoa(new_ep) + ",\"name\":" + json.quote(&rname) + ",\"room_id\":" + json.quote(&rid) + ",\"room_key\":" + json.quote(&kb64) + "}"
-        frame := encrypt_dm_frame(cfg.agent_id + "", priv, to_id + "", &fk.pk, fk.key_version, "room_rekey", body_json, "open", now) >>> (err) { -> }
+        frame := encrypt_dm_frame(cfg.agent_id + "", priv, to_id + "", &fk.pk, fk.key_version, "room_rekey", body_json, "open", now) or (err) { -> }
         envs.push("{\"to\":" + json.quote(&to_id) + ",\"frame\":" + frame + "}")
     }
     $bp := "false"
@@ -1073,7 +1073,7 @@ fn distribute_room_rekey(opts &CliOpts, cfg &Config, priv &rsa.PrivateKey, rid s
     existing := load_room_info_or(cfg.home + "", rid + "")
     if existing.created_at > 0 { created_at = existing.created_at }
     ri := RoomInfo{room_id: rid + "", name: rname + "", key_b64: kb64 + "", epoch: new_ep, created_at: created_at}
-    save_room_info(cfg.home + "", &ri) >>> (err) {
+    save_room_info(cfg.home + "", &ri) or (err) {
         << RoomRekeyOutcome{ok: false, exit_code: EXIT_CONFIG, err_code: "ERR_CONFIG", http_status: 0, err_msg: err.msg(), body: ""}
     }
     << RoomRekeyOutcome{ok: true, exit_code: EXIT_OK, err_code: "", http_status: 200, err_msg: "", body: r.body + ""}
@@ -1084,8 +1084,8 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
         << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room <create|list|info|members|set|invite|role|mute|unmute|kick|ban|unban|rotate|transfer|leave|close|sync|send> ...", 0, EXIT_USAGE)
     }
     sub := args[0] + ""
-    cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
     empty := ""
 
     if sub == "create" {
@@ -1125,8 +1125,8 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
             else { << emit_err(opts, "ERR_USAGE", 0, "unknown room create flag: " + a, 0, EXIT_USAGE) }
             i += 1
         }
-        rid := generate_room_id() >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
-        kb64 := random_b64(32) >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        rid := generate_room_id() or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        kb64 := random_b64(32) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         $lk_s := "false"
         if locked { lk_s = "true" }
         req_body := "{\"room_id\":" + json.quote(&rid) +
@@ -1142,7 +1142,7 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
         if !r.ok { << handle_api_fail(opts, &r) }
         now := time.now_time().unix()
         ri := RoomInfo{room_id: rid + "", name: label + "", key_b64: kb64 + "", epoch: 1, created_at: now}
-        save_room_info(cfg.home + "", &ri) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        save_room_info(cfg.home + "", &ri) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         println("{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"name\":" + json.quote(&label) + ",\"epoch\":1,\"send_policy\":" + json.quote(&sp) + ",\"invite_policy\":" + json.quote(&ip) + ",\"join_policy\":" + json.quote(&jp) + ",\"max_members\":" + strconv.itoa(max_m) + ",\"slow_mode_sec\":" + strconv.itoa(slow_s) + ",\"locked\":" + lk_s + "}")
         << EXIT_OK
     }
@@ -1239,12 +1239,12 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
             }
             i += 1
         }
-        ri := load_room_info(cfg.home + "", rid + "") >>> (err) { << emit_err(opts, "ERR_NOT_FOUND", 0, "room key not found locally: " + rid, 0, EXIT_NOT_FOUND) }
+        ri := load_room_info(cfg.home + "", rid + "") or (err) { << emit_err(opts, "ERR_NOT_FOUND", 0, "room key not found locally: " + rid, 0, EXIT_NOT_FOUND) }
         fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, to_id + "")
         if !fk.ok { << emit_err(opts, fk.err_code + "", 0, fk.err_msg + "", 0, fk.exit_code) }
         body_json := "{\"epoch\":" + strconv.itoa(ri.epoch) + ",\"name\":" + json.quote(&ri.name) + ",\"room_id\":" + json.quote(&rid) + ",\"room_key\":" + json.quote(&ri.key_b64) + "}"
         now := time.now_time().unix()
-        frame := encrypt_dm_frame(cfg.agent_id + "", &priv, to_id + "", &fk.pk, fk.key_version, "room_invite", body_json, "open", now) >>> (err) {
+        frame := encrypt_dm_frame(cfg.agent_id + "", &priv, to_id + "", &fk.pk, fk.key_version, "room_invite", body_json, "open", now) or (err) {
             << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
         }
         req_body := "{\"agent_id\":" + json.quote(&to_id) + ",\"role\":" + json.quote(&role) + ",\"invite_frame\":" + frame + "}"
@@ -1390,11 +1390,11 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
         if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room send <room_id> <text|->", 0, EXIT_USAGE) }
         rid := args[1] + ""
         text := read_text_arg_or_stdin(args[2] + "")
-        ri := load_room_info(cfg.home + "", rid + "") >>> (err) { << emit_err(opts, "ERR_NOT_FOUND", 0, "room key not found locally: " + rid, 0, EXIT_NOT_FOUND) }
-        rkey := base64.decode_string(ri.key_b64 + "") >>> (err) { << emit_err(opts, "ERR_CRYPTO", 0, "corrupt room key", 0, EXIT_CRYPTO) }
+        ri := load_room_info(cfg.home + "", rid + "") or (err) { << emit_err(opts, "ERR_NOT_FOUND", 0, "room key not found locally: " + rid, 0, EXIT_NOT_FOUND) }
+        rkey := base64.decode_string(ri.key_b64 + "") or (err) { << emit_err(opts, "ERR_CRYPTO", 0, "corrupt room key", 0, EXIT_CRYPTO) }
         body_json := "{\"text\":" + json.quote(&text) + "}"
         now := time.now_time().unix()
-        frame := encrypt_room_frame(cfg.agent_id + "", &priv, rid + "", &rkey, ri.epoch, body_json, now) >>> (err) {
+        frame := encrypt_room_frame(cfg.agent_id + "", &priv, rid + "", &rkey, ri.epoch, body_json, now) or (err) {
             << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
         }
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/rooms/" + rid + "/send", &frame, "")
@@ -1427,7 +1427,7 @@ fn listen_get_pk_idx(
     }
     fk := fetch_agent_key(api_base + "", timeout_sec, aid + "")
     if !fk.ok { << -1 }
-    pk := decode_spki_public_pem(&fk.pub_pem) >>> (err) { << -1 }
+    pk := decode_spki_public_pem(&fk.pub_pem) or (err) { << -1 }
     pks.push(pk)
     idx := pks.len - 1
     map_set_str_int(pk_idx, aid + "", idx)
@@ -1466,8 +1466,8 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
         i += 1
     }
 
-    cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
 
     $q := []string{}
     if channels.len > 0 { q.push("channels=" + url_encode(&channels)) }
@@ -1610,11 +1610,11 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
                 rid := json_str_or(&d, d.get(d.root(), "room_id"), "")
                 from_id := json_str_or(&d, d.get(d.root(), "from"), "")
                 frame_json := json_encode_or(&d, d.get(d.root(), "frame"), "")
-                ri := load_room_info(cfg.home + "", rid + "") >>> (err) {
+                ri := load_room_info(cfg.home + "", rid + "") or (err) {
                     emit_stdout_line("{\"type\":\"error\",\"code\":\"missing_room_key\",\"room_id\":" + json.quote(&rid) + "}")
                     ->
                 }
-                rkey := base64.decode_string(ri.key_b64 + "") >>> (err) { -> }
+                rkey := base64.decode_string(ri.key_b64 + "") or (err) { -> }
                 now_pk := time.now_time().unix()
                 $pki := listen_get_pk_idx(cfg.api_base + "", opts.timeout_sec, from_id + "", now_pk, false, $&pk_idx, $&pk_ts, $&pks)
                 $dec := dec_fail("no key")
@@ -1671,8 +1671,8 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
 pub fn cmd_mail(opts &CliOpts, args []string) int {
     if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext mail <pull [--delete]|rm <mail_id>>", 0, EXIT_USAGE) }
     sub := args[0] + ""
-    cfg := load_config(opts) >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") >>> (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
     empty := ""
 
     if sub == "rm" {
@@ -1722,7 +1722,7 @@ pub fn cmd_mail(opts &CliOpts, args []string) int {
                 pt = decrypt_mail_or(cfg.agent_id + "", &priv, mid + "", tkv, &env_json)
                 if pt.len > 0 { dec_ok = true }
             } else {
-                apriv := load_archived_private_key(cfg.home + "", tkv) >>> (err) {
+                apriv := load_archived_private_key(cfg.home + "", tkv) or (err) {
                     println("{\"mail_id\":" + json.quote(&mid) + ",\"error\":\"missing_archived_key\",\"to_key_version\":" + strconv.itoa(tkv) + "}")
                     ->
                 }

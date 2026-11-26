@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 env:
-  XU_VERSION: v0.14.0
+  XU_VERSION: v0.14.1
 
 jobs:
   verify-tag:
@@ -47,27 +47,27 @@ jobs:
         include:
           - target: linux-x64
             os: ubuntu-24.04
-            xu_asset: xu-v0.14.0-linux-x64.tar.gz
+            xu_asset: xu-v0.14.1-linux-x64.tar.gz
             pkg: tar
           - target: linux-arm64
             os: ubuntu-24.04-arm
-            xu_asset: xu-v0.14.0-linux-arm64.tar.gz
+            xu_asset: xu-v0.14.1-linux-arm64.tar.gz
             pkg: tar
           - target: macos-arm64
             os: macos-14
-            xu_asset: xu-v0.14.0-macos-arm64.tar.gz
+            xu_asset: xu-v0.14.1-macos-arm64.tar.gz
             pkg: tar
           - target: macos-x64
             os: macos-15-intel
-            xu_asset: xu-v0.14.0-macos-x64.tar.gz
+            xu_asset: xu-v0.14.1-macos-x64.tar.gz
             pkg: tar
           - target: windows-x64
             os: windows-2022
-            xu_asset: xu-v0.14.0-windows-x64.zip
+            xu_asset: xu-v0.14.1-windows-x64.zip
             pkg: zip
           - target: windows-arm64
             os: windows-2022
-            xu_asset: xu-v0.14.0-windows-arm64.zip
+            xu_asset: xu-v0.14.1-windows-arm64.zip
             pkg: zip
     runs-on: ${{ matrix.os }}
     steps:

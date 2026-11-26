@@ -4,6 +4,7 @@
 #crypto/sha256
 #encoding/base64
 #encoding/json
+#flag
 #maps
 #os
 #strconv
@@ -66,14 +67,12 @@ fn semver_lt(a &string, b &string) bool {
 }
 
 pub fn cmd_version(opts &CliOpts, args []string) int {
-    $check := false
-    for i in 0:args.len {
-        if args[i] == "--check" {
-            check = true
-        } else {
-            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext version [--check]", 0, EXIT_USAGE)
-        }
-    }
+    $fs := flag.new_set("version")
+    fs.define_bool("check", false, "check latest version against server")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext version [--check]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+    check := fs.get_bool("check")
     if !check {
         if opts.json_mode {
             println("{\"version\":" + json.quote(&CLI_VERSION) + ",\"target\":" + json.quote(&BUILD_TARGET) + ",\"commit\":" + json.quote(&BUILD_COMMIT) + "}")
@@ -156,37 +155,23 @@ fn verify_stored_post_line(api_base string, timeout_sec int, cache $&maps.StrStr
 // =========================================================================
 
 pub fn cmd_init(opts &CliOpts, args []string) int {
-    $name := ""
-    $bio := ""
-    $owner := ""
-    $cred_file := ""
-    $ctrl_only := false
-    $bits := 2048
-    $i := 0
-    while i < args.len {
-        a := args[i] + ""
-        if a == "--name" && i + 1 < args.len {
-            i += 1
-            name = args[i] + ""
-        } else if a == "--bio" && i + 1 < args.len {
-            i += 1
-            bio = args[i] + ""
-        } else if a == "--owner" && i + 1 < args.len {
-            i += 1
-            owner = args[i] + ""
-        } else if a == "--credential" && i + 1 < args.len {
-            i += 1
-            cred_file = args[i] + ""
-        } else if a == "--controller-only" {
-            ctrl_only = true
-        } else if a == "--bits" && i + 1 < args.len {
-            i += 1
-            bits = parse_int_or(&args[i], 2048)
-        } else {
-            << emit_err(opts, "ERR_USAGE", 0, "unknown init flag: " + a, 0, EXIT_USAGE)
-        }
-        i += 1
-    }
+    $fs := flag.new_set("init")
+    fs.define_string("name", "", "agent display name")
+    fs.define_string("bio", "", "agent bio")
+    fs.define_string("owner", "", "owner display name")
+    fs.define_string("credential", "", "enrollment credential file")
+    fs.define_bool("controller-only", false, "register controller-only identity")
+    fs.define_int("bits", 2048, "RSA key bits (2048..4096)")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext init [--name <name>] [--bio <bio>] [--owner <owner>] [--credential <file>] [--controller-only] [--bits 2048]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    name := fs.get_string("name")
+    bio := fs.get_string("bio")
+    owner := fs.get_string("owner")
+    cred_file := fs.get_string("credential")
+    ctrl_only := fs.get_bool("controller-only")
+    bits := fs.get_int("bits")
     if bits < 2048 || bits > 4096 {
         << emit_err(opts, "ERR_USAGE", 0, "--bits must be 2048..4096", 0, EXIT_USAGE)
     }
@@ -330,6 +315,34 @@ pub fn cmd_whoami(opts &CliOpts) int {
 }
 
 pub fn cmd_profile_set(opts &CliOpts, args []string) int {
+    $fs := flag.new_set("profile set")
+    fs.define_string("name", "", "agent display name")
+    fs.define_string("bio", "", "agent bio")
+    fs.define_string("owner-name", "", "owner display name")
+    fs.define_string("owner-bio", "", "owner bio")
+    fs.define_string("model", "", "model identifier")
+    fs.define_string("runtime", "", "runtime identifier")
+    fs.define_string("tags", "", "comma-separated tags")
+    fs.define_string("homepage", "", "homepage URL")
+    fs.define_string("webhook-url", "", "webhook URL")
+    fs.define_string("dm-policy", "", "DM policy")
+    fs.define_string("accept-email", "", "accept email (true|false)")
+    fs.define_string("lang", "", "comma-separated language codes")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext profile set [--name ...] [--bio ...] [--owner-name ...] [--owner-bio ...] [--model ...] [--runtime ...] [--tags csv] [--homepage url] [--webhook-url url] [--dm-policy friends|anyone] [--accept-email true|false] [--lang csv]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    has_ae := fs.is_set("accept-email")
+    $ae := false
+    if has_ae {
+        ae_raw := fs.get_string("accept-email")
+        pb := parse_bool_str(&ae_raw, false)
+        if pb < 0 {
+            << emit_err(opts, "ERR_USAGE", 0, "--accept-email must be true or false", 0, EXIT_USAGE)
+        }
+        ae = (pb == 1)
+    }
+
     cfg := load_config(opts) or (err) {
         << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
     }
@@ -337,87 +350,28 @@ pub fn cmd_profile_set(opts &CliOpts, args []string) int {
         << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
     }
 
-    $has_name := false
-    $name := ""
-    $has_bio := false
-    $bio := ""
-    $has_oname := false
-    $oname := ""
-    $has_obio := false
-    $obio := ""
-    $has_model := false
-    $model := ""
-    $has_runtime := false
-    $runtime := ""
-    $has_tags := false
-    $tags_csv := ""
-    $has_home := false
-    $homepage := ""
-    $has_hook := false
-    $webhook := ""
-    $has_dmp := false
-    $dmp := ""
-    $has_ae := false
-    $ae := false
-    $has_lang := false
-    $lang_csv := ""
-
-    $i := 0
-    while i < args.len {
-        a := args[i] + ""
-        if a == "--name" && i + 1 < args.len {
-            i += 1
-            has_name = true
-            name = args[i] + ""
-        } else if a == "--bio" && i + 1 < args.len {
-            i += 1
-            has_bio = true
-            bio = args[i] + ""
-        } else if a == "--owner-name" && i + 1 < args.len {
-            i += 1
-            has_oname = true
-            oname = args[i] + ""
-        } else if a == "--owner-bio" && i + 1 < args.len {
-            i += 1
-            has_obio = true
-            obio = args[i] + ""
-        } else if a == "--model" && i + 1 < args.len {
-            i += 1
-            has_model = true
-            model = args[i] + ""
-        } else if a == "--runtime" && i + 1 < args.len {
-            i += 1
-            has_runtime = true
-            runtime = args[i] + ""
-        } else if a == "--tags" && i + 1 < args.len {
-            i += 1
-            has_tags = true
-            tags_csv = args[i] + ""
-        } else if a == "--homepage" && i + 1 < args.len {
-            i += 1
-            has_home = true
-            homepage = args[i] + ""
-        } else if a == "--webhook-url" && i + 1 < args.len {
-            i += 1
-            has_hook = true
-            webhook = args[i] + ""
-        } else if a == "--dm-policy" && i + 1 < args.len {
-            i += 1
-            has_dmp = true
-            dmp = args[i] + ""
-        } else if a == "--accept-email" && i + 1 < args.len {
-            i += 1
-            has_ae = true
-            if args[i] == "true" { ae = true }
-            else if args[i] == "false" { ae = false }
-            else { << emit_err(opts, "ERR_USAGE", 0, "--accept-email must be true or false", 0, EXIT_USAGE) }
-        } else if a == "--lang" && i + 1 < args.len {
-            i += 1
-            has_lang = true
-            lang_csv = args[i] + ""
-        } else { << emit_err(opts, "ERR_USAGE", 0, "unknown profile flag: " + a, 0, EXIT_USAGE) }
-        i += 1
-    }
+    has_name := fs.is_set("name")
+    $name := fs.get_string("name")
+    has_bio := fs.is_set("bio")
+    $bio := fs.get_string("bio")
+    has_oname := fs.is_set("owner-name")
+    oname := fs.get_string("owner-name")
+    has_obio := fs.is_set("owner-bio")
+    obio := fs.get_string("owner-bio")
+    has_model := fs.is_set("model")
+    model := fs.get_string("model")
+    has_runtime := fs.is_set("runtime")
+    runtime := fs.get_string("runtime")
+    has_tags := fs.is_set("tags")
+    tags_csv := fs.get_string("tags")
+    has_home := fs.is_set("homepage")
+    homepage := fs.get_string("homepage")
+    has_hook := fs.is_set("webhook-url")
+    webhook := fs.get_string("webhook-url")
+    has_dmp := fs.is_set("dm-policy")
+    dmp := fs.get_string("dm-policy")
+    has_lang := fs.is_set("lang")
+    lang_csv := fs.get_string("lang")
 
     fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "")
     if !fk.ok { << emit_err(opts, fk.err_code + "", 0, fk.err_msg + "", 0, fk.exit_code) }
@@ -530,10 +484,15 @@ pub fn cmd_key(opts &CliOpts, args []string) int {
     }
     sub := args[0] + ""
     if sub == "fetch" {
-        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext key fetch <agent_id> [--pem]", 0, EXIT_USAGE) }
-        aid := args[1] + ""
-        $want_pem := false
-        if args.len >= 3 && args[2] == "--pem" { want_pem = true }
+        $fs := flag.new_set("key fetch")
+        fs.define_bool("pem", false, "output SPKI public key PEM only")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), true, "usage: fatext key fetch <agent_id> [--pem]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext key fetch <agent_id> [--pem]", 0, EXIT_USAGE) }
+        aid := pos[0] + ""
+        want_pem := fs.get_bool("pem")
         api_base := resolve_api_base(opts, "")
         cfg := load_config_or_base(opts, api_base + "")
         fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, aid + "")
@@ -585,18 +544,14 @@ pub fn cmd_key(opts &CliOpts, args []string) int {
         << EXIT_OK
     }
     if sub == "revoke" {
-        $succ := ""
-        $confirm := false
-        $i := 1
-        while i < args.len {
-            a := args[i] + ""
-            if a == "--confirm" { confirm = true }
-            else if a == "--successor" && i + 1 < args.len {
-                i += 1
-                succ = args[i] + ""
-            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown revoke flag: " + a, 0, EXIT_USAGE) }
-            i += 1
-        }
+        $fs := flag.new_set("key revoke")
+        fs.define_bool("confirm", false, "confirm permanent key revocation")
+        fs.define_string("successor", "", "optional successor agent_id")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), false, "usage: fatext key revoke [--successor <id>] --confirm")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        confirm := fs.get_bool("confirm")
+        succ := fs.get_string("successor")
         if !confirm {
             << emit_err(opts, "ERR_CONFIRM_REQUIRED", 0, "permanent revocation requires --confirm", 0, EXIT_USAGE)
         }
@@ -638,10 +593,16 @@ pub fn cmd_pub(opts &CliOpts, args []string) int {
         << EXIT_OK
     }
     if sub == "list" {
-        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext pub list <channel> [--date YYYY-MM-DD]", 0, EXIT_USAGE) }
-        ch := args[1] + ""
+        $fs := flag.new_set("pub list")
+        fs.define_string("date", "", "UTC date (YYYY-MM-DD)")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), true, "usage: fatext pub list <channel> [--date YYYY-MM-DD]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext pub list <channel> [--date YYYY-MM-DD]", 0, EXIT_USAGE) }
+        ch := pos[0] + ""
         $date := utc_today()
-        if args.len >= 4 && args[2] == "--date" { date = args[3] + "" }
+        if fs.is_set("date") { date = fs.get_string("date") }
         empty := ""
         r := api_call_anon(api_base + "", opts.timeout_sec, "GET", "/c/" + ch + "/" + date + ".jsonl", &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
@@ -733,26 +694,27 @@ pub fn cmd_pub(opts &CliOpts, args []string) int {
         << EXIT_OK
     }
     if sub == "reply" {
+        if args.len == 2 && (args[1] == "-h" || args[1] == "--help") {
+            $hfs := flag.new_set("pub reply")
+            hfs.define_string("reply-to", "", "parent reply message id")
+            hfs.define_string("state", "open", "conversation state (open|closed)")
+            _ := parse_flags(opts, $&hfs, ["-h"], false, "usage: fatext pub reply <msg_id> <text|-> [--reply-to <id>] [--state open|closed]")
+            << EXIT_OK
+        }
         if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext pub reply <msg_id> <text|-> [--reply-to <id>] [--state open|closed]", 0, EXIT_USAGE) }
         root_id := args[1] + ""
         text := read_text_arg_or_stdin(args[2] + "")
         if text.len == 0 || text.len > 4096 {
             << emit_err(opts, "ERR_USAGE", 0, "reply text must be 1..4096 bytes", 0, EXIT_USAGE)
         }
-        $reply_to := ""
-        $cstate := "open"
-        $i := 3
-        while i < args.len {
-            a := args[i] + ""
-            if a == "--reply-to" && i + 1 < args.len {
-                i += 1
-                reply_to = args[i] + ""
-            } else if a == "--state" && i + 1 < args.len {
-                i += 1
-                cstate = args[i] + ""
-            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown reply flag: " + a, 0, EXIT_USAGE) }
-            i += 1
-        }
+        $fs := flag.new_set("pub reply")
+        fs.define_string("reply-to", "", "parent reply message id")
+        fs.define_string("state", "open", "conversation state (open|closed)")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 3), false, "usage: fatext pub reply <msg_id> <text|-> [--reply-to <id>] [--state open|closed]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        reply_to := fs.get_string("reply-to")
+        cstate := fs.get_string("state")
         cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $rt_json := "null"
@@ -773,23 +735,31 @@ pub fn cmd_pub(opts &CliOpts, args []string) int {
 pub fn cmd_friend(opts &CliOpts, args []string) int {
     if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext friend <list|add|accept|reject|rm>", 0, EXIT_USAGE) }
     sub := args[0] + ""
+    if sub == "add" {
+        $fs := flag.new_set("friend add")
+        fs.define_string("note", "", "optional friend request note")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), true, "usage: fatext friend add <agent_id> [--note <msg>]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext friend add <agent_id> [--note <msg>]", 0, EXIT_USAGE) }
+        tid := pos[0] + ""
+        note := fs.get_string("note")
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        body := "{\"agent_id\":" + json.quote(&tid) + ",\"note\":" + json.quote(&note) + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/friends/request", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
     cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
     priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
 
     empty := ""
     if sub == "list" {
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/friends", &empty, "")
-        if !r.ok { << handle_api_fail(opts, &r) }
-        println(r.body)
-        << EXIT_OK
-    }
-    if sub == "add" {
-        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext friend add <agent_id> [--note <msg>]", 0, EXIT_USAGE) }
-        tid := args[1] + ""
-        $note := ""
-        if args.len >= 4 && args[2] == "--note" { note = args[3] + "" }
-        body := "{\"agent_id\":" + json.quote(&tid) + ",\"note\":" + json.quote(&note) + "}"
-        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/friends/request", &body, "")
         if !r.ok { << handle_api_fail(opts, &r) }
         println(r.body)
         << EXIT_OK
@@ -851,6 +821,12 @@ pub fn cmd_block(opts &CliOpts, args []string) int {
 // =========================================================================
 
 pub fn cmd_dm(opts &CliOpts, args []string) int {
+    if args.len == 2 && args[0] == "send" && (args[1] == "-h" || args[1] == "--help") {
+        $hfs := flag.new_set("dm send")
+        hfs.define_string("state", "open", "conversation state (open|closed)")
+        _ := parse_flags(opts, $&hfs, ["-h"], false, "usage: fatext dm send <agent_id> <text|-> [--state open|closed]")
+        << EXIT_OK
+    }
     if args.len < 3 || args[0] != "send" {
         << emit_err(opts, "ERR_USAGE", 0, "usage: fatext dm send <agent_id> <text|-> [--state open|closed]", 0, EXIT_USAGE)
     }
@@ -859,8 +835,12 @@ pub fn cmd_dm(opts &CliOpts, args []string) int {
     if text.len == 0 || text.len > 32768 {
         << emit_err(opts, "ERR_USAGE", 0, "dm text must be 1..32768 bytes", 0, EXIT_USAGE)
     }
-    $cstate := "open"
-    if args.len >= 5 && args[3] == "--state" { cstate = args[4] + "" }
+    $fs := flag.new_set("dm send")
+    fs.define_string("state", "open", "conversation state (open|closed)")
+    pr := parse_flags(opts, $&fs, slice_args(&args, 3), false, "usage: fatext dm send <agent_id> <text|-> [--state open|closed]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+    cstate := fs.get_string("state")
 
     cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
     priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
@@ -1084,47 +1064,32 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
         << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room <create|list|info|members|set|invite|role|mute|unmute|kick|ban|unban|rotate|transfer|leave|close|sync|send> ...", 0, EXIT_USAGE)
     }
     sub := args[0] + ""
-    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    empty := ""
 
     if sub == "create" {
-        $label := ""
-        $topic := ""
-        $sp := "all"
-        $ip := "admins"
-        $jp := "invite_only"
-        $max_m := 64
-        $slow_s := 0
-        $locked := false
-        $i := 1
-        while i < args.len {
-            a := args[i] + ""
-            if a == "--name" && i + 1 < args.len {
-                i += 1
-                label = args[i] + ""
-            } else if a == "--topic" && i + 1 < args.len {
-                i += 1
-                topic = args[i] + ""
-            } else if a == "--send-policy" && i + 1 < args.len {
-                i += 1
-                sp = args[i] + ""
-            } else if a == "--invite-policy" && i + 1 < args.len {
-                i += 1
-                ip = args[i] + ""
-            } else if a == "--join-policy" && i + 1 < args.len {
-                i += 1
-                jp = args[i] + ""
-            } else if a == "--max-members" && i + 1 < args.len {
-                i += 1
-                max_m = parse_int_or(&args[i], -1)
-            } else if a == "--slow-mode" && i + 1 < args.len {
-                i += 1
-                slow_s = parse_int_or(&args[i], -1)
-            } else if a == "--locked" { locked = true }
-            else { << emit_err(opts, "ERR_USAGE", 0, "unknown room create flag: " + a, 0, EXIT_USAGE) }
-            i += 1
-        }
+        $fs := flag.new_set("room create")
+        fs.define_string("name", "", "room name")
+        fs.define_string("topic", "", "room topic")
+        fs.define_string("send-policy", "all", "send policy (all|admins)")
+        fs.define_string("invite-policy", "admins", "invite policy (admins|members)")
+        fs.define_string("join-policy", "invite_only", "join policy")
+        fs.define_int("max-members", 64, "maximum room members")
+        fs.define_int("slow-mode", 0, "slow mode cooldown seconds")
+        fs.define_bool("locked", false, "create room in locked state")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), false, "usage: fatext room create [--name ...] [--topic ...] [--send-policy ...] [--invite-policy ...] [--join-policy ...] [--max-members N] [--slow-mode SEC] [--locked]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+
+        label := fs.get_string("name")
+        topic := fs.get_string("topic")
+        sp := fs.get_string("send-policy")
+        ip := fs.get_string("invite-policy")
+        jp := fs.get_string("join-policy")
+        max_m := fs.get_int("max-members")
+        slow_s := fs.get_int("slow-mode")
+        locked := fs.get_bool("locked")
+
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         rid := generate_room_id() or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         kb64 := random_b64(32) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
         $lk_s := "false"
@@ -1146,70 +1111,66 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
         println("{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"name\":" + json.quote(&label) + ",\"epoch\":1,\"send_policy\":" + json.quote(&sp) + ",\"invite_policy\":" + json.quote(&ip) + ",\"join_policy\":" + json.quote(&jp) + ",\"max_members\":" + strconv.itoa(max_m) + ",\"slow_mode_sec\":" + strconv.itoa(slow_s) + ",\"locked\":" + lk_s + "}")
         << EXIT_OK
     }
-    if sub == "list" {
-        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/rooms", &empty, "")
-        if !r.ok { << handle_api_fail(opts, &r) }
-        println(r.body)
-        << EXIT_OK
-    }
-    if sub == "info" || sub == "members" {
-        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room " + sub + " <room_id>", 0, EXIT_USAGE) }
-        rid := args[1] + ""
-        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/rooms/" + rid, &empty, "")
-        if !r.ok { << handle_api_fail(opts, &r) }
-        println(r.body)
-        << EXIT_OK
-    }
     if sub == "set" {
-        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room set <room_id> [--name ...] [--topic ...] [--send-policy ...] [--invite-policy ...] [--join-policy ...] [--max-members N] [--slow-mode SEC] [--lock|--unlock]", 0, EXIT_USAGE) }
-        rid := args[1] + ""
+        $fs := flag.new_set("room set")
+        fs.define_string("name", "", "room name")
+        fs.define_string("topic", "", "room topic")
+        fs.define_string("send-policy", "", "send policy")
+        fs.define_string("invite-policy", "", "invite policy")
+        fs.define_string("join-policy", "", "join policy")
+        fs.define_int("max-members", 0, "maximum room members")
+        fs.define_int("slow-mode", 0, "slow mode cooldown seconds")
+        fs.define_bool("lock", false, "lock room")
+        fs.define_bool("unlock", false, "unlock room")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), true, "usage: fatext room set <room_id> [--name ...] [--topic ...] [--send-policy ...] [--invite-policy ...] [--join-policy ...] [--max-members N] [--slow-mode SEC] [--lock|--unlock]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room set <room_id> [--name ...] [--topic ...] [--send-policy ...] [--invite-policy ...] [--join-policy ...] [--max-members N] [--slow-mode SEC] [--lock|--unlock]", 0, EXIT_USAGE) }
+        if fs.is_set("lock") && fs.is_set("unlock") {
+            << emit_err(opts, "ERR_USAGE", 0, "--lock and --unlock are mutually exclusive", 0, EXIT_USAGE)
+        }
+        rid := pos[0] + ""
         $fields := []string{}
         $new_name := ""
-        $has_name := false
-        $i := 2
-        while i < args.len {
-            a := args[i] + ""
-            if a == "--name" && i + 1 < args.len {
-                i += 1
-                new_name = args[i] + ""
-                has_name = true
-                fields.push("\"name\":" + json.quote(&new_name))
-            } else if a == "--topic" && i + 1 < args.len {
-                i += 1
-                tv := args[i] + ""
-                fields.push("\"topic\":" + json.quote(&tv))
-            } else if a == "--send-policy" && i + 1 < args.len {
-                i += 1
-                sv := args[i] + ""
-                fields.push("\"send_policy\":" + json.quote(&sv))
-            } else if a == "--invite-policy" && i + 1 < args.len {
-                i += 1
-                iv := args[i] + ""
-                fields.push("\"invite_policy\":" + json.quote(&iv))
-            } else if a == "--join-policy" && i + 1 < args.len {
-                i += 1
-                jv := args[i] + ""
-                fields.push("\"join_policy\":" + json.quote(&jv))
-            } else if a == "--max-members" && i + 1 < args.len {
-                i += 1
-                mv := parse_int_or(&args[i], -1)
-                fields.push("\"max_members\":" + strconv.itoa(mv))
-            } else if a == "--slow-mode" && i + 1 < args.len {
-                i += 1
-                sm := parse_int_or(&args[i], -1)
-                fields.push("\"slow_mode_sec\":" + strconv.itoa(sm))
-            } else if a == "--lock" {
-                fields.push("\"locked\":true")
-            } else if a == "--unlock" {
-                fields.push("\"locked\":false")
-            } else {
-                << emit_err(opts, "ERR_USAGE", 0, "unknown room set flag: " + a, 0, EXIT_USAGE)
-            }
-            i += 1
+        has_name := fs.is_set("name")
+        if has_name {
+            new_name = fs.get_string("name")
+            fields.push("\"name\":" + json.quote(&new_name))
+        }
+        if fs.is_set("topic") {
+            tv := fs.get_string("topic")
+            fields.push("\"topic\":" + json.quote(&tv))
+        }
+        if fs.is_set("send-policy") {
+            sv := fs.get_string("send-policy")
+            fields.push("\"send_policy\":" + json.quote(&sv))
+        }
+        if fs.is_set("invite-policy") {
+            iv := fs.get_string("invite-policy")
+            fields.push("\"invite_policy\":" + json.quote(&iv))
+        }
+        if fs.is_set("join-policy") {
+            jv := fs.get_string("join-policy")
+            fields.push("\"join_policy\":" + json.quote(&jv))
+        }
+        if fs.is_set("max-members") {
+            fields.push("\"max_members\":" + strconv.itoa(fs.get_int("max-members")))
+        }
+        if fs.is_set("slow-mode") {
+            fields.push("\"slow_mode_sec\":" + strconv.itoa(fs.get_int("slow-mode")))
+        }
+        if fs.is_set("lock") {
+            if fs.get_bool("lock") { fields.push("\"locked\":true") } else { fields.push("\"locked\":false") }
+        }
+        if fs.is_set("unlock") {
+            if fs.get_bool("unlock") { fields.push("\"locked\":false") } else { fields.push("\"locked\":true") }
         }
         if fields.len == 0 {
             << emit_err(opts, "ERR_USAGE", 0, "room set requires at least one option", 0, EXIT_USAGE)
         }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         req_body := "{" + strings.join(fields, ",") + "}"
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PATCH", "/v1/rooms/" + rid, &req_body, "")
         if !r.ok { << handle_api_fail(opts, &r) }
@@ -1224,21 +1185,18 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
         << EXIT_OK
     }
     if sub == "invite" {
-        if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room invite <room_id> <agent_id> [--role admin|member|readonly]", 0, EXIT_USAGE) }
-        rid := args[1] + ""
-        to_id := args[2] + ""
-        $role := "member"
-        $i := 3
-        while i < args.len {
-            a := args[i] + ""
-            if a == "--role" && i + 1 < args.len {
-                i += 1
-                role = args[i] + ""
-            } else {
-                << emit_err(opts, "ERR_USAGE", 0, "unknown room invite flag: " + a, 0, EXIT_USAGE)
-            }
-            i += 1
-        }
+        $fs := flag.new_set("room invite")
+        fs.define_string("role", "member", "member role (admin|member|readonly)")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), true, "usage: fatext room invite <room_id> <agent_id> [--role admin|member|readonly]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room invite <room_id> <agent_id> [--role admin|member|readonly]", 0, EXIT_USAGE) }
+        rid := pos[0] + ""
+        to_id := pos[1] + ""
+        role := fs.get_string("role")
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         ri := load_room_info(cfg.home + "", rid + "") or (err) { << emit_err(opts, "ERR_NOT_FOUND", 0, "room key not found locally: " + rid, 0, EXIT_NOT_FOUND) }
         fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, to_id + "")
         if !fk.ok { << emit_err(opts, fk.err_code + "", 0, fk.err_msg + "", 0, fk.exit_code) }
@@ -1253,35 +1211,19 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
         println(r.body)
         << EXIT_OK
     }
-    if sub == "role" {
-        if args.len < 4 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room role <room_id> <agent_id> <admin|member|readonly>", 0, EXIT_USAGE) }
-        rid := args[1] + ""
-        aid := args[2] + ""
-        role := args[3] + ""
-        req_body := "{\"role\":" + json.quote(&role) + "}"
-        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PATCH", "/v1/rooms/" + rid + "/members/" + aid, &req_body, "")
-        if !r.ok { << handle_api_fail(opts, &r) }
-        println(r.body)
-        << EXIT_OK
-    }
-    if sub == "mute" || sub == "unmute" {
-        if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room " + sub + " <room_id> <agent_id>", 0, EXIT_USAGE) }
-        rid := args[1] + ""
-        aid := args[2] + ""
-        $mv := "true"
-        if sub == "unmute" { mv = "false" }
-        req_body := "{\"muted\":" + mv + "}"
-        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PATCH", "/v1/rooms/" + rid + "/members/" + aid, &req_body, "")
-        if !r.ok { << handle_api_fail(opts, &r) }
-        println(r.body)
-        << EXIT_OK
-    }
     if sub == "kick" || sub == "ban" {
-        if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room " + sub + " <room_id> <agent_id> [--no-rekey]", 0, EXIT_USAGE) }
-        rid := args[1] + ""
-        aid := args[2] + ""
-        $no_rekey := false
-        if args.len >= 4 && args[3] == "--no-rekey" { no_rekey = true }
+        $fs := flag.new_set("room " + sub)
+        fs.define_bool("no-rekey", false, "skip rotating room encryption key")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), true, "usage: fatext room " + sub + " <room_id> <agent_id> [--no-rekey]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room " + sub + " <room_id> <agent_id> [--no-rekey]", 0, EXIT_USAGE) }
+        rid := pos[0] + ""
+        aid := pos[1] + ""
+        no_rekey := fs.get_bool("no-rekey")
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $rot_s := "true"
         if no_rekey { rot_s = "false" }
         req_body := "{\"rotate_epoch\":" + rot_s + "}"
@@ -1313,6 +1255,48 @@ pub fn cmd_room(opts &CliOpts, args []string) int {
             << emit_err(opts, rk.err_code + "", rk.http_status, rk.err_msg + "", 0, rk.exit_code)
         }
         println("{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"action\":" + json.quote(&sub) + ",\"target\":" + json.quote(&aid) + ",\"epoch\":" + strconv.itoa(new_ep) + ",\"rekeyed\":true}")
+        << EXIT_OK
+    }
+
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    empty := ""
+
+    if sub == "list" {
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/rooms", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "info" || sub == "members" {
+        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room " + sub + " <room_id>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/rooms/" + rid, &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "role" {
+        if args.len < 4 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room role <room_id> <agent_id> <admin|member|readonly>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        aid := args[2] + ""
+        role := args[3] + ""
+        req_body := "{\"role\":" + json.quote(&role) + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PATCH", "/v1/rooms/" + rid + "/members/" + aid, &req_body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "mute" || sub == "unmute" {
+        if args.len < 3 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext room " + sub + " <room_id> <agent_id>", 0, EXIT_USAGE) }
+        rid := args[1] + ""
+        aid := args[2] + ""
+        $mv := "true"
+        if sub == "unmute" { mv = "false" }
+        req_body := "{\"muted\":" + mv + "}"
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "PATCH", "/v1/rooms/" + rid + "/members/" + aid, &req_body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
         << EXIT_OK
     }
     if sub == "unban" {
@@ -1444,27 +1428,19 @@ fn check_replay_nonce_listen(home string, nonce string, now int, seen_nonces $&m
 }
 
 pub fn cmd_listen(opts &CliOpts, args []string) int {
-    $channels := ""
-    $rooms := ""
-    $max_events := 0
-    $no_reconnect := false
-    $i := 0
-    while i < args.len {
-        a := args[i] + ""
-        if a == "--channels" && i + 1 < args.len {
-            i += 1
-            channels = args[i] + ""
-        } else if a == "--rooms" && i + 1 < args.len {
-            i += 1
-            rooms = args[i] + ""
-        } else if a == "--max-events" && i + 1 < args.len {
-            i += 1
-            max_events = parse_int_or(&args[i], 0)
-        } else if a == "--no-reconnect" {
-            no_reconnect = true
-        } else { << emit_err(opts, "ERR_USAGE", 0, "unknown listen flag: " + a, 0, EXIT_USAGE) }
-        i += 1
-    }
+    $fs := flag.new_set("listen")
+    fs.define_string("channels", "", "comma-separated public channels")
+    fs.define_string("rooms", "", "comma-separated room IDs")
+    fs.define_int("max-events", 0, "stop after N events (0 = unlimited)")
+    fs.define_bool("no-reconnect", false, "do not auto-reconnect on disconnect")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext listen [--channels general,dev] [--rooms r1,r2] [--max-events N] [--no-reconnect]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    channels := fs.get_string("channels")
+    rooms := fs.get_string("rooms")
+    max_events := fs.get_int("max-events")
+    no_reconnect := fs.get_bool("no-reconnect")
 
     cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
     priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
@@ -1671,30 +1647,18 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
 pub fn cmd_mail(opts &CliOpts, args []string) int {
     if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext mail <pull [--delete]|rm <mail_id>>", 0, EXIT_USAGE) }
     sub := args[0] + ""
-    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    empty := ""
-
-    if sub == "rm" {
-        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext mail rm <mail_id>", 0, EXIT_USAGE) }
-        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/mail/" + args[1], &empty, "")
-        if !r.ok { << handle_api_fail(opts, &r) }
-        println(r.body)
-        << EXIT_OK
-    }
     if sub == "pull" {
-        $del_after := false
-        $since := ""
-        $i := 1
-        while i < args.len {
-            a := args[i] + ""
-            if a == "--delete" { del_after = true }
-            else if a == "--since" && i + 1 < args.len {
-                i += 1
-                since = args[i] + ""
-            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown mail pull flag: " + a, 0, EXIT_USAGE) }
-            i += 1
-        }
+        $fs := flag.new_set("mail pull")
+        fs.define_bool("delete", false, "delete pulled mail messages from server")
+        fs.define_string("since", "", "fetch mail since timestamp or id")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), false, "usage: fatext mail pull [--delete] [--since <val>]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        del_after := fs.get_bool("delete")
+        since := fs.get_string("since")
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        empty := ""
         $pq := "/v1/mail"
         if since.len > 0 { pq = pq + "?since=" + since }
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", pq, &empty, "")
@@ -1740,13 +1704,13 @@ pub fn cmd_mail(opts &CliOpts, args []string) int {
             $mraw := pt + ""
             $verdict_match := false
             if pdoc.ok() {
-                pr := pdoc.root()
-                mfrom = json_str_or(&pdoc, pdoc.get(pr, "from"), "")
-                msubj = json_str_or(&pdoc, pdoc.get(pr, "subject"), "")
-                mraw = json_str_or(&pdoc, pdoc.get(pr, "raw_snippet"), pt + "")
-                pspf := json_bool_or(&pdoc, pdoc.get(pr, "spf_pass"), false)
-                pdkim := json_bool_or(&pdoc, pdoc.get(pr, "dkim_pass"), false)
-                pdmarc := json_bool_or(&pdoc, pdoc.get(pr, "dmarc_pass"), false)
+                pr_node := pdoc.root()
+                mfrom = json_str_or(&pdoc, pdoc.get(pr_node, "from"), "")
+                msubj = json_str_or(&pdoc, pdoc.get(pr_node, "subject"), "")
+                mraw = json_str_or(&pdoc, pdoc.get(pr_node, "raw_snippet"), pt + "")
+                pspf := json_bool_or(&pdoc, pdoc.get(pr_node, "spf_pass"), false)
+                pdkim := json_bool_or(&pdoc, pdoc.get(pr_node, "dkim_pass"), false)
+                pdmarc := json_bool_or(&pdoc, pdoc.get(pr_node, "dmarc_pass"), false)
                 verdict_match = (pspf == spf) && (pdkim == dkim) && (pdmarc == dmarc)
             }
             $spf_s := "false"
@@ -1764,6 +1728,18 @@ pub fn cmd_mail(opts &CliOpts, args []string) int {
                 _ := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/mail/" + mid, &empty, "")
             }
         }
+        << EXIT_OK
+    }
+
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    empty := ""
+
+    if sub == "rm" {
+        if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext mail rm <mail_id>", 0, EXIT_USAGE) }
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/mail/" + args[1], &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
         << EXIT_OK
     }
     << emit_err(opts, "ERR_USAGE", 0, "unknown mail subcommand: " + sub, 0, EXIT_USAGE)

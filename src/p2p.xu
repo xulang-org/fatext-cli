@@ -9,6 +9,7 @@
 #crypto/sha256
 #encoding/base64
 #encoding/json
+#flag
 #net
 #os
 #strconv
@@ -1344,46 +1345,52 @@ fn handle_incoming_p2p_offer(
 }
 
 pub fn cmd_p2p_listen(opts &CliOpts, args []string) int {
+    norm_args := merge_repeatable_flag(&args, "expose")
+    $fs := flag.new_set("p2p listen")
+    fs.define_bool("allow-friends-only", true, "only accept P2P connections from friends")
+    fs.define_bool("allow-anyone", false, "accept P2P connections from non-friends")
+    fs.define_bool("stdio", false, "bridge P2P stream over stdin/stdout")
+    fs.define_bool("star", false, "run multi-peer star hub")
+    fs.define_bool("hub", false, "alias for --star")
+    fs.define_bool("bus", false, "run star JSONL message bus")
+    fs.define_int("max-peers", 32, "maximum concurrent star peers")
+    fs.define_string("expose", "", "comma-separated local TCP ports to expose")
+    fs.define_string("stun", "stun.cloudflare.com:3478", "STUN server host:port or none")
+    pr := parse_flags(opts, $&fs, norm_args, false, "usage: fatext p2p listen [--allow-friends-only|--allow-anyone] [--stdio | --star [--hub] [--bus] [--max-peers N]] [--expose PORTS] [--stun HOST:PORT]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    if fs.is_set("allow-friends-only") && fs.is_set("allow-anyone") {
+        << emit_err(opts, "ERR_USAGE", 0, "--allow-friends-only and --allow-anyone are mutually exclusive", 0, EXIT_USAGE)
+    }
     $friends_only := true
+    if fs.is_set("allow-anyone") {
+        friends_only = !fs.get_bool("allow-anyone")
+    } else if fs.is_set("allow-friends-only") {
+        friends_only = fs.get_bool("allow-friends-only")
+    }
+
+    stdio_mode := fs.get_bool("stdio")
+    bus_mode := fs.get_bool("bus")
+    star_mode := fs.get_bool("star") || fs.get_bool("hub") || bus_mode
+    has_max_peers := fs.is_set("max-peers")
+    $max_peers := fs.get_int("max-peers")
+    stun_hp := fs.get_string("stun")
     $expose_ports := []int{}
-    $stdio_mode := false
-    $star_mode := false
-    $bus_mode := false
-    $max_peers := 32
-    $has_max_peers := false
-    $stun_hp := "stun.cloudflare.com:3478"
-    $i := 0
-    while i < args.len {
-        a := args[i] + ""
-        if a == "--allow-friends-only" {
-            friends_only = true
-        } else if a == "--allow-anyone" {
-            friends_only = false
-        } else if a == "--stdio" {
-            stdio_mode = true
-        } else if a == "--star" || a == "--hub" {
-            star_mode = true
-        } else if a == "--bus" {
-            bus_mode = true
-            star_mode = true
-        } else if a == "--max-peers" && i + 1 < args.len {
-            i += 1
-            max_peers = parse_int_or(&args[i], 32)
-            has_max_peers = true
-        } else if a == "--expose" && i + 1 < args.len {
-            i += 1
-            parts := strings.split(&args[i], ",")
-            for j in 0:parts.len {
-                p := atoi_or_0(&strings.trim_space(&parts[j]))
-                if p > 0 { expose_ports.push(p) }
+    if fs.is_set("expose") {
+        expose_csv := fs.get_string("expose")
+        parts := strings.split(&expose_csv, ",")
+        for j in 0:parts.len {
+            tok := strings.trim_space(&parts[j])
+            if tok.len == 0 { -> }
+            p := strconv.atoi(&tok) or (err) {
+                << emit_err(opts, "ERR_USAGE", 0, "invalid --expose port: " + tok, 0, EXIT_USAGE)
             }
-        } else if a == "--stun" && i + 1 < args.len {
-            i += 1
-            stun_hp = args[i] + ""
-        } else {
-            << emit_err(opts, "ERR_USAGE", 0, "unknown p2p listen flag: " + a, 0, EXIT_USAGE)
+            if p <= 0 || p > 65535 {
+                << emit_err(opts, "ERR_USAGE", 0, "invalid --expose port: " + tok, 0, EXIT_USAGE)
+            }
+            expose_ports.push(p)
         }
-        i += 1
     }
     if stdio_mode && (star_mode || bus_mode) {
         << emit_err(opts, "ERR_USAGE", 0, "--stdio cannot be combined with --star or --bus", 0, EXIT_USAGE)
@@ -1481,45 +1488,46 @@ pub fn cmd_p2p_listen(opts &CliOpts, args []string) int {
 }
 
 pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
-    if args.len < 1 {
+    $fs := flag.new_set("p2p connect")
+    fs.define_string("forward", "", "TCP port forward <local_port>:<remote_port>")
+    fs.define_bool("bus", false, "connect as star bus spoke")
+    fs.define_string("stun", "stun.cloudflare.com:3478", "STUN server host:port or none")
+    fs.define_string("relay", "", "optional relay URL")
+    pr := parse_flags(opts, $&fs, args, true, "usage: fatext p2p connect <agent_id> [--forward L:R | --bus] [--relay URL] [--stun HOST:PORT]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+    pos := fs.args()
+    if pos.len != 1 {
         << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p connect <agent_id> [--forward L:R | --bus] [--relay URL] [--stun HOST:PORT]", 0, EXIT_USAGE)
     }
-    peer_id := args[0] + ""
+    peer_id := pos[0] + ""
     if !is_valid_agent_id(peer_id + "") {
         << emit_err(opts, "ERR_USAGE", 0, "invalid peer agent_id: " + peer_id, 0, EXIT_USAGE)
     }
     $lport_fwd := 0
     $rport_fwd := 0
     $forward_mode := false
-    $bus_mode := false
-    $stun_hp := "stun.cloudflare.com:3478"
-    $i := 1
-    while i < args.len {
-        a := args[i] + ""
-        if a == "--forward" && i + 1 < args.len {
-            i += 1
-            ps := strings.split(&args[i], ":")
-            if ps.len != 2 {
-                << emit_err(opts, "ERR_USAGE", 0, "--forward requires <local_port>:<remote_port>", 0, EXIT_USAGE)
-            }
-            lport_fwd = parse_int_or(&ps[0], 0)
-            rport_fwd = parse_int_or(&ps[1], 0)
-            if lport_fwd <= 0 || rport_fwd <= 0 {
-                << emit_err(opts, "ERR_USAGE", 0, "invalid --forward ports", 0, EXIT_USAGE)
-            }
-            forward_mode = true
-        } else if a == "--bus" {
-            bus_mode = true
-        } else if a == "--stun" && i + 1 < args.len {
-            i += 1
-            stun_hp = args[i] + ""
-        } else if a == "--relay" && i + 1 < args.len {
-            i += 1
-        } else {
-            << emit_err(opts, "ERR_USAGE", 0, "unknown p2p connect flag: " + a, 0, EXIT_USAGE)
+    if fs.is_set("forward") {
+        fwd_spec := fs.get_string("forward")
+        ps := strings.split(&fwd_spec, ":")
+        if ps.len != 2 {
+            << emit_err(opts, "ERR_USAGE", 0, "--forward requires <local_port>:<remote_port>", 0, EXIT_USAGE)
         }
-        i += 1
+        lp := strconv.atoi(&ps[0]) or (err) {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid --forward ports", 0, EXIT_USAGE)
+        }
+        rp := strconv.atoi(&ps[1]) or (err) {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid --forward ports", 0, EXIT_USAGE)
+        }
+        if lp <= 0 || lp > 65535 || rp <= 0 || rp > 65535 {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid --forward ports", 0, EXIT_USAGE)
+        }
+        lport_fwd = lp
+        rport_fwd = rp
+        forward_mode = true
     }
+    bus_mode := fs.get_bool("bus")
+    stun_hp := fs.get_string("stun")
     if forward_mode && bus_mode {
         << emit_err(opts, "ERR_USAGE", 0, "--forward and --bus are mutually exclusive", 0, EXIT_USAGE)
     }

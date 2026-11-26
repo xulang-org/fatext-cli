@@ -7,6 +7,7 @@
 #crypto/sha256
 #encoding/json
 #errors
+#flag
 #net/http
 #os
 #os/exec
@@ -573,36 +574,24 @@ fn fetch_latest_cli_discovery(opts &CliOpts, api_base &string) LatestDiscovery {
 }
 
 pub fn cmd_update(opts &CliOpts, args []string) int {
-    $check_only := false
-    $force := false
-    $req_version := ""
-    $req_prefix := ""
-    $archive_path := ""
-
-    $i := 0
-    while i < args.len {
-        a := args[i] + ""
-        if a == "--help" || a == "-h" {
-            print_update_help()
-            << EXIT_OK
-        } else if a == "--check" {
-            check_only = true
-        } else if a == "--force" {
-            force = true
-        } else if a == "--version" || a == "--prefix" || a == "--archive" {
-            if i + 1 >= args.len {
-                << emit_err(opts, "ERR_USAGE", 0, a + " requires an argument", 0, EXIT_USAGE)
-            }
-            val := args[i + 1] + ""
-            if a == "--version" { req_version = val }
-            else if a == "--prefix" { req_prefix = val }
-            else if a == "--archive" { archive_path = val }
-            i += 1
-        } else {
-            << emit_err(opts, "ERR_USAGE", 0, "unknown option '" + a + "'", 0, EXIT_USAGE)
-        }
-        i += 1
+    $fs := flag.new_set("update")
+    fs.define_bool("check", false, "check latest version without installing")
+    fs.define_bool("force", false, "reinstall even if version matches")
+    fs.define_string("version", "", "target release version")
+    fs.define_string("prefix", "", "install directory prefix")
+    fs.define_string("archive", "", "offline release archive path")
+    pr := parse_flags(opts, $&fs, args, false, "")
+    if pr == FLAG_HELP {
+        print_update_help()
+        << EXIT_OK
     }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    check_only := fs.get_bool("check")
+    force := fs.get_bool("force")
+    $req_version := fs.get_string("version")
+    req_prefix := fs.get_string("prefix")
+    archive_path := fs.get_string("archive")
 
     if archive_path.len > 0 && req_version.len == 0 {
         << emit_err(opts, "ERR_USAGE", 0, "--archive requires --version", 0, EXIT_USAGE)

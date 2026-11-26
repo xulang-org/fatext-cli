@@ -3,6 +3,7 @@
 #crypto/rsa
 #crypto/sha256
 #encoding/json
+#flag
 #os
 #strconv
 #strings
@@ -119,34 +120,25 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
         if rest.len < 1 || rest[0] != "issue" {
             << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl cred issue [--label ...] [--scopes all|csv] [--ttl 30d] [--out <file>]", 0, EXIT_USAGE)
         }
-        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        $lbl := ""
-        $scopes_in := "all"
-        $ttl_s := "30d"
-        $out_path := ""
-        $i := 1
-        while i < rest.len {
-            a := rest[i] + ""
-            if a == "--label" && i + 1 < rest.len {
-                i += 1
-                lbl = rest[i] + ""
-            } else if a == "--scopes" && i + 1 < rest.len {
-                i += 1
-                scopes_in = rest[i] + ""
-            } else if a == "--ttl" && i + 1 < rest.len {
-                i += 1
-                ttl_s = rest[i] + ""
-            } else if a == "--out" && i + 1 < rest.len {
-                i += 1
-                out_path = rest[i] + ""
-            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown cred issue flag: " + a, 0, EXIT_USAGE) }
-            i += 1
-        }
+        $fs := flag.new_set("ctl cred issue")
+        fs.define_string("label", "", "credential label")
+        fs.define_string("scopes", "all", "comma-separated capability scopes or all")
+        fs.define_string("ttl", "30d", "credential lifetime (e.g. 30d, 12h)")
+        fs.define_string("out", "", "output file path")
+        pr := parse_flags(opts, $&fs, slice_args(&rest, 1), false, "usage: fatext ctl cred issue [--label ...] [--scopes all|csv] [--ttl 30d] [--out <file>]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+
+        lbl := fs.get_string("label")
+        scopes_in := fs.get_string("scopes")
+        ttl_s := fs.get_string("ttl")
+        out_path := fs.get_string("out")
         sr := normalize_cli_scopes(&scopes_in)
         if !sr.ok { << emit_err(opts, "ERR_USAGE", 0, "invalid scopes: " + scopes_in, 0, EXIT_USAGE) }
         ttl := parse_ttl_seconds(&ttl_s)
         if ttl < 0 { << emit_err(opts, "ERR_USAGE", 0, "invalid ttl: " + ttl_s, 0, EXIT_USAGE) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         iat := time.now_time().unix()
         $exp := 0
         if ttl > 0 { exp = iat + ttl }
@@ -203,36 +195,27 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
     }
 
     if sub == "grant" {
-        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl grant <agent_id> [--scopes ...] [--ttl 30d] [--label ...] [--proof <file>]", 0, EXIT_USAGE) }
-        aid := rest[0] + ""
-        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-        $lbl := ""
-        $scopes_in := "all"
-        $ttl_s := "30d"
-        $proof_path := ""
-        $i := 1
-        while i < rest.len {
-            a := rest[i] + ""
-            if a == "--label" && i + 1 < rest.len {
-                i += 1
-                lbl = rest[i] + ""
-            } else if a == "--scopes" && i + 1 < rest.len {
-                i += 1
-                scopes_in = rest[i] + ""
-            } else if a == "--ttl" && i + 1 < rest.len {
-                i += 1
-                ttl_s = rest[i] + ""
-            } else if a == "--proof" && i + 1 < rest.len {
-                i += 1
-                proof_path = rest[i] + ""
-            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown grant flag: " + a, 0, EXIT_USAGE) }
-            i += 1
-        }
+        $fs := flag.new_set("ctl grant")
+        fs.define_string("label", "", "credential label")
+        fs.define_string("scopes", "all", "comma-separated capability scopes or all")
+        fs.define_string("ttl", "30d", "credential lifetime (e.g. 30d, 12h)")
+        fs.define_string("proof", "", "adoption proof file")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext ctl grant <agent_id> [--scopes ...] [--ttl 30d] [--label ...] [--proof <file>]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl grant <agent_id> [--scopes ...] [--ttl 30d] [--label ...] [--proof <file>]", 0, EXIT_USAGE) }
+        aid := pos[0] + ""
+        lbl := fs.get_string("label")
+        scopes_in := fs.get_string("scopes")
+        ttl_s := fs.get_string("ttl")
+        proof_path := fs.get_string("proof")
         sr := normalize_cli_scopes(&scopes_in)
         if !sr.ok { << emit_err(opts, "ERR_USAGE", 0, "invalid scopes: " + scopes_in, 0, EXIT_USAGE) }
         ttl := parse_ttl_seconds(&ttl_s)
         if ttl < 0 { << emit_err(opts, "ERR_USAGE", 0, "invalid ttl: " + ttl_s, 0, EXIT_USAGE) }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
 
         afk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, aid + "")
         if !afk.ok { << emit_err(opts, afk.err_code + "", 0, afk.err_msg + "", 0, afk.exit_code) }
@@ -258,10 +241,15 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
     }
 
     if sub == "suspend" {
-        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl suspend <agent_id> [--reason ...]", 0, EXIT_USAGE) }
-        aid := rest[0] + ""
-        $reason := ""
-        if rest.len >= 3 && rest[1] == "--reason" { reason = rest[2] + "" }
+        $fs := flag.new_set("ctl suspend")
+        fs.define_string("reason", "", "suspension reason")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext ctl suspend <agent_id> [--reason ...]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl suspend <agent_id> [--reason ...]", 0, EXIT_USAGE) }
+        aid := pos[0] + ""
+        reason := fs.get_string("reason")
         cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         body := "{\"reason\":" + json.quote(&reason) + "}"
@@ -284,24 +272,19 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
     }
 
     if sub == "revoke" {
-        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl revoke <agent_id> [--successor <id>] [--reason ...] --confirm", 0, EXIT_USAGE) }
-        aid := rest[0] + ""
-        $succ := ""
-        $reason := ""
-        $confirm := false
-        $i := 1
-        while i < rest.len {
-            a := rest[i] + ""
-            if a == "--confirm" { confirm = true }
-            else if a == "--successor" && i + 1 < rest.len {
-                i += 1
-                succ = rest[i] + ""
-            } else if a == "--reason" && i + 1 < rest.len {
-                i += 1
-                reason = rest[i] + ""
-            } else { << emit_err(opts, "ERR_USAGE", 0, "unknown revoke flag: " + a, 0, EXIT_USAGE) }
-            i += 1
-        }
+        $fs := flag.new_set("ctl revoke")
+        fs.define_bool("confirm", false, "confirm permanent revocation")
+        fs.define_string("successor", "", "optional successor agent_id")
+        fs.define_string("reason", "", "revocation reason")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext ctl revoke <agent_id> [--successor <id>] [--reason ...] --confirm")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl revoke <agent_id> [--successor <id>] [--reason ...] --confirm", 0, EXIT_USAGE) }
+        aid := pos[0] + ""
+        succ := fs.get_string("successor")
+        reason := fs.get_string("reason")
+        confirm := fs.get_bool("confirm")
         if !confirm { << emit_err(opts, "ERR_CONFIRM_REQUIRED", 0, "permanent revocation requires --confirm", 0, EXIT_USAGE) }
         cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
@@ -315,34 +298,30 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
     }
 
     if sub == "policy" {
-        if rest.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl policy <agent_id> [--name ...] [--dm-policy ...] [--accept-email true|false] [--clear-webhook]", 0, EXIT_USAGE) }
-        aid := rest[0] + ""
-        $has_name := false
-        $aname := ""
-        $has_dmp := false
-        $dmp := ""
-        $has_ae := false
+        $fs := flag.new_set("ctl policy")
+        fs.define_string("name", "", "agent display name")
+        fs.define_string("dm-policy", "", "DM policy")
+        fs.define_string("accept-email", "", "accept email (true|false)")
+        fs.define_bool("clear-webhook", false, "clear webhook URL")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext ctl policy <agent_id> [--name ...] [--dm-policy ...] [--accept-email true|false] [--clear-webhook]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl policy <agent_id> [--name ...] [--dm-policy ...] [--accept-email true|false] [--clear-webhook]", 0, EXIT_USAGE) }
+        aid := pos[0] + ""
+        has_name := fs.is_set("name")
+        aname := fs.get_string("name")
+        has_dmp := fs.is_set("dm-policy")
+        dmp := fs.get_string("dm-policy")
+        has_ae := fs.is_set("accept-email")
         $ae := false
-        $clear_wh := false
-        $i := 1
-        while i < rest.len {
-            a := rest[i] + ""
-            if a == "--name" && i + 1 < rest.len {
-                i += 1
-                has_name = true
-                aname = rest[i] + ""
-            } else if a == "--dm-policy" && i + 1 < rest.len {
-                i += 1
-                has_dmp = true
-                dmp = rest[i] + ""
-            } else if a == "--accept-email" && i + 1 < rest.len {
-                i += 1
-                has_ae = true
-                ae = (rest[i] == "true" || rest[i] == "1")
-            } else if a == "--clear-webhook" { clear_wh = true }
-            else { << emit_err(opts, "ERR_USAGE", 0, "unknown policy flag: " + a, 0, EXIT_USAGE) }
-            i += 1
+        if has_ae {
+            ae_raw := fs.get_string("accept-email")
+            pb := parse_bool_str(&ae_raw, true)
+            if pb < 0 { << emit_err(opts, "ERR_USAGE", 0, "--accept-email must be true or false", 0, EXIT_USAGE) }
+            ae = (pb == 1)
         }
+        clear_wh := fs.get_bool("clear-webhook")
         cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         $parts := []string{}
@@ -369,11 +348,16 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
 }
 
 pub fn cmd_claim_proof(opts &CliOpts, args []string) int {
-    if args.len < 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext claim-proof <controller_id> [--out <file>]", 0, EXIT_USAGE) }
-    cid := args[0] + ""
+    $fs := flag.new_set("claim-proof")
+    fs.define_string("out", "", "output file path")
+    pr := parse_flags(opts, $&fs, args, true, "usage: fatext claim-proof <controller_id> [--out <file>]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+    pos := fs.args()
+    if pos.len != 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext claim-proof <controller_id> [--out <file>]", 0, EXIT_USAGE) }
+    cid := pos[0] + ""
     if !is_valid_agent_id(cid + "") { << emit_err(opts, "ERR_USAGE", 0, "invalid controller_id", 0, EXIT_USAGE) }
-    $out_path := ""
-    if args.len >= 3 && args[1] == "--out" { out_path = args[2] + "" }
+    out_path := fs.get_string("out")
 
     cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
     priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }

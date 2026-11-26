@@ -3,6 +3,7 @@
 #crypto/rsa
 #crypto/sha256
 #encoding/json
+#flag
 #math/big
 #os
 #strconv
@@ -341,30 +342,29 @@ pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
     for i in 1:args.len { rest.push(args[i] + "") }
 
     if sub == "set" {
-        $vis := "public"
-        $fmt := "markdown"
-        $has_text := false
-        $text_val := ""
-        $file_arg := ""
-        $i := 0
-        while i < rest.len {
-            a := rest[i] + ""
-            if a == "--public" { vis = "public" }
-            else if a == "--private" { vis = "private" }
-            else if a == "--format" && i + 1 < rest.len {
-                i += 1
-                fmt = rest[i] + ""
-            } else if a == "--text" && i + 1 < rest.len {
-                i += 1
-                has_text = true
-                text_val = rest[i] + ""
-            } else if strings.has_prefix(&a, "-") && a != "-" {
-                << emit_err(opts, "ERR_USAGE", 0, "unknown " + kind + " set flag: " + a, 0, EXIT_USAGE)
-            } else {
-                file_arg = a
-            }
-            i += 1
+        $fs := flag.new_set(kind + " set")
+        fs.define_bool("public", false, "make document public")
+        fs.define_bool("private", false, "make document private")
+        fs.define_string("format", "markdown", "document format (markdown|text)")
+        fs.define_string("text", "", "inline document text")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext " + kind + " set [<file|->] [--text <str>] [--public|--private] [--format markdown|text]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        if fs.is_set("public") && fs.is_set("private") {
+            << emit_err(opts, "ERR_USAGE", 0, "--public and --private are mutually exclusive", 0, EXIT_USAGE)
         }
+        pos := fs.args()
+        if pos.len > 1 {
+            << emit_err(opts, "ERR_USAGE", 0, "unexpected argument: " + pos[1], 0, EXIT_USAGE)
+        }
+        $vis := "public"
+        if fs.get_bool("private") { vis = "private" }
+        else if fs.is_set("public") && !fs.get_bool("public") { vis = "private" }
+        fmt := fs.get_string("format")
+        has_text := fs.is_set("text")
+        text_val := fs.get_string("text")
+        $file_arg := ""
+        if pos.len == 1 { file_arg = pos[0] + "" }
         $content := ""
         if has_text {
             content = text_val
@@ -414,21 +414,18 @@ pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
     }
 
     if sub == "get" || sub == "pull" {
-        $target := ""
-        $out_path := ""
-        $i := 0
-        while i < rest.len {
-            a := rest[i] + ""
-            if a == "--out" && i + 1 < rest.len {
-                i += 1
-                out_path = rest[i] + ""
-            } else if strings.has_prefix(&a, "-") {
-                << emit_err(opts, "ERR_USAGE", 0, "unknown " + kind + " " + sub + " flag: " + a, 0, EXIT_USAGE)
-            } else {
-                target = a
-            }
-            i += 1
+        $fs := flag.new_set(kind + " " + sub)
+        fs.define_string("out", "", "output file path")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext " + kind + " " + sub + " [<agent_id>] [--out <file>]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len > 1 {
+            << emit_err(opts, "ERR_USAGE", 0, "unexpected argument: " + pos[1], 0, EXIT_USAGE)
         }
+        $target := ""
+        if pos.len == 1 { target = pos[0] + "" }
+        out_path := fs.get_string("out")
 
         $api_base := resolve_api_base(opts, "")
         cfg_opt := load_config_or_base(opts, api_base + "")
@@ -497,43 +494,62 @@ pub fn cmd_ctl_doc(opts &CliOpts, kind string, args []string) int {
     }
     sub := args[0] + ""
     aid := args[1] + ""
+    if aid == "-h" || aid == "--help" {
+        if sub == "set" {
+            $hfs := flag.new_set("ctl " + kind + " set")
+            hfs.define_bool("public", false, "make document public")
+            hfs.define_bool("private", false, "make document private")
+            hfs.define_bool("lock", false, "lock document against agent edits")
+            hfs.define_bool("unlock", false, "unlock document")
+            hfs.define_string("format", "markdown", "document format (markdown|text)")
+            hfs.define_string("text", "", "inline document text")
+            _ := parse_flags(opts, $&hfs, ["-h"], false, "usage: fatext ctl " + kind + " set <agent_id> [<file|->] [--text <str>] [--public|--private] [--lock|--unlock] [--format markdown|text]")
+            << EXIT_OK
+        }
+        if sub == "get" || sub == "pull" {
+            $hfs := flag.new_set("ctl " + kind + " " + sub)
+            hfs.define_string("out", "", "output file path")
+            _ := parse_flags(opts, $&hfs, ["-h"], false, "usage: fatext ctl " + kind + " " + sub + " <agent_id> [--out <file>]")
+            << EXIT_OK
+        }
+    }
     if !is_valid_agent_id(aid + "") {
         << emit_err(opts, "ERR_USAGE", 0, "invalid agent_id: " + aid, 0, EXIT_USAGE)
     }
-    $rest := []string{}
-    for i in 2:args.len { rest.push(args[i] + "") }
-
-    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    rest := slice_args(&args, 2)
 
     if sub == "set" {
-        $vis := "public"
-        $fmt := "markdown"
-        $locked := false
-        $has_text := false
-        $text_val := ""
-        $file_arg := ""
-        $i := 0
-        while i < rest.len {
-            a := rest[i] + ""
-            if a == "--public" { vis = "public" }
-            else if a == "--private" { vis = "private" }
-            else if a == "--lock" { locked = true }
-            else if a == "--unlock" { locked = false }
-            else if a == "--format" && i + 1 < rest.len {
-                i += 1
-                fmt = rest[i] + ""
-            } else if a == "--text" && i + 1 < rest.len {
-                i += 1
-                has_text = true
-                text_val = rest[i] + ""
-            } else if strings.has_prefix(&a, "-") && a != "-" {
-                << emit_err(opts, "ERR_USAGE", 0, "unknown ctl " + kind + " set flag: " + a, 0, EXIT_USAGE)
-            } else {
-                file_arg = a
-            }
-            i += 1
+        $fs := flag.new_set("ctl " + kind + " set")
+        fs.define_bool("public", false, "make document public")
+        fs.define_bool("private", false, "make document private")
+        fs.define_bool("lock", false, "lock document against agent edits")
+        fs.define_bool("unlock", false, "unlock document")
+        fs.define_string("format", "markdown", "document format (markdown|text)")
+        fs.define_string("text", "", "inline document text")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext ctl " + kind + " set <agent_id> [<file|->] [--text <str>] [--public|--private] [--lock|--unlock] [--format markdown|text]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        if fs.is_set("public") && fs.is_set("private") {
+            << emit_err(opts, "ERR_USAGE", 0, "--public and --private are mutually exclusive", 0, EXIT_USAGE)
         }
+        if fs.is_set("lock") && fs.is_set("unlock") {
+            << emit_err(opts, "ERR_USAGE", 0, "--lock and --unlock are mutually exclusive", 0, EXIT_USAGE)
+        }
+        pos := fs.args()
+        if pos.len > 1 {
+            << emit_err(opts, "ERR_USAGE", 0, "unexpected argument: " + pos[1], 0, EXIT_USAGE)
+        }
+        $vis := "public"
+        if fs.get_bool("private") { vis = "private" }
+        else if fs.is_set("public") && !fs.get_bool("public") { vis = "private" }
+        $locked := false
+        if fs.get_bool("lock") { locked = true }
+        else if fs.is_set("unlock") { locked = !fs.get_bool("unlock") }
+        fmt := fs.get_string("format")
+        has_text := fs.is_set("text")
+        text_val := fs.get_string("text")
+        $file_arg := ""
+        if pos.len == 1 { file_arg = pos[0] + "" }
         $content := ""
         if has_text {
             content = text_val
@@ -550,6 +566,8 @@ pub fn cmd_ctl_doc(opts &CliOpts, kind string, args []string) int {
             << emit_err(opts, "ERR_USAGE", 0, "document exceeds 65536 bytes", 0, EXIT_USAGE)
         }
 
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         empty := ""
         cur_r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents/" + aid + "/docs/" + kind, &empty, "")
         $next_ver := 1
@@ -582,18 +600,14 @@ pub fn cmd_ctl_doc(opts &CliOpts, kind string, args []string) int {
     }
 
     if sub == "get" || sub == "pull" {
-        $out_path := ""
-        $i := 0
-        while i < rest.len {
-            a := rest[i] + ""
-            if a == "--out" && i + 1 < rest.len {
-                i += 1
-                out_path = rest[i] + ""
-            } else {
-                << emit_err(opts, "ERR_USAGE", 0, "unknown ctl " + kind + " " + sub + " flag: " + a, 0, EXIT_USAGE)
-            }
-            i += 1
-        }
+        $fs := flag.new_set("ctl " + kind + " " + sub)
+        fs.define_string("out", "", "output file path")
+        pr := parse_flags(opts, $&fs, rest, false, "usage: fatext ctl " + kind + " " + sub + " <agent_id> [--out <file>]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        out_path := fs.get_string("out")
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         empty := ""
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents/" + aid + "/docs/" + kind, &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
@@ -601,6 +615,9 @@ pub fn cmd_ctl_doc(opts &CliOpts, kind string, args []string) int {
         if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
         << emit_doc_output(opts, kind + "", out_path + "", &dv)
     }
+
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
 
     if sub == "status" {
         empty := ""

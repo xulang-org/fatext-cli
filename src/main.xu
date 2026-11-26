@@ -46,18 +46,65 @@ fn main() int {
         a := argv[i] + ""
         if a == "--json" {
             opts.json_mode = true
-        } else if a == "--config" && i + 1 < argv.len {
+        } else if strings.has_prefix(&a, "--json=") {
+            jv := a[7:a.len]
+            pb := parse_bool_str(&jv, false)
+            if pb < 0 {
+                << emit_err(&opts, "ERR_USAGE", 0, "invalid boolean value for --json: " + jv, 0, EXIT_USAGE)
+            }
+            opts.json_mode = (pb == 1)
+        } else if a == "--config" {
+            if i + 1 >= argv.len {
+                << emit_err(&opts, "ERR_USAGE", 0, "--config requires an argument", 0, EXIT_USAGE)
+            }
             i += 1
             opts.config_path = argv[i] + ""
-        } else if a == "--api" && i + 1 < argv.len {
+        } else if strings.has_prefix(&a, "--config=") {
+            opts.config_path = a[9:a.len]
+        } else if a == "--api" {
+            if i + 1 >= argv.len {
+                << emit_err(&opts, "ERR_USAGE", 0, "--api requires an argument", 0, EXIT_USAGE)
+            }
             i += 1
             opts.api_override = argv[i] + ""
-        } else if a == "--timeout" && i + 1 < argv.len {
-            i += 1
-            opts.timeout_sec = parse_int_or(&args_or(&argv, i), 30)
-        } else if a == "--pow-bits" && i + 1 < argv.len {
-            i += 1
-            opts.pow_bits_override = parse_int_or(&args_or(&argv, i), 0)
+        } else if strings.has_prefix(&a, "--api=") {
+            opts.api_override = a[6:a.len]
+        } else if a == "--timeout" || strings.has_prefix(&a, "--timeout=") {
+            $tv := ""
+            if a == "--timeout" {
+                if i + 1 >= argv.len {
+                    << emit_err(&opts, "ERR_USAGE", 0, "--timeout requires an argument", 0, EXIT_USAGE)
+                }
+                i += 1
+                tv = argv[i] + ""
+            } else {
+                tv = a[10:a.len]
+            }
+            tn := strconv.atoi(&tv) or (err) {
+                << emit_err(&opts, "ERR_USAGE", 0, "invalid integer value for --timeout: " + tv, 0, EXIT_USAGE)
+            }
+            if tn <= 0 {
+                << emit_err(&opts, "ERR_USAGE", 0, "--timeout must be > 0", 0, EXIT_USAGE)
+            }
+            opts.timeout_sec = tn
+        } else if a == "--pow-bits" || strings.has_prefix(&a, "--pow-bits=") {
+            $pv := ""
+            if a == "--pow-bits" {
+                if i + 1 >= argv.len {
+                    << emit_err(&opts, "ERR_USAGE", 0, "--pow-bits requires an argument", 0, EXIT_USAGE)
+                }
+                i += 1
+                pv = argv[i] + ""
+            } else {
+                pv = a[11:a.len]
+            }
+            pn := strconv.atoi(&pv) or (err) {
+                << emit_err(&opts, "ERR_USAGE", 0, "invalid integer value for --pow-bits: " + pv, 0, EXIT_USAGE)
+            }
+            if pn < 0 {
+                << emit_err(&opts, "ERR_USAGE", 0, "--pow-bits must be >= 0", 0, EXIT_USAGE)
+            }
+            opts.pow_bits_override = pn
         } else if (a == "--version" || a == "-V") && pos.len == 0 {
             if opts.json_mode {
                 println("{\"version\":" + "\"" + CLI_VERSION + "\",\"target\":\"" + BUILD_TARGET + "\",\"commit\":\"" + BUILD_COMMIT + "\"}")
@@ -120,9 +167,4 @@ fn main() int {
     }
 
     << emit_err(&opts, "ERR_USAGE", 0, "unknown command: " + cmd, 0, EXIT_USAGE)
-}
-
-fn args_or(argv &[]string, idx int) string {
-    if idx >= 0 && idx < argv.len { << argv[idx] + "" }
-    << ""
 }

@@ -1,0 +1,98 @@
+@main
+
+#flag
+#strconv
+#strings
+
+pub const FLAG_OK = 0
+pub const FLAG_HELP = 1
+pub const FLAG_ERR = 2
+
+pub fn slice_args(args &[]string, start int) []string {
+    $out := []string{}
+    $s := start
+    if s < 0 { s = 0 }
+    for i in s:args.len {
+        out.push(args[i] + "")
+    }
+    << out
+}
+
+pub fn parse_flags(opts &CliOpts, fs $&flag.Set, args []string, allow_pos bool, usage string) int {
+    fs.parse(args) or (err) {
+        msg := err.msg()
+        if msg == "flag: help requested" {
+            if usage.len > 0 {
+                println(usage)
+                fs.print_defaults()
+            }
+            << FLAG_HELP
+        }
+        _ := emit_err(opts, "ERR_USAGE", 0, msg + "", 0, EXIT_USAGE)
+        << FLAG_ERR
+    }
+    if !allow_pos && fs.narg() > 0 {
+        _ := emit_err(opts, "ERR_USAGE", 0, "unexpected argument: " + fs.arg(0), 0, EXIT_USAGE)
+        << FLAG_ERR
+    }
+    << FLAG_OK
+}
+
+pub fn parse_bool_str(val &string, allow_numeric bool) int {
+    v := val + ""
+    if v == "true" { << 1 }
+    if v == "false" { << 0 }
+    if allow_numeric {
+        if v == "1" { << 1 }
+        if v == "0" { << 0 }
+    }
+    << -1
+}
+
+pub fn merge_repeatable_flag(args &[]string, flag_name string) []string {
+    long_fl := "--" + flag_name
+    short_fl := "-" + flag_name
+    long_eq := long_fl + "="
+    short_eq := short_fl + "="
+    $out := []string{}
+    $collected := []string{}
+    $dd_idx := args.len
+    $i := 0
+    while i < args.len {
+        a := args[i] + ""
+        if a == "--" {
+            dd_idx = i
+            <-
+        }
+        if a == long_fl || a == short_fl {
+            if i + 1 < args.len {
+                collected.push(args[i + 1] + "")
+                i += 2
+                ->
+            }
+            out.push(a)
+            i += 1
+            ->
+        }
+        if strings.has_prefix(&a, long_eq + "") {
+            collected.push(a[long_eq.len:a.len])
+            i += 1
+            ->
+        }
+        if strings.has_prefix(&a, short_eq + "") {
+            collected.push(a[short_eq.len:a.len])
+            i += 1
+            ->
+        }
+        out.push(a)
+        i += 1
+    }
+    if collected.len > 0 {
+        out.push(long_fl)
+        out.push(join_ref(&collected, ","))
+    }
+    for j in dd_idx:args.len {
+        out.push(args[j] + "")
+    }
+    << out
+}

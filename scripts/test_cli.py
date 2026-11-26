@@ -1510,6 +1510,17 @@ def run_self_update_tests():
             assert_eq(ores["verified"], False, "offline archive verified=false")
             assert_eq(ores["version"], "1.2.0", "offline version")
 
+            # 7b. Offline --archive= --version= --prefix= equals syntax
+            prefix_eq = os.path.join(td, "prefix_eq")
+            os.makedirs(prefix_eq, exist_ok=True)
+            rc, out, err = run_cli(
+                ["--json=true", f"--timeout=15", "update", f"--archive={arch_file}", "--version=1.2.0", f"--prefix={prefix_eq}"],
+                api_url=api_url,
+            )
+            assert_eq(rc, 0, f"offline --flag=value update failed: {err}")
+            oeq = json.loads(out.strip())
+            assert_eq(oeq["version"], "1.2.0", "offline --flag=value version")
+
             # 8. min_version unsupported detection in update --check
             mock_cfg["min_version"] = "1.1.0"
             rc, out, err = run_cli(["--json", "update", "--check"], api_url=api_url)
@@ -1522,6 +1533,57 @@ def run_self_update_tests():
             srv.server_close()
 
 
+def run_flag_tests():
+    # Subcommand --help exits 0 and renders #flag usage/defaults
+    help_cases = [
+        (["init", "--help"], "--bits"),
+        (["profile", "set", "--help"], "--accept-email"),
+        (["room", "create", "--help"], "--max-members"),
+        (["p2p", "listen", "--help"], "--expose"),
+        (["ctl", "grant", "--help"], "--scopes"),
+        (["ctl", "soul", "set", "--help"], "--lock"),
+        (["soul", "set", "--help"], "--private"),
+        (["update", "--help"], "--archive"),
+    ]
+    for argv, needle in help_cases:
+        rc, out, err = run_cli(argv)
+        assert_eq(rc, 0, f"{argv} expected rc=0, got rc={rc} err={err}")
+        assert_true(needle in out, f"{argv} expected {needle!r} in output: {out}")
+
+    # --flag=value positive smoke checks
+    rc, out, err = run_cli(["--json", "--timeout=15", "version", "--check=false"])
+    assert_eq(rc, 0, f"version --check=false failed: {err}")
+    assert_true('"version"' in out, f"unexpected version json: {out}")
+
+    # Strict validation -> exit 2 (EXIT_USAGE) + JSON ERR_USAGE
+    bad_cases = [
+        ["--json", "init", "--bits=abc"],
+        ["--json", "room", "create", "--max-members=abc"],
+        ["--json", "--timeout=abc", "version"],
+        ["--json", "version", "--bogus"],
+        ["--json", "init", "unexpected_pos"],
+        ["--json", "profile", "set", "--accept-email=maybe"],
+        ["--json", "room", "set", "rm_123456789012", "--lock", "--unlock"],
+        ["--json", "soul", "set", "--text", "hi", "--public", "--private"],
+        ["--json", "p2p", "listen", "--allow-friends-only", "--allow-anyone"],
+        ["--json", "p2p", "listen", "--expose", "8080", "--expose=notaport"],
+    ]
+    for argv in bad_cases:
+        rc, _, err = run_cli(argv)
+        assert_eq(rc, 2, f"{argv} expected rc=2, got rc={rc} err={err}")
+        edoc = json.loads(err.strip())
+        assert_eq(edoc["ok"], False, f"{argv} ok=false")
+        assert_eq(edoc["error"]["code"], "ERR_USAGE", f"{argv} ERR_USAGE")
+
+    # Repeatable --expose + --expose= merged before conflict validation
+    rc, _, err = run_cli(["--json", "p2p", "listen", "--expose", "8080", "--expose=9090", "--stdio", "--star"])
+    assert_eq(rc, 2, f"repeatable --expose conflict check failed: rc={rc} err={err}")
+    edoc = json.loads(err.strip())
+    assert_eq(edoc["error"]["code"], "ERR_USAGE", "conflict code ERR_USAGE")
+    assert_true("--stdio" in edoc["error"]["message"], f"expected --stdio conflict error, got {edoc}")
+    print("  [flag] #flag parsing & validation checks PASSED")
+
+
 def main():
     if not os.path.isfile(CLI_BIN):
         raise SystemExit(f"Missing CLI binary: {CLI_BIN}. Run `make build` first.")
@@ -1530,6 +1592,7 @@ def main():
     if "--suite-b-only" not in sys.argv[1:]:
         run_suite_a()
     run_suite_b()
+    run_flag_tests()
     print("ALL TESTS PASSED")
 
 

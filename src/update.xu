@@ -16,6 +16,7 @@
 #strings
 
 const UPDATE_MAX_BYTES = 134217728
+const OFFICIAL_KEY_PIN_FP = ""
 const TERM_BAR_CELLS = 24
 const TERM_SIZE_WIDTH = 11
 const TERM_PERCENT_WIDTH = 5
@@ -392,6 +393,23 @@ fn lookup_sha256sum(sums_text &string, filename &string) string {
     << ""
 }
 
+fn is_loopback_http_url(u &string) bool {
+    if !strings.has_prefix(u, "http://") { << false }
+    rest := u[7:u.len] + ""
+    $end := rest.len
+    for i in 0:rest.len {
+        c := rest[i] & 255
+        if c == 47 || c == 63 || c == 35 {
+            end = i
+            <-
+        }
+    }
+    auth := strings.to_lower(&rest[0:end])
+    << auth == "127.0.0.1" || strings.has_prefix(&auth, "127.0.0.1:") ||
+       auth == "localhost" || strings.has_prefix(&auth, "localhost:") ||
+       auth == "[::1]" || strings.has_prefix(&auth, "[::1]:")
+}
+
 fn verify_and_download_archive(
     api_base &string,
     timeout_sec int,
@@ -401,15 +419,28 @@ fn verify_and_download_archive(
     req_explicit_ver bool,
     show_progress bool
 ) string {
+    if !strings.has_prefix(api_base, "https://") && !is_loopback_http_url(api_base) {
+        >> errors.new("CRYPTO_VERIFY_FAILED: refusing plaintext HTTP update URL: " + api_base)
+    }
     $dl_timeout_sec := timeout_sec
     if dl_timeout_sec < 60 { dl_timeout_sec = 60 }
     timeout_ns := dl_timeout_sec * 1000000000
     dl_base := strip_trailing_slash(api_base) + "/dl"
 
-    // 1. Fetch & self-verify ftx_fatextoffice official key
+    // 1. Fetch & self-verify ftx_fatextoffice official key (+ optional fingerprint pin)
     fk := fetch_agent_key(api_base + "", timeout_sec, "ftx_fatextoffice")
     if !fk.ok || !fk.self_sig_valid || fk.status != "active" {
         >> errors.new("failed to verify active official ftx_fatextoffice public key: " + fk.err_msg)
+    }
+    $expected_fp := strings.trim_space(&os.getenv("FATEXT_OFFICIAL_KEY_FP"))
+    if expected_fp.len == 0 {
+        expected_fp = OFFICIAL_KEY_PIN_FP
+    }
+    if expected_fp.len > 0 {
+        actual_fp := pubkey_fingerprint(&fk.pub_pem)
+        if actual_fp != expected_fp {
+            >> errors.new("CRYPTO_VERIFY_FAILED: official key fingerprint mismatch (expected " + expected_fp + ", got " + actual_fp + ")")
+        }
     }
 
     // 2. Fetch SHA256SUMS + SHA256SUMS.sig and verify RSA-PSS signature

@@ -314,10 +314,21 @@ fn hub_stdin_bridge(bus_ch chan BusMsg) {
     }
 }
 
+struct P2PCiphers {
+    pub tx aes.Cipher
+    pub rx aes.Cipher
+}
+
+fn make_p2p_ciphers(tx_key &string, rx_key &string) P2PCiphers {
+    tx := aes.new_cipher(tx_key) or >>
+    rx := aes.new_cipher(rx_key) or >>
+    << P2PCiphers{tx: tx, rx: rx}
+}
+
 fn p2p_star_forward_worker(
     opts CliOpts,
     pconn_in net.PacketConn,
-    ciph aes.Cipher,
+    ciph P2PCiphers,
     sess string,
     from_id string,
     cands []net.UDPAddr,
@@ -334,7 +345,7 @@ fn p2p_star_forward_worker(
 fn p2p_punch_only(
     opts &CliOpts,
     pconn $&net.PacketConn,
-    ciph &aes.Cipher,
+    ciph &P2PCiphers,
     session string,
     peer_id string,
     cands &[]net.UDPAddr
@@ -343,7 +354,7 @@ fn p2p_punch_only(
     t_start := time.now_time().unix()
     for round in 0:200 {
         if time.now_time().unix() - t_start > 10 { <- }
-        punch_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_PUNCH, 0, &empty)
+        punch_pkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_PUNCH, 0, &empty)
         if punch_pkt.len > 0 {
             for i in 0:cands.len {
                 pconn_write_q(pconn, &punch_pkt, &cands[i])
@@ -351,11 +362,11 @@ fn p2p_punch_only(
         }
         pconn_deadline_q(pconn, 50000000)
         upkt := pconn.read_from(4096) or (err) { -> }
-        opened := p2p_open_packet(ciph, session + "", &upkt.data)
+        opened := p2p_open_packet(&ciph.rx, session + "", &upkt.data)
         if opened.ok {
             pa := net.UDPAddr{ip: upkt.addr.ip + "", port: upkt.addr.port, zone: ""}
             if opened.ptype == P2P_PKT_PUNCH {
-                ack_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_ACK, 0, &empty)
+                ack_pkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_ACK, 0, &empty)
                 if ack_pkt.len > 0 { pconn_write_q(pconn, &ack_pkt, &pa) }
                 << pa
             } else if opened.ptype == P2P_PKT_ACK {
@@ -370,7 +381,7 @@ fn p2p_punch_only(
 fn p2p_star_bus_worker(
     opts CliOpts,
     pconn_in net.PacketConn,
-    ciph aes.Cipher,
+    ciph P2PCiphers,
     sess string,
     from_id string,
     cands []net.UDPAddr,
@@ -427,7 +438,7 @@ fn p2p_star_bus_worker(
                 tx_head = 0
             }
             bytes_out += ch_s.len
-            dpkt := seal_pkt_q(&ciph, sess + "", P2P_PKT_DATA, seq, &ch_s)
+            dpkt := seal_pkt_q(&ciph.tx, sess + "", P2P_PKT_DATA, seq, &ch_s)
             if dpkt.len > 0 {
                 pconn_write_q($&pconn, &dpkt, &peer_addr)
                 wait_ack = true
@@ -450,7 +461,7 @@ fn p2p_star_bus_worker(
         }
 
         if !wait_ack && time.now() - last_tx_ns >= 15000000000 {
-            send_ctrl_pkt_q($&pconn, &ciph, sess + "", P2P_PKT_PING, &peer_addr)
+            send_ctrl_pkt_q($&pconn, &ciph.tx, sess + "", P2P_PKT_PING, &peer_addr)
             last_tx_ns = time.now()
         }
 
@@ -459,18 +470,18 @@ fn p2p_star_bus_worker(
         pconn_deadline_q($&pconn, dl)
         upkt := read_from_or($&pconn, 65535)
         if upkt.data.len > 0 {
-            opened := p2p_open_packet(&ciph, sess + "", &upkt.data)
+            opened := p2p_open_packet(&ciph.rx, sess + "", &upkt.data)
             if opened.ok {
                 if opened.ptype == P2P_PKT_ACK {
                     if wait_ack && opened.seq == unacked_seq {
                         wait_ack = false
                     }
                 } else if opened.ptype == P2P_PKT_PUNCH {
-                    send_ack_q($&pconn, &ciph, sess + "", 0, &peer_addr)
+                    send_ack_q($&pconn, &ciph.tx, sess + "", 0, &peer_addr)
                 } else if opened.ptype == P2P_PKT_PING {
-                    send_ctrl_pkt_q($&pconn, &ciph, sess + "", P2P_PKT_PONG, &peer_addr)
+                    send_ctrl_pkt_q($&pconn, &ciph.tx, sess + "", P2P_PKT_PONG, &peer_addr)
                 } else if opened.ptype == P2P_PKT_DATA {
-                    send_ack_q($&pconn, &ciph, sess + "", opened.seq, &peer_addr)
+                    send_ack_q($&pconn, &ciph.tx, sess + "", opened.seq, &peer_addr)
                     if opened.seq >= expected_seq {
                         bytes_in += opened.data.len
                         expected_seq = opened.seq + 1
@@ -502,7 +513,7 @@ fn p2p_star_bus_worker(
 fn p2p_bus_client_session(
     opts &CliOpts,
     pconn $&net.PacketConn,
-    ciph &aes.Cipher,
+    ciph &P2PCiphers,
     sess string,
     peer_id string,
     self_id string,
@@ -569,7 +580,7 @@ fn p2p_bus_client_session(
                 tx_head = 0
             }
             bytes_out += ch_s.len
-            dpkt := seal_pkt_q(ciph, sess + "", P2P_PKT_DATA, seq, &ch_s)
+            dpkt := seal_pkt_q(&ciph.tx, sess + "", P2P_PKT_DATA, seq, &ch_s)
             if dpkt.len > 0 {
                 pconn_write_q(pconn, &dpkt, &peer_addr)
                 wait_ack = true
@@ -592,7 +603,7 @@ fn p2p_bus_client_session(
         }
 
         if stdin_eof && tx_head >= tx_q.len && !wait_ack {
-            fin_pkt := seal_pkt_q(ciph, sess + "", P2P_PKT_FIN, seq, &empty)
+            fin_pkt := seal_pkt_q(&ciph.tx, sess + "", P2P_PKT_FIN, seq, &empty)
             if fin_pkt.len > 0 {
                 for r in 0:3 { pconn_write_q(pconn, &fin_pkt, &peer_addr) }
             }
@@ -601,7 +612,7 @@ fn p2p_bus_client_session(
         }
 
         if !wait_ack && time.now() - last_tx_ns >= 15000000000 {
-            send_ctrl_pkt_q(pconn, ciph, sess + "", P2P_PKT_PING, &peer_addr)
+            send_ctrl_pkt_q(pconn, &ciph.tx, sess + "", P2P_PKT_PING, &peer_addr)
             last_tx_ns = time.now()
         }
 
@@ -610,16 +621,16 @@ fn p2p_bus_client_session(
         pconn_deadline_q(pconn, dl)
         upkt := read_from_or(pconn, 65535)
         if upkt.data.len > 0 {
-            opened := p2p_open_packet(ciph, sess + "", &upkt.data)
+            opened := p2p_open_packet(&ciph.rx, sess + "", &upkt.data)
             if opened.ok {
                 if opened.ptype == P2P_PKT_ACK {
                     if wait_ack && opened.seq == unacked_seq {
                         wait_ack = false
                     }
                 } else if opened.ptype == P2P_PKT_PING {
-                    send_ctrl_pkt_q(pconn, ciph, sess + "", P2P_PKT_PONG, &peer_addr)
+                    send_ctrl_pkt_q(pconn, &ciph.tx, sess + "", P2P_PKT_PONG, &peer_addr)
                 } else if opened.ptype == P2P_PKT_DATA {
-                    send_ack_q(pconn, ciph, sess + "", opened.seq, &peer_addr)
+                    send_ack_q(pconn, &ciph.tx, sess + "", opened.seq, &peer_addr)
                     if opened.seq >= expected_seq {
                         bytes_in += opened.data.len
                         expected_seq = opened.seq + 1
@@ -644,10 +655,6 @@ fn p2p_bus_client_session(
 
     p2p_log(opts, "closed", sess + "", peer_id + "", "\"bytes_in\":" + strconv.itoa(bytes_in) + ",\"bytes_out\":" + strconv.itoa(bytes_out))
     << EXIT_OK
-}
-
-fn gen_sess_or() string {
-    << generate_session_id() or (err) { << "s_0000000000000000" }
 }
 
 fn p2p_log(opts &CliOpts, state string, session string, peer string, extra_json string) {
@@ -712,9 +719,17 @@ pub fn stun_discover(pconn &net.PacketConn, stun_hp string) string {
     resp := pconn.read_from(2048) or (err) { << "" }
     d := resp.data + ""
     if d.len < 20 { << "" }
-    // Verify magic cookie & transaction id
+    // Verify STUN Binding Success Response (0x0101), magic cookie & 12-byte transaction id
+    if (d[0] & 255) != 1 || (d[1] & 255) != 1 {
+        << ""
+    }
     if (d[4] & 255) != 33 || (d[5] & 255) != 18 || (d[6] & 255) != 164 || (d[7] & 255) != 66 {
         << ""
+    }
+    for ti in 0:12 {
+        if (d[8 + ti] & 255) != (tx[ti] & 255) {
+            << ""
+        }
     }
     $off := 20
     while off + 4 <= d.len {
@@ -747,8 +762,19 @@ pub fn stun_discover(pconn &net.PacketConn, stun_hp string) string {
     << ""
 }
 
-fn p2p_derive_key(session string, shared_secret &string) string {
-    << sha256.sum256_bytes("fatext-p2p-v1\n" + session + "\n" + (shared_secret + ""))
+fn p2p_derive_dir_key(
+    dir string,
+    session string,
+    init_id string,
+    resp_id string,
+    init_xpub string,
+    resp_xpub string,
+    shared_secret &string
+) string {
+    << sha256.sum256_bytes(
+        "fatext-p2p-v2\n" + dir + "\n" + session + "\n" +
+        init_id + "\n" + resp_id + "\n" + init_xpub + "\n" + resp_xpub + "\n" + (shared_secret + "")
+    )
 }
 
 fn p2p_seal_packet(ciph &aes.Cipher, session string, ptype int, seq int, payload &string) string {
@@ -838,14 +864,34 @@ fn build_candidates_json(lport int, srflx string) string {
     << "[" + strings.join(cands, ",") + "]"
 }
 
+fn udp_addr_from_literal(hp string) net.UDPAddr {
+    parts := parse_host_port(hp + "")
+    if parts.len != 2 {
+        >> errors.new("p2p: invalid candidate host:port")
+    }
+    port := strconv.atoi(&parts[1]) or >>
+    if port <= 0 || port > 65535 {
+        >> errors.new("p2p: invalid candidate port")
+    }
+    ip := net.parse_ip(&parts[0])
+    if ip.len != 4 {
+        >> errors.new("p2p: candidate must be IPv4 literal")
+    }
+    if (ip[0] & 255) == 0 && (ip[1] & 255) == 0 && (ip[2] & 255) == 0 && (ip[3] & 255) == 0 {
+        >> errors.new("p2p: zero candidate IP not allowed")
+    }
+    << net.UDPAddr{ip: ip, port: port, zone: ""}
+}
+
 fn extract_candidate_addrs(doc &json.Doc, arr_node int) []net.UDPAddr {
     $out := []net.UDPAddr{}
     if !doc.is_list(arr_node) { << out }
     for i in 0:doc.count(arr_node) {
+        if out.len >= 8 { <- }
         el := doc.at(arr_node, i)
         if doc.is_dict(el) && doc.has(el, "a") {
             astr := json_str_or(doc, doc.get(el, "a"), "")
-            addr := udp_addr_from_str(astr + "") or (err) { -> }
+            addr := udp_addr_from_literal(astr + "") or (err) { -> }
             out.push(addr)
         }
     }
@@ -855,7 +901,7 @@ fn extract_candidate_addrs(doc &json.Doc, arr_node int) []net.UDPAddr {
 fn p2p_punch_and_session(
     opts &CliOpts,
     pconn $&net.PacketConn,
-    ciph &aes.Cipher,
+    ciph &P2PCiphers,
     session string,
     peer_id string,
     cands &[]net.UDPAddr,
@@ -877,7 +923,7 @@ fn p2p_punch_and_session(
     // Hole punching loop up to 10s
     for round in 0:200 {
         if time.now_time().unix() - t_start > 10 { <- }
-        punch_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_PUNCH, 0, &empty)
+        punch_pkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_PUNCH, 0, &empty)
         if punch_pkt.len > 0 {
             for i in 0:cands.len {
                 ca := &cands[i]
@@ -888,11 +934,11 @@ fn p2p_punch_and_session(
         upkt := pconn.read_from(4096) or (err) {
             ->
         }
-        opened := p2p_open_packet(ciph, session + "", &upkt.data)
+        opened := p2p_open_packet(&ciph.rx, session + "", &upkt.data)
         if opened.ok {
             peer_addr = net.UDPAddr{ip: upkt.addr.ip + "", port: upkt.addr.port, zone: ""}
             if opened.ptype == P2P_PKT_PUNCH {
-                ack_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_ACK, 0, &empty)
+                ack_pkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_ACK, 0, &empty)
                 if ack_pkt.len > 0 {
                     pconn_write_q(pconn, &ack_pkt, &peer_addr)
                 }
@@ -902,7 +948,7 @@ fn p2p_punch_and_session(
                 connected = true
                 <-
             } else if opened.ptype == P2P_PKT_DATA {
-                send_ack_q(pconn, ciph, session + "", opened.seq, &peer_addr)
+                send_ack_q(pconn, &ciph.tx, session + "", opened.seq, &peer_addr)
                 if opened.seq >= expected_seq {
                     if stdio_mode && !is_initiator {
                         bytes_in += opened.data.len
@@ -950,7 +996,7 @@ fn p2p_punch_and_session(
                 for ci in 0:chunks.len {
                     ch_s := chunks[ci] + ""
                     bytes_out += ch_s.len
-                    dpkt := p2p_seal_packet(ciph, session + "", P2P_PKT_DATA, seq, &ch_s) or (err) {
+                    dpkt := p2p_seal_packet(&ciph.tx, session + "", P2P_PKT_DATA, seq, &ch_s) or (err) {
                         aborted = true
                         <-
                     }
@@ -967,14 +1013,14 @@ fn p2p_punch_and_session(
                             pconn_deadline_q(pconn, 10000000)
                             upkt := read_from_or(pconn, 65535)
                             if upkt.data.len > 0 {
-                                opened := p2p_open_packet(ciph, session + "", &upkt.data)
+                                opened := p2p_open_packet(&ciph.rx, session + "", &upkt.data)
                                 if opened.ok {
                                     if opened.ptype == P2P_PKT_ACK && opened.seq == seq {
                                         ack_ok = true
                                     } else if opened.ptype == P2P_PKT_PUNCH {
-                                        send_ack_q(pconn, ciph, session + "", 0, &peer_addr)
+                                        send_ack_q(pconn, &ciph.tx, session + "", 0, &peer_addr)
                                     } else if opened.ptype == P2P_PKT_PING {
-                                        send_ctrl_pkt_q(pconn, ciph, session + "", P2P_PKT_PONG, &peer_addr)
+                                        send_ctrl_pkt_q(pconn, &ciph.tx, session + "", P2P_PKT_PONG, &peer_addr)
                                     }
                                 }
                             }
@@ -984,7 +1030,7 @@ fn p2p_punch_and_session(
                     seq += 1
                 }
             }
-            fin_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_FIN, seq, &empty)
+            fin_pkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_FIN, seq, &empty)
             if fin_pkt.len > 0 {
                 for r in 0:3 {
                     pconn_write_q(pconn, &fin_pkt, &peer_addr)
@@ -1001,18 +1047,18 @@ fn p2p_punch_and_session(
                     ->
                 }
                 idle = 0
-                opened := p2p_open_packet(ciph, session + "", &upkt.data)
+                opened := p2p_open_packet(&ciph.rx, session + "", &upkt.data)
                 if !opened.ok { -> }
                 if opened.ptype == P2P_PKT_PUNCH {
-                    send_ack_q(pconn, ciph, session + "", 0, &peer_addr)
+                    send_ack_q(pconn, &ciph.tx, session + "", 0, &peer_addr)
                     ->
                 }
                 if opened.ptype == P2P_PKT_PING {
-                    send_ctrl_pkt_q(pconn, ciph, session + "", P2P_PKT_PONG, &peer_addr)
+                    send_ctrl_pkt_q(pconn, &ciph.tx, session + "", P2P_PKT_PONG, &peer_addr)
                     ->
                 }
                 if opened.ptype == P2P_PKT_DATA {
-                    send_ack_q(pconn, ciph, session + "", opened.seq, &peer_addr)
+                    send_ack_q(pconn, &ciph.tx, session + "", opened.seq, &peer_addr)
                     if opened.seq >= expected_seq {
                         bytes_in += opened.data.len
                         fd_write_q(1, opened.data + "")
@@ -1073,7 +1119,7 @@ fn p2p_punch_and_session(
                     tx_head = 0
                 }
                 bytes_out += ch_s.len
-                dpkt := seal_pkt_q(ciph, session + "", P2P_PKT_DATA, seq, &ch_s)
+                dpkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_DATA, seq, &ch_s)
                 if dpkt.len > 0 {
                     pconn.write_to(&dpkt, &peer_addr) or (err) { <- }
                     wait_ack = true
@@ -1097,14 +1143,14 @@ fn p2p_punch_and_session(
 
             if !local_fin && tcp_eof_seen && tx_head >= tx_q.len && !wait_ack {
                 local_fin = true
-                fin_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_FIN, seq, &empty)
+                fin_pkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_FIN, seq, &empty)
                 if fin_pkt.len > 0 {
                     for r in 0:3 { pconn_write_q(pconn, &fin_pkt, &peer_addr) }
                 }
             }
 
             if !wait_ack && time.now() - last_tx_ns >= 15000000000 {
-                send_ctrl_pkt_q(pconn, ciph, session + "", P2P_PKT_PING, &peer_addr)
+                send_ctrl_pkt_q(pconn, &ciph.tx, session + "", P2P_PKT_PING, &peer_addr)
                 last_tx_ns = time.now()
             }
 
@@ -1113,7 +1159,7 @@ fn p2p_punch_and_session(
             pconn_deadline_q(pconn, dl)
             upkt := read_from_or(pconn, 65535)
             if upkt.data.len > 0 {
-                opened := p2p_open_packet(ciph, session + "", &upkt.data)
+                opened := p2p_open_packet(&ciph.rx, session + "", &upkt.data)
                 if opened.ok {
                     fin_idle = 0
                     if opened.ptype == P2P_PKT_ACK {
@@ -1121,11 +1167,11 @@ fn p2p_punch_and_session(
                             wait_ack = false
                         }
                     } else if opened.ptype == P2P_PKT_PUNCH {
-                        send_ack_q(pconn, ciph, session + "", 0, &peer_addr)
+                        send_ack_q(pconn, &ciph.tx, session + "", 0, &peer_addr)
                     } else if opened.ptype == P2P_PKT_PING {
-                        send_ctrl_pkt_q(pconn, ciph, session + "", P2P_PKT_PONG, &peer_addr)
+                        send_ctrl_pkt_q(pconn, &ciph.tx, session + "", P2P_PKT_PONG, &peer_addr)
                     } else if opened.ptype == P2P_PKT_DATA {
-                        send_ack_q(pconn, ciph, session + "", opened.seq, &peer_addr)
+                        send_ack_q(pconn, &ciph.tx, session + "", opened.seq, &peer_addr)
                         if opened.seq >= expected_seq {
                             bytes_in += opened.data.len
                             _ := net.conn_write(tcp_fd, &opened.data) or (err) { <- }
@@ -1173,7 +1219,7 @@ fn p2p_star_worker(
     json_mode bool,
     bus_mode bool,
     pconn_in net.PacketConn,
-    ciph aes.Cipher,
+    ciph P2PCiphers,
     sess string,
     from_id string,
     cands []net.UDPAddr,
@@ -1220,12 +1266,13 @@ fn handle_incoming_p2p_offer(
     if !dec.ok || !dec.verified || dec.msg_type != "p2p_offer" { << -1 }
     now0 := time.now_time().unix()
     if dec.ts <= 0 || (now0 - dec.ts) > 60 || (dec.ts - now0) > 60 { << -1 }
-    if dec.nonce.len > 0 && !check_and_record_nonce_in(cfg.home + "", "p2p_nonces.jsonl", dec.nonce + "", now0) { << -1 }
+    if dec.nonce.len == 0 || !check_and_record_nonce_in(cfg.home + "", "p2p_nonces.jsonl", dec.nonce + "", now0) { << -1 }
 
     odoc := json.parse(&dec.body_json)
     if !odoc.ok() { << -1 }
     oroot := odoc.root()
     sess := json_str_or(&odoc, odoc.get(oroot, "session"), "")
+    if sess.len == 0 { << -1 }
     exp := json_int_or(&odoc, odoc.get(oroot, "expires_at"), 0)
     now := time.now_time().unix()
     if exp > 0 && now > exp { << -1 }
@@ -1301,7 +1348,7 @@ fn handle_incoming_p2p_offer(
     xpub_bytes := xpriv.public_key().bytes()
     my_xpub_b64 := base64.encode_to_string(xpub_bytes)
 
-    peer_xpub_raw := base64.decode_string(xpub_b64) or (err) {
+    peer_xpub_raw := base64.decode_string(xpub_b64 + "") or (err) {
         pconn_close_q($&pconn)
         if got_slot { star_guard_release(guard_ch) }
         << -1
@@ -1316,8 +1363,9 @@ fn handle_incoming_p2p_offer(
         if got_slot { star_guard_release(guard_ch) }
         << -1
     }
-    sess_key := p2p_derive_key(sess + "", &shared)
-    ciph := aes.new_cipher(&sess_key) or (err) {
+    k_r2i := p2p_derive_dir_key("r2i", sess + "", from_id + "", cfg.agent_id + "", xpub_b64 + "", my_xpub_b64 + "", &shared)
+    k_i2r := p2p_derive_dir_key("i2r", sess + "", from_id + "", cfg.agent_id + "", xpub_b64 + "", my_xpub_b64 + "", &shared)
+    ciph := make_p2p_ciphers(&k_r2i, &k_i2r) or (err) {
         pconn_close_q($&pconn)
         if got_slot { star_guard_release(guard_ch) }
         << -1
@@ -1560,7 +1608,11 @@ pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
         << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
     }
     xpub_b64 := base64.encode_to_string(xpriv.public_key().bytes())
-    sess := gen_sess_or()
+    sess := generate_session_id() or (err) {
+        pconn_close_q($&pconn)
+        sse_close($&sc)
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
     now := time.now_time().unix()
     $mode_s := "stdio"
     if forward_mode { mode_s = "forward" }
@@ -1603,7 +1655,7 @@ pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
         if !dec.ok || !dec.verified || dec.msg_type != "p2p_answer" { -> }
         now_a := time.now_time().unix()
         if dec.ts <= 0 || (now_a - dec.ts) > 60 || (dec.ts - now_a) > 60 { -> }
-        if dec.nonce.len > 0 && !check_and_record_nonce_in(cfg.home + "", "p2p_nonces.jsonl", dec.nonce + "", now_a) { -> }
+        if dec.nonce.len == 0 || !check_and_record_nonce_in(cfg.home + "", "p2p_nonces.jsonl", dec.nonce + "", now_a) { -> }
         ad := json.parse(&dec.body_json)
         if !ad.ok() { -> }
         ar := ad.root()
@@ -1626,7 +1678,7 @@ pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
         << emit_err(opts, "ERR_P2P", 0, "no valid p2p_answer received", 0, EXIT_P2P)
     }
 
-    px_raw := base64.decode_string(peer_xpub_b64) or (err) {
+    px_raw := base64.decode_string(peer_xpub_b64 + "") or (err) {
         pconn_close_q($&pconn)
         << emit_err(opts, "ERR_CRYPTO", 0, "invalid peer x25519 key", 0, EXIT_CRYPTO)
     }
@@ -1638,8 +1690,9 @@ pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
         pconn_close_q($&pconn)
         << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
     }
-    sess_key := p2p_derive_key(sess + "", &shared)
-    ciph := aes.new_cipher(&sess_key) or (err) {
+    k_i2r := p2p_derive_dir_key("i2r", sess + "", cfg.agent_id + "", peer_id + "", xpub_b64 + "", peer_xpub_b64 + "", &shared)
+    k_r2i := p2p_derive_dir_key("r2i", sess + "", cfg.agent_id + "", peer_id + "", xpub_b64 + "", peer_xpub_b64 + "", &shared)
+    ciph := make_p2p_ciphers(&k_i2r, &k_r2i) or (err) {
         pconn_close_q($&pconn)
         << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
     }

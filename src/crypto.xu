@@ -229,6 +229,9 @@ pub fn decode_spki_public_pem(pem_str &string) rsa.PublicKey {
     $d := asn1.new_decoder(&spki.bytes)
     alg := d.next() or >>
     keyv := d.next() or >>
+    if alg.tag != asn1.TAG_SEQUENCE {
+        >> errors.new("rsa: invalid SPKI algorithm")
+    }
     $ad := asn1.new_decoder(&alg.bytes)
     oidv := ad.next() or >>
     arcs := oidv.as_oid() or >>
@@ -237,12 +240,25 @@ pub fn decode_spki_public_pem(pem_str &string) rsa.PublicKey {
     }
     bits := keyv.as_bit_string() or >>
     rseq := asn1.unmarshal(&bits) or >>
+    if rseq.tag != asn1.TAG_SEQUENCE {
+        >> errors.new("rsa: invalid RSAPublicKey sequence")
+    }
     $rd := asn1.new_decoder(&rseq.bytes)
     nv := rd.next() or >>
     ev := rd.next() or >>
+    if nv.tag != asn1.TAG_INTEGER || ev.tag != asn1.TAG_INTEGER {
+        >> errors.new("rsa: invalid RSA integers")
+    }
     $n := big.new_int(0)
     n.set_bytes(nv.bytes + "")
     e := ev.as_int() or >>
+    if e != 65537 {
+        >> errors.new("rsa: public exponent must be 65537")
+    }
+    nbits := n.bit_len()
+    if nbits < 2048 || nbits > 4096 {
+        >> errors.new("rsa: key size must be 2048..4096 bits")
+    }
     << rsa.PublicKey{n: n, e: e}
 }
 
@@ -432,6 +448,12 @@ pub fn decrypt_dm_frame(self_id string, self_priv &rsa.PrivateKey, expected_from
     if !doc.is_dict(r) || !doc.has(r, "ek") || !doc.has(r, "iv") || !doc.has(r, "ct") {
         << dec_fail("missing dm envelope fields")
     }
+    if doc.has(r, "v") && json_int_or(&doc, doc.get(r, "v"), 0) != 1 {
+        << dec_fail("unsupported dm envelope version")
+    }
+    if doc.has(r, "alg") && json_str_or(&doc, doc.get(r, "alg"), "") != "RSA-OAEP-256+A256GCM" {
+        << dec_fail("unsupported dm envelope alg")
+    }
     ek_b64 := doc.as_string(doc.get(r, "ek")) or (err) { << dec_fail("bad ek") }
     iv_b64 := doc.as_string(doc.get(r, "iv")) or (err) { << dec_fail("bad iv") }
     ct_b64 := doc.as_string(doc.get(r, "ct")) or (err) { << dec_fail("bad ct") }
@@ -443,6 +465,7 @@ pub fn decrypt_dm_frame(self_id string, self_priv &rsa.PrivateKey, expected_from
     ek := base64.decode_string(ek_b64) or (err) { << dec_fail("bad ek base64") }
     iv := base64.decode_string(iv_b64) or (err) { << dec_fail("bad iv base64") }
     ct := base64.decode_string(ct_b64) or (err) { << dec_fail("bad ct base64") }
+    if iv.len != 12 { << dec_fail("invalid aes-gcm iv length") }
 
     empty_lbl := ""
     cek := oaep.decrypt_oaep(self_priv, rsa.SHA256, &ek, &empty_lbl) or (err) {
@@ -520,6 +543,12 @@ pub fn decrypt_room_frame(room_id string, room_key_bytes &string, expected_from 
     if !doc.is_dict(r) || !doc.has(r, "iv") || !doc.has(r, "ct") {
         << dec_fail("missing room envelope fields")
     }
+    if doc.has(r, "v") && json_int_or(&doc, doc.get(r, "v"), 0) != 1 {
+        << dec_fail("unsupported room envelope version")
+    }
+    if doc.has(r, "alg") && json_str_or(&doc, doc.get(r, "alg"), "") != "A256GCM" {
+        << dec_fail("unsupported room envelope alg")
+    }
     iv_b64 := doc.as_string(doc.get(r, "iv")) or (err) { << dec_fail("bad iv") }
     ct_b64 := doc.as_string(doc.get(r, "ct")) or (err) { << dec_fail("bad ct") }
     $epoch := 1
@@ -528,6 +557,7 @@ pub fn decrypt_room_frame(room_id string, room_key_bytes &string, expected_from 
     }
     iv := base64.decode_string(iv_b64) or (err) { << dec_fail("bad iv base64") }
     ct := base64.decode_string(ct_b64) or (err) { << dec_fail("bad ct base64") }
+    if iv.len != 12 { << dec_fail("invalid aes-gcm iv length") }
 
     ciph := aes.new_cipher(room_key_bytes) or (err) { << dec_fail("aes init failed") }
     aad := "fatext-room\n" + room_id + "\n" + strconv.itoa(epoch)
@@ -568,14 +598,21 @@ pub fn decrypt_room_frame(room_id string, room_key_bytes &string, expected_from 
 
 pub fn decrypt_mail_envelope(self_id string, priv &rsa.PrivateKey, mail_id string, to_key_ver int, env_json &string) string {
     doc := json.parse(env_json)
-    if !doc.ok() { >> errors.new("mail: invalid envelope json") }
+    if !doc.ok() || !doc.is_dict(doc.root()) { >> errors.new("mail: invalid envelope json") }
     r := doc.root()
+    if doc.has(r, "v") && json_int_or(&doc, doc.get(r, "v"), 0) != 1 {
+        >> errors.new("mail: unsupported envelope version")
+    }
+    if doc.has(r, "alg") && json_str_or(&doc, doc.get(r, "alg"), "") != "RSA-OAEP-256+A256GCM" {
+        >> errors.new("mail: unsupported envelope alg")
+    }
     ek_b64 := doc.as_string(doc.get(r, "ek")) or >>
     iv_b64 := doc.as_string(doc.get(r, "iv")) or >>
     ct_b64 := doc.as_string(doc.get(r, "ct")) or >>
     ek := base64.decode_string(ek_b64) or >>
     iv := base64.decode_string(iv_b64) or >>
     ct := base64.decode_string(ct_b64) or >>
+    if iv.len != 12 { >> errors.new("mail: invalid aes-gcm iv length") }
     empty_lbl := ""
     cek := oaep.decrypt_oaep(priv, rsa.SHA256, &ek, &empty_lbl) or >>
     ciph := aes.new_cipher(&cek) or >>
@@ -647,6 +684,12 @@ pub fn decrypt_doc_envelope(
     if !doc.has(r, "iv") || !doc.has(r, "ct") || !doc.has(r, "recipients") {
         << doc_dec_fail("missing doc envelope fields")
     }
+    if doc.has(r, "v") && json_int_or(&doc, doc.get(r, "v"), 0) != 1 {
+        << doc_dec_fail("unsupported doc envelope version")
+    }
+    if doc.has(r, "alg") && json_str_or(&doc, doc.get(r, "alg"), "") != "RSA-OAEP-256+A256GCM" {
+        << doc_dec_fail("unsupported doc envelope alg")
+    }
     iv_b64 := doc.as_string(doc.get(r, "iv")) or (err) { << doc_dec_fail("bad iv") }
     ct_b64 := doc.as_string(doc.get(r, "ct")) or (err) { << doc_dec_fail("bad ct") }
     recs := doc.get(r, "recipients")
@@ -674,6 +717,7 @@ pub fn decrypt_doc_envelope(
     iv := base64.decode_string(iv_b64) or (err) { << doc_dec_fail("bad iv base64") }
     ct := base64.decode_string(ct_b64) or (err) { << doc_dec_fail("bad ct base64") }
     ek := base64.decode_string(ek_b64) or (err) { << doc_dec_fail("bad ek base64") }
+    if iv.len != 12 { << doc_dec_fail("invalid aes-gcm iv length") }
 
     empty_lbl := ""
     $cek := ""

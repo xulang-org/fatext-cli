@@ -66,6 +66,21 @@ pub fn json_encode_or(doc &json.Doc, node int, def string) string {
     << doc.encode(node) or (err) { << def }
 }
 
+pub fn json_has_str(doc &json.Doc, dict_node int, key string, def string) string {
+    if dict_node < 0 || !doc.is_dict(dict_node) || !doc.has(dict_node, key) { << def }
+    << json_str_or(doc, doc.get(dict_node, key), def)
+}
+
+pub fn json_has_int(doc &json.Doc, dict_node int, key string, def int) int {
+    if dict_node < 0 || !doc.is_dict(dict_node) || !doc.has(dict_node, key) { << def }
+    << json_int_or(doc, doc.get(dict_node, key), def)
+}
+
+pub fn json_has_bool(doc &json.Doc, dict_node int, key string, def bool) bool {
+    if dict_node < 0 || !doc.is_dict(dict_node) || !doc.has(dict_node, key) { << def }
+    << json_bool_or(doc, doc.get(dict_node, key), def)
+}
+
 pub fn read_file_or_empty(path string) string {
     << os.read(path) or (err) { << "" }
 }
@@ -83,11 +98,36 @@ pub fn join_ref(xs &[]string, sep string) string {
     << out
 }
 
+fn remove_quiet(path string) {
+    _ := os.remove(path) or (err) { << }
+}
+
+pub fn ensure_dir_mode(dir string, mode int) int {
+    os.mkdir_all(dir + "") or >>
+    if os.getenv("OS") != "Windows_NT" {
+        os.chmod(dir + "", mode) or >>
+    }
+    << 0
+}
+
 pub fn write_atomic_mode(path string, data &string, mode int) int {
-    tmp := path + ".tmp." + strconv.itoa(os.getpid())
-    os.write(tmp + "", data + "") or >>
-    os.chmod(tmp + "", mode) or >>
-    os.rename(tmp + "", path) or >>
+    tmp := path + ".tmp." + strconv.itoa(os.getpid()) + "." + strconv.itoa(time.now())
+    empty := ""
+    os.write(tmp + "", empty) or >>
+    if os.getenv("OS") != "Windows_NT" {
+        os.chmod(tmp + "", mode) or (err) {
+            remove_quiet(tmp + "")
+            >> err
+        }
+    }
+    os.write(tmp + "", data + "") or (err) {
+        remove_quiet(tmp + "")
+        >> err
+    }
+    os.rename(tmp + "", path) or (err) {
+        remove_quiet(tmp + "")
+        >> err
+    }
     << 0
 }
 
@@ -195,7 +235,7 @@ pub fn load_config(opts &CliOpts) Config {
 
 pub fn save_config(cfg_path string, cfg &Config) int {
     home := dirname_of(cfg_path + "")
-    os.mkdir_all(home) or >>
+    ensure_dir_mode(home + "", 448) or >>
     body := "{" +
         "\"agent_id\":" + json.quote(&cfg.agent_id) + "," +
         "\"name\":" + json.quote(&cfg.name) + "," +
@@ -226,14 +266,15 @@ pub fn load_private_key_checked(home string) rsa.PrivateKey {
 }
 
 pub fn save_private_key_atomic(home string, pem_str &string) int {
-    os.mkdir_all(home + "") or >>
+    ensure_dir_mode(home + "", 448) or >>
     ppath := home + "/private.pem"
     << write_atomic_mode(ppath, pem_str, 384) or >>
 }
 
 pub fn archive_private_key(home string, version int, pem_str &string) int {
+    ensure_dir_mode(home + "", 448) or >>
     kdir := home + "/keys"
-    os.mkdir_all(kdir + "") or >>
+    ensure_dir_mode(kdir + "", 448) or >>
     kpath := kdir + "/private.v" + strconv.itoa(version) + ".pem"
     << write_atomic_mode(kpath, pem_str, 384) or >>
 }
@@ -246,8 +287,12 @@ pub fn load_archived_private_key(home string, version int) rsa.PrivateKey {
 }
 
 pub fn save_room_info(home string, ri &RoomInfo) int {
+    if !is_valid_room_id(ri.room_id + "") {
+        >> errors.new("invalid room_id")
+    }
+    ensure_dir_mode(home + "", 448) or >>
     rdir := home + "/rooms"
-    os.mkdir_all(rdir + "") or >>
+    ensure_dir_mode(rdir + "", 448) or >>
     rpath := rdir + "/" + ri.room_id + ".json"
     body := "{" +
         "\"room_id\":" + json.quote(&ri.room_id) + "," +
@@ -260,6 +305,9 @@ pub fn save_room_info(home string, ri &RoomInfo) int {
 }
 
 pub fn load_room_info(home string, room_id string) RoomInfo {
+    if !is_valid_room_id(room_id + "") {
+        >> errors.new("invalid room_id")
+    }
     rpath := home + "/rooms/" + room_id + ".json"
     raw := os.read(rpath) or >>
     doc := json.parse(&raw)
@@ -276,6 +324,7 @@ pub fn load_room_info(home string, room_id string) RoomInfo {
 }
 
 pub fn delete_room_info_quiet(home string, room_id string) {
+    if !is_valid_room_id(room_id + "") { << }
     rpath := home + "/rooms/" + room_id + ".json"
     os.remove(rpath) or (err) { << }
 }

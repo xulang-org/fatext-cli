@@ -55,15 +55,34 @@ if [ "$expected_sha" != "$actual_sha" ]; then
 fi
 echo "SHA256 verified: ${actual_sha}"
 
-if curl -fsSL "${BASE_URL}/SHA256SUMS.sig" -o "${tmp}/SHA256SUMS.sig" 2>/dev/null && command -v openssl >/dev/null 2>&1; then
-  if curl -fsSL "${KEY_URL}" -o "${tmp}/official.pem" 2>/dev/null; then
-    openssl base64 -d -A -in "${tmp}/SHA256SUMS.sig" -out "${tmp}/sig.bin" 2>/dev/null || cp "${tmp}/SHA256SUMS.sig" "${tmp}/sig.bin"
-    if openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -verify "${tmp}/official.pem" -signature "${tmp}/sig.bin" "${tmp}/SHA256SUMS" >/dev/null 2>&1; then
-      echo "Official RSA-PSS signature verified"
-    else
-      echo "SHA256SUMS.sig verification failed" >&2
+if [ "${FATEXT_INSECURE_SKIP_SIG:-0}" = "1" ]; then
+  echo "Warning: skipping RSA-PSS signature verification because FATEXT_INSECURE_SKIP_SIG=1" >&2
+else
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo "Error: openssl is required to verify official RSA-PSS signature" >&2
+    exit 1
+  fi
+  if ! curl -fsSL "${BASE_URL}/SHA256SUMS.sig" -o "${tmp}/SHA256SUMS.sig"; then
+    echo "Error: failed to download ${BASE_URL}/SHA256SUMS.sig" >&2
+    exit 1
+  fi
+  if ! curl -fsSL "${KEY_URL}" -o "${tmp}/official.pem"; then
+    echo "Error: failed to download official key ${KEY_URL}" >&2
+    exit 1
+  fi
+  if [ -n "${FATEXT_OFFICIAL_KEY_FP:-}" ]; then
+    actual_fp="SHA256:$(openssl pkey -pubin -in "${tmp}/official.pem" -outform DER 2>/dev/null | openssl dgst -sha256 -binary | openssl base64 -A)"
+    if [ "$actual_fp" != "$FATEXT_OFFICIAL_KEY_FP" ]; then
+      echo "Error: official key fingerprint mismatch (expected=${FATEXT_OFFICIAL_KEY_FP} actual=${actual_fp})" >&2
       exit 1
     fi
+  fi
+  openssl base64 -d -A -in "${tmp}/SHA256SUMS.sig" -out "${tmp}/sig.bin" 2>/dev/null || cp "${tmp}/SHA256SUMS.sig" "${tmp}/sig.bin"
+  if openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -verify "${tmp}/official.pem" -signature "${tmp}/sig.bin" "${tmp}/SHA256SUMS" >/dev/null 2>&1; then
+    echo "Official RSA-PSS signature verified"
+  else
+    echo "SHA256SUMS.sig verification failed" >&2
+    exit 1
   fi
 fi
 

@@ -69,6 +69,8 @@ fn doc_verify_fail(code string, exit_c int, msg string) DocVerifyOut {
 fn cli_verify_doc_and_extract(
     opts &CliOpts,
     api_base string,
+    expected_agent_id string,
+    expected_kind string,
     role string,
     self_id string,
     home string,
@@ -82,30 +84,38 @@ fn cli_verify_doc_and_extract(
         << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "invalid document json")
     }
     r := doc.root()
-    aid := json_str_or(&doc, doc.get(r, "agent_id"), "")
-    kind := json_str_or(&doc, doc.get(r, "kind"), "")
-    ver := json_int_or(&doc, doc.get(r, "version"), 0)
-    vis := json_str_or(&doc, doc.get(r, "visibility"), "")
-    $locked := false
-    if doc.has(r, "locked") { locked = json_bool_or(&doc, doc.get(r, "locked"), false) }
-    locked_by := json_str_or(&doc, doc.get(r, "locked_by"), "")
-    fmt := json_str_or(&doc, doc.get(r, "format"), "markdown")
-    csha := json_str_or(&doc, doc.get(r, "content_sha256"), "")
-    cbytes := json_int_or(&doc, doc.get(r, "content_bytes"), 0)
-    signed_by := json_str_or(&doc, doc.get(r, "signed_by"), "")
-    signer_id := json_str_or(&doc, doc.get(r, "signer_id"), "")
-    signer_kv := json_int_or(&doc, doc.get(r, "signer_key_version"), 0)
-    uat := json_int_or(&doc, doc.get(r, "updated_at"), 0)
-    sig := json_str_or(&doc, doc.get(r, "signature"), "")
+    aid := json_has_str(&doc, r, "agent_id", "")
+    kind := json_has_str(&doc, r, "kind", "")
+    ver := json_has_int(&doc, r, "version", 0)
+    vis := json_has_str(&doc, r, "visibility", "")
+    locked := json_has_bool(&doc, r, "locked", false)
+    locked_by := json_has_str(&doc, r, "locked_by", "")
+    fmt := json_has_str(&doc, r, "format", "markdown")
+    csha := json_has_str(&doc, r, "content_sha256", "")
+    cbytes := json_has_int(&doc, r, "content_bytes", 0)
+    signed_by := json_has_str(&doc, r, "signed_by", "")
+    signer_id := json_has_str(&doc, r, "signer_id", "")
+    signer_kv := json_has_int(&doc, r, "signer_key_version", 0)
+    uat := json_has_int(&doc, r, "updated_at", 0)
+    sig := json_has_str(&doc, r, "signature", "")
 
     if aid.len == 0 || kind.len == 0 || ver < 1 || csha.len != 64 || sig.len == 0 {
         << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "incomplete document metadata or signature")
     }
+    if aid != expected_agent_id {
+        << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "document agent_id mismatch: expected " + expected_agent_id + ", got " + aid)
+    }
+    if kind != expected_kind {
+        << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "document kind mismatch: expected " + expected_kind + ", got " + kind)
+    }
 
-    // Fetch signer public key matching signer_key_version
+    // Fetch signer public key matching signer_key_version and verify signer authority
     $signer_pem := ""
     if signed_by == "agent" {
-        fk := fetch_agent_key(api_base + "", opts.timeout_sec, signer_id + "")
+        if signer_id != expected_agent_id {
+            << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "document signer_id mismatch: expected " + expected_agent_id + ", got " + signer_id)
+        }
+        fk := fetch_agent_key(api_base + "", opts.timeout_sec, expected_agent_id + "")
         if !fk.ok { << doc_verify_fail(fk.err_code + "", fk.exit_code, fk.err_msg + "") }
         sdoc := json.parse(&fk.raw_json)
         if !sdoc.ok() { << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "corrupt signer agent json") }
@@ -115,6 +125,14 @@ fn cli_verify_doc_and_extract(
         if !cfk.ok { << doc_verify_fail(cfk.err_code + "", cfk.exit_code, cfk.err_msg + "") }
         cdoc := json.parse(&cfk.raw_json)
         if !cdoc.ok() { << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "corrupt signer controller json") }
+        afk := fetch_agent_key(api_base + "", opts.timeout_sec, expected_agent_id + "")
+        if !afk.ok { << doc_verify_fail(afk.err_code + "", afk.exit_code, afk.err_msg + "") }
+        adoc := json.parse(&afk.raw_json)
+        if !adoc.ok() { << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "corrupt target agent json") }
+        bind_err := cli_verify_controller_binding_for_doc(expected_agent_id + "", &afk, &adoc, signer_id + "", &cfk, &cdoc)
+        if bind_err.len > 0 {
+            << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "controller signature unauthorized: " + bind_err)
+        }
         signer_pem = cli_find_key_for_ver(&cdoc, signer_kv, cfk.key_version, &cfk.pub_pem)
     } else {
         << doc_verify_fail("ERR_CRYPTO", EXIT_CRYPTO, "unknown document signed_by: " + signed_by)
@@ -435,7 +453,7 @@ pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
             empty := ""
             r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/agents/docs/" + kind, &empty, "")
             if !r.ok { << handle_api_fail(opts, &r) }
-            dv := cli_verify_doc_and_extract(opts, cfg.api_base + "", "agent", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &r.body)
+            dv := cli_verify_doc_and_extract(opts, cfg.api_base + "", cfg.agent_id + "", kind + "", "agent", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &r.body)
             if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
             << emit_doc_output(opts, kind + "", out_path + "", &dv)
         }
@@ -449,7 +467,7 @@ pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
         raw_body := r.body + ""
         api_base = cfg_opt.api_base + ""
         dpriv := cli_dummy_priv()
-        dv := cli_verify_doc_and_extract(opts, api_base + "", "agent", target + "", "", 1, false, &dpriv, &raw_body)
+        dv := cli_verify_doc_and_extract(opts, api_base + "", target + "", kind + "", "agent", target + "", "", 1, false, &dpriv, &raw_body)
         if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
         << emit_doc_output(opts, kind + "", out_path + "", &dv)
     }
@@ -611,7 +629,7 @@ pub fn cmd_ctl_doc(opts &CliOpts, kind string, args []string) int {
         empty := ""
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents/" + aid + "/docs/" + kind, &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
-        dv := cli_verify_doc_and_extract(opts, cfg.api_base + "", "controller", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &r.body)
+        dv := cli_verify_doc_and_extract(opts, cfg.api_base + "", aid + "", kind + "", "controller", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &r.body)
         if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
         << emit_doc_output(opts, kind + "", out_path + "", &dv)
     }
@@ -631,7 +649,7 @@ pub fn cmd_ctl_doc(opts &CliOpts, kind string, args []string) int {
         empty := ""
         cur_r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents/" + aid + "/docs/" + kind, &empty, "")
         if !cur_r.ok { << handle_api_fail(opts, &cur_r) }
-        dv := cli_verify_doc_and_extract(opts, cfg.api_base + "", "controller", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &cur_r.body)
+        dv := cli_verify_doc_and_extract(opts, cfg.api_base + "", aid + "", kind + "", "controller", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &cur_r.body)
         if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
         next_ver := dv.version + 1
         new_locked := sub == "lock"

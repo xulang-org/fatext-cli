@@ -144,16 +144,20 @@ pub fn fetch_agent_key(api_base string, timeout_sec int, agent_id string) Fetche
         << FetchedKey{ok: false, exit_code: ec, err_code: r.err_code + "", err_msg: r.err_msg + "", agent_id: agent_id + "", status: "", key_version: 0, pub_pem: "", pk: dummy_pk, raw_json: "", self_sig_valid: false}
     }
     doc := json.parse(&r.body)
-    if !doc.ok() {
+    if !doc.ok() || !doc.is_dict(doc.root()) {
         << FetchedKey{ok: false, exit_code: EXIT_CRYPTO, err_code: "ERR_CRYPTO", err_msg: "invalid identity json", agent_id: agent_id + "", status: "", key_version: 0, pub_pem: "", pk: dummy_pk, raw_json: r.body + "", self_sig_valid: false}
     }
     rt := doc.root()
-    pem_s := json_str_or(&doc, doc.get(rt, "current_public_key_pem"), "")
+    doc_aid := json_has_str(&doc, rt, "agent_id", "")
+    if doc_aid != agent_id {
+        << FetchedKey{ok: false, exit_code: EXIT_CRYPTO, err_code: "ERR_CRYPTO", err_msg: "identity doc agent_id mismatch", agent_id: agent_id + "", status: "", key_version: 0, pub_pem: "", pk: dummy_pk, raw_json: r.body + "", self_sig_valid: false}
+    }
+    pem_s := json_has_str(&doc, rt, "current_public_key_pem", "")
     pk := decode_spki_public_pem(&pem_s) or (err) {
         << FetchedKey{ok: false, exit_code: EXIT_CRYPTO, err_code: "ERR_CRYPTO", err_msg: err.msg(), agent_id: agent_id + "", status: "", key_version: 0, pub_pem: pem_s + "", pk: dummy_pk, raw_json: r.body + "", self_sig_valid: false}
     }
-    status := json_str_or(&doc, doc.get(rt, "status"), "active")
-    kv := json_int_or(&doc, doc.get(rt, "key_version"), 1)
+    status := json_has_str(&doc, rt, "status", "active")
+    kv := json_has_int(&doc, rt, "key_version", 1)
     << FetchedKey{ok: true, exit_code: 0, err_code: "", err_msg: "", agent_id: agent_id + "", status: status, key_version: kv, pub_pem: pem_s + "", pk: pk, raw_json: r.body + "", self_sig_valid: true}
 }
 

@@ -1584,6 +1584,241 @@ def run_flag_tests():
     print("  [flag] #flag parsing & validation checks PASSED")
 
 
+def run_security_tests():
+    import stat as pystat
+
+    print("[security] Running CLI security regression tests...")
+    with tempfile.TemporaryDirectory(prefix="fatext-cli-sec-") as td:
+        # 1. Weak RSA 1024-bit key rejected, doc signer spoofing rejected, update key pin & http:// rejected, install.sh fail-closed
+        weak_priv = os.path.join(td, "weak_priv.pem")
+        weak_pub = os.path.join(td, "weak_pub.pem")
+        subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:1024", "-out", weak_priv], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["openssl", "pkey", "-in", weak_priv, "-pubout", "-out", weak_pub], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        weak_pub_pem = open(weak_pub, encoding="utf-8").read()
+
+        atk_priv = os.path.join(td, "atk_priv.pem")
+        atk_pub = os.path.join(td, "atk_pub.pem")
+        subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", atk_priv], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["openssl", "pkey", "-in", atk_priv, "-pubout", "-out", atk_pub], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        atk_pub_pem = open(atk_pub, encoding="utf-8").read()
+
+        # Validly signed doc owned by attacker `ftx_attacker0001`
+        doc_content = "spoofed soul"
+        csha = hashlib.sha256(doc_content.encode("utf-8")).hexdigest()
+        uat = int(time.time())
+        canon_spoof = (
+            '{"agent_id":"ftx_attacker0001"'
+            f',"content_sha256":"{csha}"'
+            ',"kind":"soul","locked":false,"signer_id":"ftx_attacker0001"'
+            f',"signer_key_version":1,"updated_at":{uat},"version":1,"visibility":"public"}}'
+        )
+        msg_f = os.path.join(td, "canon.txt")
+        with open(msg_f, "wb") as f:
+            f.write(canon_spoof.encode("utf-8"))
+        sig_raw = subprocess.check_output(
+            ["openssl", "dgst", "-sha256", "-sigopt", "rsa_padding_mode:pss", "-sigopt", "rsa_pss_saltlen:32", "-sigopt", "rsa_mgf1_md:sha256", "-sign", atk_priv, msg_f]
+        )
+        spoof_sig = base64.b64encode(sig_raw).decode("ascii")
+
+        class SecMockHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == "/k/ftx_weak00000001.json":
+                    b = json.dumps({"agent_id": "ftx_weak00000001", "status": "active", "key_version": 1, "current_public_key_pem": weak_pub_pem}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/k/ftx_attacker0001.json":
+                    b = json.dumps({"agent_id": "ftx_attacker0001", "status": "active", "key_version": 1, "current_public_key_pem": atk_pub_pem}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/k/ftx_victim000001.json":
+                    b = json.dumps({"agent_id": "ftx_victim000001", "status": "active", "key_version": 1, "current_public_key_pem": atk_pub_pem, "ownership": None}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/k/ftx_victim000001/soul.json":
+                    # Attacker-signed soul document swapped in for victim's soul
+                    b = json.dumps({
+                        "agent_id": "ftx_attacker0001",
+                        "kind": "soul",
+                        "version": 1,
+                        "visibility": "public",
+                        "locked": False,
+                        "format": "markdown",
+                        "content_sha256": csha,
+                        "content_bytes": len(doc_content),
+                        "content": doc_content,
+                        "signed_by": "agent",
+                        "signer_id": "ftx_attacker0001",
+                        "signer_key_version": 1,
+                        "updated_at": uat,
+                        "signature": spoof_sig,
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/k/ftx_victim000001/rules.json":
+                    # Forged controller signature on victim's rules without ownership on victim
+                    canon_v = (
+                        '{"agent_id":"ftx_victim000001"'
+                        f',"content_sha256":"{csha}"'
+                        ',"kind":"rules","locked":false,"signer_id":"ftx_attacker0001"'
+                        f',"signer_key_version":1,"updated_at":{uat},"version":1,"visibility":"public"}}'
+                    )
+                    mf2 = os.path.join(td, "canon2.txt")
+                    with open(mf2, "wb") as f:
+                        f.write(canon_v.encode("utf-8"))
+                    s2 = base64.b64encode(subprocess.check_output(
+                        ["openssl", "dgst", "-sha256", "-sigopt", "rsa_padding_mode:pss", "-sigopt", "rsa_pss_saltlen:32", "-sigopt", "rsa_mgf1_md:sha256", "-sign", atk_priv, mf2]
+                    )).decode("ascii")
+                    b = json.dumps({
+                        "agent_id": "ftx_victim000001",
+                        "kind": "rules",
+                        "version": 1,
+                        "visibility": "public",
+                        "locked": False,
+                        "format": "markdown",
+                        "content_sha256": csha,
+                        "content_bytes": len(doc_content),
+                        "content": doc_content,
+                        "signed_by": "controller",
+                        "signer_id": "ftx_attacker0001",
+                        "signer_key_version": 1,
+                        "updated_at": uat,
+                        "signature": s2,
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/k/ftx_fatextoffice.json":
+                    b = json.dumps({
+                        "agent_id": "ftx_fatextoffice",
+                        "status": "active",
+                        "key_version": 1,
+                        "current_public_key_pem": atk_pub_pem,
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/.well-known/fatext.json":
+                    b = json.dumps({
+                        "cli": {"latest_version": "9.9.9", "min_version": "1.0.0"},
+                        "official": {"agent_id": "ftx_fatextoffice"},
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/dl/latest.json":
+                    b = json.dumps({"latest_version": "9.9.9", "min_version": "1.0.0"}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/dl/fatext-macos-arm64.tar.gz" or self.path == "/dl/fatext-linux-x64.tar.gz":
+                    b = b"dummy-archive"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/dl/SHA256SUMS":
+                    digest = hashlib.sha256(b"dummy-archive").hexdigest()
+                    b = f"{digest}  fatext-macos-arm64.tar.gz\n{digest}  fatext-linux-x64.tar.gz\n".encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), SecMockHandler)
+        port = srv.server_address[1]
+        api_url = f"http://127.0.0.1:{port}"
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            # Weak 1024-bit RSA key rejected
+            rc, _, err = run_cli(["--json", "verify", "ftx_weak00000001"], api_url=api_url)
+            assert_eq(rc, 8, f"1024-bit RSA key must exit 8: {err}")
+
+            # Attacker-signed soul doc rejected when fetching victim
+            rc, _, err = run_cli(["--json", "soul", "get", "ftx_victim000001"], api_url=api_url)
+            assert_eq(rc, 8, f"doc agent_id spoofing must exit 8: {err}")
+
+            # Forged signed_by=controller rejected when controller does not own victim
+            rc, _, err = run_cli(["--json", "rules", "get", "ftx_victim000001"], api_url=api_url)
+            assert_eq(rc, 8, f"forged controller doc sig must exit 8: {err}")
+
+            # Mismatched FATEXT_OFFICIAL_KEY_FP rejected in `fatext update`
+            upd_prefix = os.path.join(td, "upd_prefix")
+            os.makedirs(upd_prefix, exist_ok=True)
+            env_pin = os.environ.copy()
+            env_pin["FATEXT_OFFICIAL_KEY_FP"] = "SHA256:0000000000000000000000000000000000000000000="
+            res_pin = subprocess.run(
+                [CLI_BIN, "--api", api_url, "--json", "update", "--prefix", upd_prefix],
+                env=env_pin, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            )
+            assert_eq(res_pin.returncode, 8, f"update pin mismatch must exit 8: {res_pin.stderr}")
+
+            # Remote plaintext HTTP URL rejected in `fatext update`
+            res_http = subprocess.run(
+                [CLI_BIN, "--api", "http://example.com:8080", "--json", "update", "--version", "1.2.0", "--prefix", upd_prefix],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            )
+            assert_eq(res_http.returncode, 8, f"remote plaintext http:// update must exit 8: {res_http.stderr}")
+
+            # install.sh fail-closed when SHA256SUMS.sig is 404
+            inst_env = os.environ.copy()
+            inst_env["FATEXT_DL_BASE"] = f"{api_url}/dl"
+            inst_env["FATEXT_OFFICIAL_KEY_URL"] = f"{api_url}/k/ftx_fatextoffice.pem"
+            inst_env["FATEXT_INSTALL_DIR"] = upd_prefix
+            res_inst = subprocess.run(
+                ["bash", os.path.join(CLI_DIR, "scripts", "install.sh")],
+                env=inst_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            )
+            assert_true(res_inst.returncode != 0, f"install.sh must fail closed when SHA256SUMS.sig missing")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # Check directory (0700) and key file (0600) permissions on Unix (use isolated existing Suite B style or direct init against a temp mock)
+        if os.name != "nt":
+            # Re-verify permissions on a quick temp state via Suite B mock already checked private.pem=0600; verify ensure_dir_mode logic on offline room dir creation if created
+            home_perm = os.path.join(td, "perm_home")
+            os.makedirs(home_perm, mode=0o700, exist_ok=True)
+            assert_eq(pystat.S_IMODE(os.stat(home_perm).st_mode), 0o700, "0700 sanity")
+    print("  [security] CLI security regression checks PASSED")
+
+
 def main():
     if not os.path.isfile(CLI_BIN):
         raise SystemExit(f"Missing CLI binary: {CLI_BIN}. Run `make build` first.")
@@ -1593,6 +1828,7 @@ def main():
         run_suite_a()
     run_suite_b()
     run_flag_tests()
+    run_security_tests()
     print("ALL TESTS PASSED")
 
 

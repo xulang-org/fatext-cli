@@ -1420,7 +1420,7 @@ fn listen_get_pk_idx(
 }
 
 fn check_replay_nonce_listen(home string, nonce string, now int, seen_nonces $&maps.StrInt) bool {
-    if nonce.len == 0 { << true }
+    if nonce.len == 0 { << false }
     if seen_nonces.has(nonce + "") { << false }
     if !check_and_record_nonce(home + "", nonce + "", now) { << false }
     map_set_str_int(seen_nonces, nonce + "", now)

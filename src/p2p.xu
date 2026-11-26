@@ -485,6 +485,10 @@ fn p2p_star_bus_worker(
                     if opened.seq >= expected_seq {
                         bytes_in += opened.data.len
                         expected_seq = opened.seq + 1
+                        if rx_buf.len + opened.data.len > 1048576 {
+                            alive = false
+                            <-
+                        }
                         rx_buf = rx_buf + opened.data
                         while true {
                             nl := strings.index_of(&rx_buf, "\n")
@@ -634,6 +638,10 @@ fn p2p_bus_client_session(
                     if opened.seq >= expected_seq {
                         bytes_in += opened.data.len
                         expected_seq = opened.seq + 1
+                        if rx_buf.len + opened.data.len > 1048576 {
+                            alive = false
+                            <-
+                        }
                         rx_buf = rx_buf + opened.data
                         while true {
                             nl := strings.index_of(&rx_buf, "\n")
@@ -707,7 +715,7 @@ fn udp_addr_from_str(hp string) net.UDPAddr {
     << net.UDPAddr{ip: ip, port: port, zone: ""}
 }
 
-pub fn stun_discover(pconn &net.PacketConn, stun_hp string) string {
+pub fn stun_discover(pconn $&net.PacketConn, stun_hp string) string {
     if stun_hp.len == 0 || stun_hp == "none" { << "" }
     raddr := udp_addr_from_str(stun_hp) or (err) { << "" }
     tx := rand.read(12) or (err) { << "" }
@@ -716,7 +724,12 @@ pub fn stun_discover(pconn &net.PacketConn, stun_hp string) string {
     for i in 0:12 { req.push(tx[i] & 255) }
     pkt := string_from_bytes(req)
     _ := pconn.write_to(&pkt, &raddr) or (err) { << "" }
-    resp := pconn.read_from(2048) or (err) { << "" }
+    pconn_deadline_q(pconn, 2000000000)
+    resp := pconn.read_from(2048) or (err) {
+        pconn_deadline_q(pconn, 0)
+        << ""
+    }
+    pconn_deadline_q(pconn, 0)
     d := resp.data + ""
     if d.len < 20 { << "" }
     // Verify STUN Binding Success Response (0x0101), magic cookie & 12-byte transaction id
@@ -1336,7 +1349,7 @@ fn handle_incoming_p2p_offer(
     }
     lport := local_port_of(&pconn)
     pconn_deadline_q($&pconn, 1500000000)
-    srflx := stun_discover(&pconn, stun_hp + "")
+    srflx := stun_discover($&pconn, stun_hp + "")
 
     xpriv := ecdh.generate_key(ecdh.x25519()) or (err) {
         pconn_close_q($&pconn)
@@ -1600,7 +1613,7 @@ pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
     }
     lport := local_port_of(&pconn)
     pconn_deadline_q($&pconn, 1500000000)
-    srflx := stun_discover(&pconn, stun_hp + "")
+    srflx := stun_discover($&pconn, stun_hp + "")
 
     xpriv := ecdh.generate_key(ecdh.x25519()) or (err) {
         pconn_close_q($&pconn)

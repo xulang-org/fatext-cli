@@ -44,6 +44,8 @@ fn empty_api_err(net_err bool, code string, msg string) ApiResp {
 pub fn api_call(api_base string, timeout_sec int, agent_id string, priv &rsa.PrivateKey, signed bool, method string, path_and_query string, body &string, extra_headers string) ApiResp {
     $cl := http.new_client()
     cl.set_timeout(timeout_sec * 1000000000)
+    cl.max_redirects = -1
+    cl.max_response_bytes = 8388608
 
     $extra := extra_headers + ""
     if !strings.contains(&extra, "User-Agent:") {
@@ -189,14 +191,42 @@ fn strip_port(host string) string {
     << host + ""
 }
 
+const SSE_CONNECT_TIMEOUT_NS = 10000000000
+const SSE_READ_TIMEOUT_NS = 75000000000
+const SSE_MAX_LINE_BYTES = 1048576
+
 fn tc_write(tc $&tls.Conn, data &string) int { << tc.write(data) or >> }
 fn nc_write(c $&net.Conn, data &string) int { << c.write(data) or >> }
 fn tc_read(tc $&tls.Conn, n int) string { << tc.read(n) or >> }
 fn nc_read(c $&net.Conn, n int) string { << c.read(n) or >> }
 fn tc_close(tc $&tls.Conn) { tc.close() or (err) { << } }
 fn nc_close(c $&net.Conn) { c.close() or (err) { << } }
+fn net_fd_close_q(fd int) {
+    if fd >= 0 {
+        _ := net.conn_close(fd) or (err) { << }
+    }
+}
+
+fn tc_set_deadline_q(tc $&tls.Conn, dl int) {
+    _ := tc.set_deadline(dl) or (err) { << }
+}
+
+fn nc_set_deadline_q(nc $&net.Conn, dl int) {
+    _ := nc.set_deadline(dl) or (err) { << }
+}
+
+fn sse_set_deadline(sc $&SseConn, dur_ns int) {
+    $dl := 0
+    if dur_ns > 0 { dl = time.now() + dur_ns }
+    if sc.is_tls {
+        tc_set_deadline_q($&sc.tc, dl)
+        <<
+    }
+    nc_set_deadline_q($&sc.conn, dl)
+}
 
 fn sse_write_all(sc $&SseConn, data &string) int {
+    sse_set_deadline(sc, SSE_CONNECT_TIMEOUT_NS)
     if sc.is_tls {
         << tc_write($&sc.tc, data) or >>
     }
@@ -204,6 +234,7 @@ fn sse_write_all(sc $&SseConn, data &string) int {
 }
 
 fn sse_read_chunk(sc $&SseConn) string {
+    sse_set_deadline(sc, SSE_READ_TIMEOUT_NS)
     if sc.is_tls {
         << tc_read($&sc.tc, 8192) or >>
     }
@@ -222,6 +253,11 @@ fn sse_read_line(sc $&SseConn) string {
     while true {
         idx := strings.index_of(&sc.buf, "\n")
         if idx >= 0 {
+            if idx > SSE_MAX_LINE_BYTES {
+                sc.eof = true
+                sc.buf = ""
+                << ""
+            }
             $ln := sc.buf[0:idx]
             if idx + 1 < sc.buf.len {
                 sc.buf = sc.buf[(idx + 1):sc.buf.len]
@@ -232,6 +268,11 @@ fn sse_read_line(sc $&SseConn) string {
                 ln = ln[0:(ln.len - 1)]
             }
             << ln
+        }
+        if sc.buf.len >= SSE_MAX_LINE_BYTES {
+            sc.eof = true
+            sc.buf = ""
+            << ""
         }
         chunk := sse_read_chunk(sc) or (err) {
             sc.eof = true
@@ -285,12 +326,24 @@ pub fn sse_connect_into(api_base string, agent_id string, priv &rsa.PrivateKey, 
     sc.eof = false
 
     if https {
-        cfg := tls.new_config(sni)
-        sc.tc = tls.dial("tcp", addr, &cfg) or (err) {
+        $nc := net.dial_timeout("tcp", addr, SSE_CONNECT_TIMEOUT_NS) or (err) {
+            << SseConnectOutcome{ok: false, http_status: 0, err_msg: err.msg()}
+        }
+        fd := nc.descriptor() or (err) {
+            nc_close($&nc)
+            << SseConnectOutcome{ok: false, http_status: 0, err_msg: err.msg()}
+        }
+        nc.set_deadline(time.now() + SSE_CONNECT_TIMEOUT_NS) or (err) {
+            net_fd_close_q(fd)
+            << SseConnectOutcome{ok: false, http_status: 0, err_msg: err.msg()}
+        }
+        $cfg := tls.new_config(sni)
+        sc.tc = tls.client(nc, &cfg) or (err) {
+            net_fd_close_q(fd)
             << SseConnectOutcome{ok: false, http_status: 0, err_msg: err.msg()}
         }
     } else {
-        sc.conn = net.dial_to("tcp", addr) or (err) {
+        sc.conn = net.dial_timeout("tcp", addr, SSE_CONNECT_TIMEOUT_NS) or (err) {
             << SseConnectOutcome{ok: false, http_status: 0, err_msg: err.msg()}
         }
     }

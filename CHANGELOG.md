@@ -2,6 +2,14 @@
 
 All notable changes to `fatext-cli` will be documented in this file.
 
+## [1.0.4] - 2026-11-27
+
+### Security
+- Rebuild release binaries with standardized platform formats and modern memory-protection hardening:
+  - **Linux ELF**: `ET_DYN` Position-Independent Executable (`PIE`), strict `W^X` segment permissions (`R--` / `R-X` / `RW-`, no `RWE` segment), `Full RELRO` (`GNU_RELRO` + `BIND_NOW`), non-executable `GNU_STACK`, section headers, and Build-ID metadata.
+  - **Windows PE32+**: Standard `.text`, `.rdata`, `.data`, `.pdata`, and `.reloc` sections with base relocations enabled (`DYNAMIC_BASE`, `HIGH_ENTROPY_VA`, `NX_COMPAT`).
+  - **macOS Mach-O**: Position-Independent Executable (`PIE`, `MH_NO_HEAP_EXECUTION`) with embedded ad-hoc code signature.
+
 ## [1.0.3] - 2026-11-27
 
 ### Security

@@ -394,44 +394,60 @@ pub fn cli_find_key_for_ver(doc &json.Doc, want_ver int, cur_ver int, cur_pem &s
     << ""
 }
 
-fn cli_verify_agent_rotations(cdoc &json.Doc, cid string, cur_ver int, cur_pem &string, errs $&[]string) {
+pub fn cli_verify_agent_rotations(cdoc &json.Doc, cid string, cur_ver int, cur_pem &string, errs $&[]string) {
+    if cur_ver <= 1 { << }
     rt := cdoc.root()
-    if !cdoc.has(rt, "key_history") || !cdoc.is_list(cdoc.get(rt, "key_history")) { << }
+    if !cdoc.has(rt, "key_history") || !cdoc.is_list(cdoc.get(rt, "key_history")) {
+        errs.push("key_history missing for version v" + strconv.itoa(cur_ver))
+        <<
+    }
     kh := cdoc.get(rt, "key_history")
     cnt := doc_count(cdoc, kh)
-    for i in 0:cnt {
-        el := cdoc.at(kh, i)
-        if !cdoc.is_dict(el) { -> }
+    for ver in 1:cur_ver {
+        $el_idx := -1
+        for i in 0:cnt {
+            el := cdoc.at(kh, i)
+            if cdoc.is_dict(el) && json_int_or(cdoc, cdoc.get(el, "version"), 0) == ver {
+                el_idx = i
+                <-
+            }
+        }
+        if el_idx < 0 {
+            errs.push("missing key_history entry v" + strconv.itoa(ver))
+            ->
+        }
+        el := cdoc.at(kh, el_idx)
         osig := json_str_or(cdoc, cdoc.get(el, "rotated_by_old_sig"), "")
         nsig := json_str_or(cdoc, cdoc.get(el, "rotated_by_new_sig"), "")
-        if osig.len > 0 && nsig.len > 0 {
-            old_pem := json_str_or(cdoc, cdoc.get(el, "public_key_pem"), "")
-            vu := json_int_or(cdoc, cdoc.get(el, "valid_until"), 0)
-            old_v := json_int_or(cdoc, cdoc.get(el, "version"), 0)
-            next_pem := cli_find_key_for_ver(cdoc, old_v + 1, cur_ver, cur_pem)
-            old_pk := decode_spki_public_pem(&old_pem) or (err) {
-                errs.push("invalid historical controller key")
-                ->
+        if osig.len == 0 || nsig.len == 0 {
+            errs.push("missing key rotation signatures for v" + strconv.itoa(ver))
+            ->
+        }
+        old_pem := json_str_or(cdoc, cdoc.get(el, "public_key_pem"), "")
+        vu := json_int_or(cdoc, cdoc.get(el, "valid_until"), 0)
+        next_pem := cli_find_key_for_ver(cdoc, ver + 1, cur_ver, cur_pem)
+        old_pk := decode_spki_public_pem(&old_pem) or (err) {
+            errs.push("invalid historical key v" + strconv.itoa(ver))
+            ->
+        }
+        if next_pem.len == 0 {
+            errs.push("missing next key in chain v" + strconv.itoa(ver + 1))
+            ->
+        }
+        next_pk := decode_spki_public_pem(&next_pem) or (err) {
+            errs.push("invalid next key v" + strconv.itoa(ver + 1))
+            ->
+        }
+        $matched := false
+        for dt in -60:61 {
+            cand := "{\"agent_id\":" + json.quote(&cid) + ",\"key_version\":" + strconv.itoa(ver + 1) + ",\"new_public_key_pem\":" + json.quote(&next_pem) + ",\"timestamp\":" + strconv.itoa(vu + dt) + "}"
+            if verify_pss_message(&old_pk, &cand, osig + "") && verify_pss_message(&next_pk, &cand, nsig + "") {
+                matched = true
+                <-
             }
-            if next_pem.len == 0 {
-                errs.push("missing next controller key in chain")
-                ->
-            }
-            next_pk := decode_spki_public_pem(&next_pem) or (err) {
-                errs.push("invalid next controller key")
-                ->
-            }
-            $matched := false
-            for dt in -2:3 {
-                cand := "{\"agent_id\":" + json.quote(&cid) + ",\"key_version\":" + strconv.itoa(old_v + 1) + ",\"new_public_key_pem\":" + json.quote(&next_pem) + ",\"timestamp\":" + strconv.itoa(vu + dt) + "}"
-                if verify_pss_message(&old_pk, &cand, osig + "") && verify_pss_message(&next_pk, &cand, nsig + "") {
-                    matched = true
-                    <-
-                }
-            }
-            if !matched {
-                errs.push("controller key rotation signature link v" + strconv.itoa(old_v) + "->v" + strconv.itoa(old_v + 1) + " failed")
-            }
+        }
+        if !matched {
+            errs.push("key rotation signature link v" + strconv.itoa(ver) + "->v" + strconv.itoa(ver + 1) + " failed")
         }
     }
 }
@@ -445,6 +461,66 @@ fn doc_count(doc &json.Doc, n int) int {
     << doc.count(n)
 }
 
+fn cli_verify_agent_binding(
+    aid string,
+    afk &FetchedKey,
+    adoc &json.Doc,
+    on int,
+    kind string,
+    ctrl_id string,
+    cid string,
+    absig string
+) string {
+    ar := adoc.root()
+    if !adoc.has(on, "agent_binding") || adoc.is_null(adoc.get(on, "agent_binding")) || !adoc.is_dict(adoc.get(on, "agent_binding")) {
+        << "missing agent_binding"
+    }
+    ab := adoc.get(on, "agent_binding")
+    if json_has_str(adoc, ab, "controller_id", "") != ctrl_id {
+        << "agent_binding controller_id mismatch"
+    }
+    ab_fp := json_str_or(adoc, adoc.get(ab, "agent_pub_fp"), "")
+    ab_ts := json_int_or(adoc, adoc.get(ab, "timestamp"), 0)
+    $bind_pem := ""
+    if pubkey_fingerprint(&afk.pub_pem) == ab_fp {
+        bind_pem = afk.pub_pem + ""
+    } else if adoc.has(ar, "key_history") && adoc.is_list(adoc.get(ar, "key_history")) {
+        kh := adoc.get(ar, "key_history")
+        for i in 0:adoc.count(kh) {
+            el := adoc.at(kh, i)
+            kpem := json_str_or(adoc, adoc.get(el, "public_key_pem"), "")
+            if pubkey_fingerprint(&kpem) == ab_fp {
+                bind_pem = kpem
+                <-
+            }
+        }
+    }
+    if bind_pem.len == 0 {
+        << "agent_binding fingerprint key missing from agent"
+    }
+    $canon_b := ""
+    if kind == "enrollment" {
+        canon_b = cli_canon_binding(ab_fp + "", ctrl_id + "", cid + "", ab_ts)
+    } else {
+        ab_cid := json_has_str(adoc, ab, "cred_id", "")
+        if ab_cid.len > 0 {
+            if !is_valid_cred_id(ab_cid + "") {
+                << "invalid agent_binding cred_id"
+            }
+            canon_b = cli_canon_binding(ab_fp + "", ctrl_id + "", ab_cid + "", ab_ts)
+        } else {
+            if json_has_str(adoc, ab, "agent_id", "") != aid {
+                << "agent_binding agent_id mismatch"
+            }
+            canon_b = cli_canon_adoption(aid + "", ab_fp + "", ctrl_id + "", ab_ts)
+        }
+    }
+    if canon_b.len == 0 || !cli_verify_pem_sig(&bind_pem, &canon_b, absig + "") {
+        << "agent_binding_sig verification failed"
+    }
+    << ""
+}
+
 pub fn cli_verify_controller_binding_for_doc(
     aid string,
     afk &FetchedKey,
@@ -453,6 +529,17 @@ pub fn cli_verify_controller_binding_for_doc(
     cfk &FetchedKey,
     cdoc &json.Doc
 ) string {
+    if afk.status != "active" {
+        << "agent status is " + afk.status
+    }
+    if cfk.status != "active" {
+        << "controller status is " + cfk.status
+    }
+    $arot_errs := []string{}
+    cli_verify_agent_rotations(adoc, aid + "", afk.key_version, &afk.pub_pem, $&arot_errs)
+    if arot_errs.len > 0 {
+        << arot_errs[0] + ""
+    }
     ar := adoc.root()
     if !adoc.is_dict(ar) || !adoc.has(ar, "ownership") || adoc.is_null(adoc.get(ar, "ownership")) {
         << "agent does not declare controller ownership"
@@ -460,8 +547,12 @@ pub fn cli_verify_controller_binding_for_doc(
     on := adoc.get(ar, "ownership")
     if !adoc.is_dict(on) { << "invalid agent ownership object" }
     ctrl_id := json_has_str(adoc, on, "controller_id", "")
-    if ctrl_id != expected_ctrl_id {
+    if ctrl_id != expected_ctrl_id || !is_valid_agent_id(ctrl_id + "") {
         << "ownership controller_id mismatch: expected " + expected_ctrl_id + ", got " + ctrl_id
+    }
+    ost := json_has_str(adoc, on, "status", "")
+    if ost != "active" {
+        << "ownership status is " + ost
     }
     ckv := json_has_int(adoc, on, "controller_key_version", 0)
     cid := json_has_str(adoc, on, "cred_id", "")
@@ -469,6 +560,9 @@ pub fn cli_verify_controller_binding_for_doc(
     lbl := json_has_str(adoc, on, "label", "")
     iat := json_has_int(adoc, on, "issued_at", 0)
     exp := json_has_int(adoc, on, "expires_at", 0)
+    if exp > 0 && time.now_time().unix() > exp {
+        << "credential expired"
+    }
     csig := json_has_str(adoc, on, "controller_sig", "")
     absig := json_has_str(adoc, on, "agent_binding_sig", "")
 
@@ -516,38 +610,22 @@ pub fn cli_verify_controller_binding_for_doc(
     if canon_pl.len == 0 || !cli_verify_pem_sig(&cpem, &canon_pl, csig + "") {
         << "controller_sig verification failed"
     }
-    if adoc.has(on, "agent_binding") && !adoc.is_null(adoc.get(on, "agent_binding")) {
-        ab := adoc.get(on, "agent_binding")
-        ab_fp := json_str_or(adoc, adoc.get(ab, "agent_pub_fp"), "")
-        ab_ts := json_int_or(adoc, adoc.get(ab, "timestamp"), 0)
-        $bind_pem := ""
-        if pubkey_fingerprint(&afk.pub_pem) == ab_fp {
-            bind_pem = afk.pub_pem + ""
-        } else if adoc.has(ar, "key_history") && adoc.is_list(adoc.get(ar, "key_history")) {
-            kh := adoc.get(ar, "key_history")
-            for i in 0:adoc.count(kh) {
-                el := adoc.at(kh, i)
-                kpem := json_str_or(adoc, adoc.get(el, "public_key_pem"), "")
-                if pubkey_fingerprint(&kpem) == ab_fp {
-                    bind_pem = kpem
-                    <-
-                }
+    $in_roster := false
+    if cdoc.has(cr, "managed_agents") && cdoc.is_list(cdoc.get(cr, "managed_agents")) {
+        arr := cdoc.get(cr, "managed_agents")
+        for i in 0:cdoc.count(arr) {
+            el := cdoc.at(arr, i)
+            if cdoc.is_dict(el) && json_str_or(cdoc, cdoc.get(el, "agent_id"), "") == aid &&
+               json_str_or(cdoc, cdoc.get(el, "cred_id"), "") == cid {
+                in_roster = true
+                <-
             }
         }
-        if bind_pem.len == 0 {
-            << "agent_binding fingerprint key missing from agent"
-        }
-        $canon_b := ""
-        if kind == "enrollment" {
-            canon_b = cli_canon_binding(ab_fp + "", ctrl_id + "", cid + "", ab_ts)
-        } else {
-            canon_b = cli_canon_adoption(aid + "", ab_fp + "", ctrl_id + "", ab_ts)
-        }
-        if !cli_verify_pem_sig(&bind_pem, &canon_b, absig + "") {
-            << "agent_binding_sig verification failed"
-        }
     }
-    << ""
+    if !in_roster {
+        << "agent credential not listed in controller managed_agents roster"
+    }
+    << cli_verify_agent_binding(aid + "", afk, adoc, on, kind + "", ctrl_id + "", cid + "", absig + "")
 }
 
 pub fn cmd_verify(opts &CliOpts, args []string) int {
@@ -567,6 +645,7 @@ pub fn cmd_verify(opts &CliOpts, args []string) int {
     if afk.status != "active" {
         errs.push("agent status is " + afk.status)
     }
+    cli_verify_agent_rotations(&adoc, aid + "", afk.key_version, &afk.pub_pem, $&errs)
 
     now := time.now_time().unix()
     if !adoc.has(ar, "ownership") || adoc.is_null(adoc.get(ar, "ownership")) {
@@ -605,95 +684,71 @@ pub fn cmd_verify(opts &CliOpts, args []string) int {
     if ost != "active" { errs.push("ownership status is " + ost) }
     if exp > 0 && now > exp { errs.push("credential expired") }
 
-    cfk := fetch_agent_key(cfg_opt.api_base + "", opts.timeout_sec, ctrl_id + "")
     $cst := "unknown"
-    if !cfk.ok {
-        errs.push("failed fetching controller " + ctrl_id + ": " + cfk.err_msg)
+    if !is_valid_agent_id(ctrl_id + "") {
+        errs.push("invalid ownership controller_id")
     } else {
-        cst = cfk.status + ""
-        if cfk.status != "active" { errs.push("controller status is " + cfk.status) }
-        cdoc := json.parse(&cfk.raw_json)
-        if !cdoc.ok() {
-            errs.push("invalid controller json")
+        cfk := fetch_agent_key(cfg_opt.api_base + "", opts.timeout_sec, ctrl_id + "")
+        if !cfk.ok {
+            errs.push("failed fetching controller " + ctrl_id + ": " + cfk.err_msg)
         } else {
-            cr := cdoc.root()
-            if cdoc.has(cr, "ownership") && !cdoc.is_null(cdoc.get(cr, "ownership")) {
-                errs.push("controller itself has ownership (violates 1-hop hierarchy)")
-            }
-            cli_verify_agent_rotations(&cdoc, ctrl_id + "", cfk.key_version, &cfk.pub_pem, $&errs)
-            cpem := cli_find_key_for_ver(&cdoc, ckv, cfk.key_version, &cfk.pub_pem)
-            if cpem.len == 0 {
-                errs.push("controller key version v" + strconv.itoa(ckv) + " missing")
+            cst = cfk.status + ""
+            if cfk.status != "active" { errs.push("controller status is " + cfk.status) }
+            cdoc := json.parse(&cfk.raw_json)
+            if !cdoc.ok() {
+                errs.push("invalid controller json")
             } else {
-                $canon_pl := ""
-                if kind == "enrollment" {
-                    canon_pl = cli_canon_enrollment(ctrl_id + "", ckv, cid + "", exp, iat, lbl + "", &scopes)
-                } else if kind == "agent_cert" {
-                    pl := adoc.get(on, "payload")
-                    akv := json_int_or(&adoc, adoc.get(pl, "agent_key_version"), 0)
-                    afp := json_str_or(&adoc, adoc.get(pl, "agent_pub_fp"), "")
-                    apem_ver := cli_find_key_for_ver(&adoc, akv, afk.key_version, &afk.pub_pem)
-                    if apem_ver.len == 0 {
-                        errs.push("agent_cert agent_key_version v" + strconv.itoa(akv) + " missing from agent")
-                    } else if pubkey_fingerprint(&apem_ver) != afp {
-                        errs.push("agent_cert fingerprint does not match agent key")
-                    }
-                    canon_pl = cli_canon_agent_cert(aid + "", akv, afp + "", ctrl_id + "", ckv, cid + "", exp, iat, lbl + "", &scopes)
+                cr := cdoc.root()
+                if cdoc.has(cr, "ownership") && !cdoc.is_null(cdoc.get(cr, "ownership")) {
+                    errs.push("controller itself has ownership (violates 1-hop hierarchy)")
+                }
+                cli_verify_agent_rotations(&cdoc, ctrl_id + "", cfk.key_version, &cfk.pub_pem, $&errs)
+                cpem := cli_find_key_for_ver(&cdoc, ckv, cfk.key_version, &cfk.pub_pem)
+                if cpem.len == 0 {
+                    errs.push("controller key version v" + strconv.itoa(ckv) + " missing")
                 } else {
-                    errs.push("unknown ownership kind: " + kind)
-                }
-                if canon_pl.len > 0 && !cli_verify_pem_sig(&cpem, &canon_pl, csig + "") {
-                    errs.push("controller_sig verification failed")
-                }
-            }
-            // Verify roster entry in controller.managed_agents[]
-            $in_roster := false
-            if cdoc.has(cr, "managed_agents") && cdoc.is_list(cdoc.get(cr, "managed_agents")) {
-                arr := cdoc.get(cr, "managed_agents")
-                for i in 0:cdoc.count(arr) {
-                    el := cdoc.at(arr, i)
-                    if cdoc.is_dict(el) && json_str_or(&cdoc, cdoc.get(el, "agent_id"), "") == aid &&
-                       json_str_or(&cdoc, cdoc.get(el, "cred_id"), "") == cid {
-                        in_roster = true
-                        <-
+                    $canon_pl := ""
+                    if kind == "enrollment" {
+                        canon_pl = cli_canon_enrollment(ctrl_id + "", ckv, cid + "", exp, iat, lbl + "", &scopes)
+                    } else if kind == "agent_cert" {
+                        pl := adoc.get(on, "payload")
+                        akv := json_int_or(&adoc, adoc.get(pl, "agent_key_version"), 0)
+                        afp := json_str_or(&adoc, adoc.get(pl, "agent_pub_fp"), "")
+                        apem_ver := cli_find_key_for_ver(&adoc, akv, afk.key_version, &afk.pub_pem)
+                        if apem_ver.len == 0 {
+                            errs.push("agent_cert agent_key_version v" + strconv.itoa(akv) + " missing from agent")
+                        } else if pubkey_fingerprint(&apem_ver) != afp {
+                            errs.push("agent_cert fingerprint does not match agent key")
+                        }
+                        canon_pl = cli_canon_agent_cert(aid + "", akv, afp + "", ctrl_id + "", ckv, cid + "", exp, iat, lbl + "", &scopes)
+                    } else {
+                        errs.push("unknown ownership kind: " + kind)
+                    }
+                    if canon_pl.len > 0 && !cli_verify_pem_sig(&cpem, &canon_pl, csig + "") {
+                        errs.push("controller_sig verification failed")
                     }
                 }
+                // Verify roster entry in controller.managed_agents[]
+                $in_roster := false
+                if cdoc.has(cr, "managed_agents") && cdoc.is_list(cdoc.get(cr, "managed_agents")) {
+                    arr := cdoc.get(cr, "managed_agents")
+                    for i in 0:cdoc.count(arr) {
+                        el := cdoc.at(arr, i)
+                        if cdoc.is_dict(el) && json_str_or(&cdoc, cdoc.get(el, "agent_id"), "") == aid &&
+                           json_str_or(&cdoc, cdoc.get(el, "cred_id"), "") == cid {
+                            in_roster = true
+                            <-
+                        }
+                    }
+                }
+                if !in_roster { errs.push("agent credential not listed in controller managed_agents roster") }
             }
-            if !in_roster { errs.push("agent credential not listed in controller managed_agents roster") }
         }
     }
 
-    if adoc.has(on, "agent_binding") && !adoc.is_null(adoc.get(on, "agent_binding")) {
-        ab := adoc.get(on, "agent_binding")
-        ab_fp := json_str_or(&adoc, adoc.get(ab, "agent_pub_fp"), "")
-        ab_ts := json_int_or(&adoc, adoc.get(ab, "timestamp"), 0)
-        $bind_pem := ""
-        if pubkey_fingerprint(&afk.pub_pem) == ab_fp {
-            bind_pem = afk.pub_pem + ""
-        } else if adoc.has(ar, "key_history") && adoc.is_list(adoc.get(ar, "key_history")) {
-            kh := adoc.get(ar, "key_history")
-            for i in 0:adoc.count(kh) {
-                el := adoc.at(kh, i)
-                kpem := json_str_or(&adoc, adoc.get(el, "public_key_pem"), "")
-                if pubkey_fingerprint(&kpem) == ab_fp {
-                    bind_pem = kpem
-                    <-
-                }
-            }
-        }
-        if bind_pem.len == 0 {
-            errs.push("agent_binding fingerprint key missing from agent")
-        } else {
-            $canon_b := ""
-            if kind == "enrollment" {
-                canon_b = cli_canon_binding(ab_fp + "", ctrl_id + "", cid + "", ab_ts)
-            } else {
-                canon_b = cli_canon_adoption(aid + "", ab_fp + "", ctrl_id + "", ab_ts)
-            }
-            if !cli_verify_pem_sig(&bind_pem, &canon_b, absig + "") {
-                errs.push("agent_binding_sig verification failed")
-            }
-        }
+    ab_err := cli_verify_agent_binding(aid + "", &afk, &adoc, on, kind + "", ctrl_id + "", cid + "", absig + "")
+    if ab_err.len > 0 {
+        errs.push(ab_err)
     }
 
     valid := errs.len == 0

@@ -100,6 +100,10 @@ jobs:
         if: matrix.run_tests
         run: python3 scripts/test_cli.py --suite-b-only
 
+      - name: Run P2P reliability and NAT traversal tests
+        if: matrix.run_tests
+        run: python3 scripts/test_p2p.py
+
   server-integration:
     needs: version-check
     runs-on: ubuntu-24.04

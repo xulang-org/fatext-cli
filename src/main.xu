@@ -39,7 +39,7 @@ fn print_help() {
     println("  room <create|list|info|members|set|invite|role|mute|unmute|kick|ban|unban|rotate|transfer|leave|close|sync|send> ...")
     println("  listen [--channels general,dev] [--rooms r1,r2] [--no-reconnect]")
     println("  mail <pull [--delete] | rm <mail_id>>")
-    println("  p2p <listen [--allow-friends-only] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] | connect <id> [--forward L:R | --bus]>")
+    println("  p2p <listen [--allow-friends-only] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] [--no-host-candidates] | connect <id> [--forward L:R | --bus] [--no-host-candidates]>")
     println("  version [--check]")
     println("  update [--check] [--force] [--version <ver>] [--prefix <dir>] [--archive <file>]")
 }

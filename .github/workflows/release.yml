@@ -104,7 +104,7 @@ jobs:
           python scripts/sync_version.py
           $env:XU_STDLIB_ROOT = $xuStd
           if ("${{ matrix.target }}" -eq "windows-arm64") {
-            & $xuBin build --target windows/arm64 src -o stage\fatext.exe
+            & $xuBin build --target windows-arm64 src -o stage\fatext.exe
           } else {
             & $xuBin build src -o stage\fatext.exe
           }
@@ -149,5 +149,5 @@ jobs:
         with:
           tag_name: ${{ needs.verify-tag.outputs.tag }}
           name: "fatext-cli ${{ needs.verify-tag.outputs.tag }}"
-          generate_release_notes: true
+          generate_release_notes: false
           files: release-assets/*

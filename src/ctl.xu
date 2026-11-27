@@ -110,7 +110,7 @@ pub fn cli_canon_adoption(aid string, fp string, controller_id string, ts int) s
 
 pub fn cmd_ctl(opts &CliOpts, args []string) int {
     if args.len < 1 {
-        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl <cred|agents|grant|suspend|resume|revoke|policy|soul|rules> ...", 0, EXIT_USAGE)
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl <cred|agents|grant|suspend|resume|revoke|policy|soul|rules|human> ...", 0, EXIT_USAGE)
     }
     sub := args[0] + ""
     $rest := []string{}
@@ -342,6 +342,10 @@ pub fn cmd_ctl(opts &CliOpts, args []string) int {
 
     if sub == "soul" || sub == "rules" {
         << cmd_ctl_doc(opts, sub + "", rest)
+    }
+
+    if sub == "human" {
+        << cmd_ctl_human(opts, rest)
     }
 
     << emit_err(opts, "ERR_USAGE", 0, "unknown ctl subcommand: " + sub, 0, EXIT_USAGE)

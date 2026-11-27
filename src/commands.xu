@@ -1762,6 +1762,11 @@ pub fn cmd_mail(opts &CliOpts, args []string) int {
         arr := doc.get(doc.root(), "mail")
         if !doc.is_list(arr) { << EXIT_OK }
 
+        $hcfg := empty_human_mail_config()
+        if doc.count(arr) > 0 {
+            hcfg = fetch_verified_human_config(opts, &cfg, &priv)
+        }
+
         for j in 0:doc.count(arr) {
             el := doc.at(arr, j)
             if !doc.is_dict(el) { -> }
@@ -1793,12 +1798,14 @@ pub fn cmd_mail(opts &CliOpts, args []string) int {
 
             pdoc := json.parse(&pt)
             $mfrom := ""
+            $mheader_from := ""
             $msubj := ""
             $mraw := pt + ""
             $verdict_match := false
             if pdoc.ok() {
                 pr_node := pdoc.root()
                 mfrom = json_str_or(&pdoc, pdoc.get(pr_node, "from"), "")
+                mheader_from = json_str_or(&pdoc, pdoc.get(pr_node, "header_from"), "")
                 msubj = json_str_or(&pdoc, pdoc.get(pr_node, "subject"), "")
                 mraw = json_str_or(&pdoc, pdoc.get(pr_node, "raw_snippet"), pt + "")
                 pspf := json_bool_or(&pdoc, pdoc.get(pr_node, "spf_pass"), false)
@@ -1806,6 +1813,10 @@ pub fn cmd_mail(opts &CliOpts, args []string) int {
                 pdmarc := json_bool_or(&pdoc, pdoc.get(pr_node, "dmarc_pass"), false)
                 verdict_match = (pspf == spf) && (pdkim == dkim) && (pdmarc == dmarc)
             }
+            norm_hf := normalize_email_addr(&mheader_from)
+            from_human := hcfg.ok && norm_hf.len > 0 && email_list_contains(&hcfg.emails, &norm_hf)
+            cmd_ok := verdict_match && dkim && dmarc && from_human && hcfg.command_enabled
+
             $spf_s := "false"
             if spf { spf_s = "true" }
             $dkim_s := "false"
@@ -1814,8 +1825,12 @@ pub fn cmd_mail(opts &CliOpts, args []string) int {
             if dmarc { dmarc_s = "true" }
             $vm_s := "false"
             if verdict_match { vm_s = "true" }
+            $fh_s := "false"
+            if from_human { fh_s = "true" }
+            $ce_s := "false"
+            if cmd_ok { ce_s = "true" }
 
-            println("{\"mail_id\":" + json.quote(&mid) + ",\"received_at\":" + strconv.itoa(rat) + ",\"expires_at\":" + strconv.itoa(rat + 864000) + ",\"from\":" + json.quote(&mfrom) + ",\"subject\":" + json.quote(&msubj) + ",\"text\":" + json.quote(&mraw) + ",\"spf_pass\":" + spf_s + ",\"dkim_pass\":" + dkim_s + ",\"dmarc_pass\":" + dmarc_s + ",\"verified\":" + vm_s + "}")
+            println("{\"mail_id\":" + json.quote(&mid) + ",\"received_at\":" + strconv.itoa(rat) + ",\"expires_at\":" + strconv.itoa(rat + 864000) + ",\"from\":" + json.quote(&mfrom) + ",\"header_from\":" + json.quote(&mheader_from) + ",\"subject\":" + json.quote(&msubj) + ",\"text\":" + json.quote(&mraw) + ",\"spf_pass\":" + spf_s + ",\"dkim_pass\":" + dkim_s + ",\"dmarc_pass\":" + dmarc_s + ",\"verified\":" + vm_s + ",\"from_human\":" + fh_s + ",\"command_eligible\":" + ce_s + "}")
 
             if del_after && is_valid_mail_id(mid + "") {
                 _ := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/mail/" + mid, &empty, "")

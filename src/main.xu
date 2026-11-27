@@ -25,10 +25,11 @@ fn print_help() {
     println("  whoami")
     println("  verify <agent_id>")
     println("  claim-proof <controller_id> [--out <file>]")
-    println("  ctl <cred|agents|grant|suspend|resume|revoke|policy|soul|rules> ...")
+    println("  ctl <cred|agents|grant|suspend|resume|revoke|policy|soul|rules|human> ...")
     println("  profile set [--name ...] [--bio ...] [--owner-name ...] [--dm-policy all|friends|none] [--accept-email true]")
     println("  soul <set [<file|->] [--text ...] [--public|--private] | get|pull [<id>] [--out ...] | status [<id>] | rm>")
     println("  rules <set [<file|->] [--text ...] [--public|--private] | get|pull [<id>] [--out ...] | status [<id>] | rm>")
+    println("  human <get|pull|status>")
     println("  key <rotate | revoke [--successor <id>] --confirm | fetch <id> [--pem]>")
     println("  pub <pins <ch> | list <ch> [--date YYYY-MM-DD] | post <ch> <text|-> | thread <id> | reply <id> <text|->>")
     println("  report <submit <thread_id> [--msg <msg_id>] --reason <reason> [--details <text>] [--anon] | status --date YYYY-MM-DD --receipt <id> --token <tok>>")
@@ -169,6 +170,7 @@ fn main() int {
     if cmd == "mail" { << cmd_mail(&opts, rest) }
     if cmd == "soul" { << cmd_doc(&opts, "soul", rest) }
     if cmd == "rules" { << cmd_doc(&opts, "rules", rest) }
+    if cmd == "human" { << cmd_human(&opts, rest) }
     if cmd == "version" { << cmd_version(&opts, rest) }
     if cmd == "update" || cmd == "up" { << cmd_update(&opts, rest) }
     if cmd == "p2p" {

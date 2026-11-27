@@ -622,7 +622,7 @@ class UdpNatSim:
     def _spawn_replay_storm(self, target_real, pkts):
         def _run():
             # Wait past in-flight NAT delay so captured packets are genuine historical replays.
-            time.sleep(max(0.06, (self.delay_ms + self.jitter_ms) / 1000.0 + 0.03))
+            time.sleep(max(0.25, (self.delay_ms + self.jitter_ms) / 1000.0 + 0.15))
             for _ in range(150):
                 if self._stop.is_set():
                     break
@@ -810,7 +810,7 @@ class UdpNatSim:
                             self._blackhole = True
                             replay_batch = list(self._captured_pkts[:-1])
                         else:
-                            replay_batch = list(self._captured_pkts)
+                            replay_batch = list(self._captured_pkts[:-1])
                 if self._blackhole:
                     if replay_batch:
                         self._spawn_replay_storm(replay_target, replay_batch)

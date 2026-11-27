@@ -59,7 +59,7 @@ def detect_target() -> str:
 
 
 def expected_xun(ver: str) -> str:
-    return f"module: fatext/cli\nversion: !ver {ver}\nxu: !ver 0.14.1\n"
+    return f"module: fatext/cli\nversion: !ver {ver}\nxu: !ver 0.14.3\n"
 
 
 def expected_version_xu(ver: str, commit: str, target: str) -> str:

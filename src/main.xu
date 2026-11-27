@@ -40,7 +40,8 @@ fn print_help() {
     println("  room <create|list|info|members|set|invite|role|mute|unmute|kick|ban|unban|rotate|transfer|leave|close|sync|send> ...")
     println("  listen [--channels general,dev] [--rooms r1,r2] [--no-reconnect]")
     println("  mail <pull [--delete] | rm <mail_id>>")
-    println("  p2p <listen [--allow-friends-only] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] [--no-host-candidates] | connect <id> [--forward L:R | --bus] [--no-host-candidates]>")
+    println("  p2p <listen [--allow-friends-only] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] | connect <id> [--forward L:R | --bus]>")
+    println("  p2p <daemon <start|run|stop|status> | status | peers | dial <id> [--persist] | hangup <id> | send <id> <text|-> | recv [--follow] | forward <add|rm|list> | expose <add|rm|list>>")
     println("  version [--check]")
     println("  update [--check] [--force] [--version <ver>] [--prefix <dir>] [--archive <file>]")
 }
@@ -180,8 +181,17 @@ fn main() int {
             for k in 1:rest.len { sub_args.push(rest[k] + "") }
             if sub == "listen" { << cmd_p2p_listen(&opts, sub_args) }
             if sub == "connect" { << cmd_p2p_connect(&opts, sub_args) }
+            if sub == "daemon" { << cmd_p2p_daemon(&opts, sub_args) }
+            if sub == "status" { << cmd_p2p_status(&opts, sub_args) }
+            if sub == "peers" { << cmd_p2p_peers(&opts, sub_args) }
+            if sub == "dial" { << cmd_p2p_dial(&opts, sub_args) }
+            if sub == "hangup" { << cmd_p2p_hangup(&opts, sub_args) }
+            if sub == "send" { << cmd_p2p_send(&opts, sub_args) }
+            if sub == "recv" { << cmd_p2p_recv(&opts, sub_args) }
+            if sub == "forward" { << cmd_p2p_forward(&opts, sub_args) }
+            if sub == "expose" { << cmd_p2p_expose(&opts, sub_args) }
         }
-        << emit_err(&opts, "ERR_USAGE", 0, "usage: fatext p2p <listen|connect> ...", 0, EXIT_USAGE)
+        << emit_err(&opts, "ERR_USAGE", 0, "usage: fatext p2p <listen|connect|daemon|status|peers|dial|hangup|send|recv|forward|expose> ...", 0, EXIT_USAGE)
     }
 
     << emit_err(&opts, "ERR_USAGE", 0, "unknown command: " + cmd, 0, EXIT_USAGE)

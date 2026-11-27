@@ -1557,15 +1557,18 @@ def t12_signaling_security_and_key_rotation(ctx):
         rx.close()
         rx = None
 
-        # Offer without proto="fatext-p2p-v3" must be rejected as unsupported_p2p_proto
+        # Offer without proto="fatext-p2p-v4" (including legacy v3) must be rejected as unsupported_p2p_proto
         rx_proto = LineProc(["--json", "p2p", "listen", "--allow-anyone", "--stdio", "--stun", "none"], home=ctx["hb"], api_url=ctx["api"], binary_stdout=True)
         rx_proto.wait_err_state("listening")
         if ctx.get("relay_state") is not None:
             old_offer = {"session": "s_old_proto", "candidates": [{"t": "host", "a": "127.0.0.1:1"}], "x25519_pub": base64.b64encode(os.urandom(32)).decode(), "mode": "stdio", "remote_port": 0, "expires_at": now + 60}
             fr_old = json.loads(build_dm_frame(ctx["aid"], a_priv, ctx["bid"], b_pub, b_kv, "p2p_offer", old_offer, now, nonce="nonce-old-proto").decode())
             ctx["relay_state"].push_sse(ctx["bid"], "dm", {"from": ctx["aid"], "frame": fr_old})
+            v3_offer = {"session": "s_v3_proto", "proto": "fatext-p2p-v3", "candidates": [{"t": "host", "a": "127.0.0.1:1"}], "x25519_pub": base64.b64encode(os.urandom(32)).decode(), "mode": "stdio", "remote_port": 0, "expires_at": now + 60}
+            fr_v3 = json.loads(build_dm_frame(ctx["aid"], a_priv, ctx["bid"], b_pub, b_kv, "p2p_offer", v3_offer, now, nonce="nonce-v3-proto").decode())
+            ctx["relay_state"].push_sse(ctx["bid"], "dm", {"from": ctx["aid"], "frame": fr_v3})
             time.sleep(0.4)
-            assert_true(rx_proto.proc.poll() is None, "t12 listener stayed alive after old proto offer")
+            assert_true(rx_proto.proc.poll() is None, "t12 listener stayed alive after old/v3 proto offers")
         rx_proto.close()
         rx_proto = None
 
@@ -1618,7 +1621,10 @@ def t13_replay_migration_and_zombie_spoof(ctx):
             home=ctx["ha"], api_url=ctx["api"],
         )
         tx.wait_err_state("connected", timeout=12.0)
-        tx.send_stdin(payload)
+        half = len(payload) // 2
+        tx.send_stdin(payload[:half])
+        time.sleep(0.45)
+        tx.send_stdin(payload[half:])
         tx.close_stdin()
         assert_eq(tx.proc.wait(timeout=20), 0, f"t13a tx exit stderr={tx.err_dump()}")
         assert_eq(rx.proc.wait(timeout=20), 0, f"t13a rx exit stderr={rx.err_dump()}")
@@ -1668,6 +1674,347 @@ def t13_replay_migration_and_zombie_spoof(ctx):
         sim2.stop()
 
 
+def _stop_daemon_safe(home: str, api_url: str):
+    try:
+        run_cli(["--json", "p2p", "daemon", "stop"], home=home, api_url=api_url, timeout=8.0)
+    except Exception:
+        pass
+    spath = os.path.join(home, "p2p-daemon.json")
+    if os.path.exists(spath):
+        try:
+            with open(spath, "r", encoding="utf-8") as f:
+                pid = int(json.load(f).get("pid", 0))
+            if pid > 0:
+                os.kill(pid, 9)
+        except Exception:
+            pass
+        try:
+            os.remove(spath)
+        except OSError:
+            pass
+
+
+def _wait_daemon_sse(home: str, api_url: str, timeout: float = 8.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rc, out, _ = run_cli(["--json", "p2p", "daemon", "status"], home=home, api_url=api_url, timeout=5.0)
+        if rc == 0:
+            st = json.loads(out)
+            if st.get("sse_connected"):
+                return st
+        time.sleep(0.05)
+    raise AssertionError(f"Daemon SSE not ready in {home}")
+
+
+def _wait_peer_connected(home: str, peer_id: str, api_url: str, timeout: float = 12.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rc, out, _ = run_cli(["--json", "p2p", "peers"], home=home, api_url=api_url, timeout=5.0)
+        if rc == 0:
+            peers = json.loads(out).get("peers", [])
+            for p in peers:
+                if p.get("agent_id") == peer_id and p.get("state") == "connected":
+                    return p
+        time.sleep(0.1)
+    raise AssertionError(f"Peer {peer_id} did not reach connected in {home}")
+
+
+def t14_v4_sliding_window_throughput_and_ooo(ctx):
+    sim = UdpNatSim(
+        nat_mode="port_restricted",
+        delay_ms=40.0,
+        jitter_ms=15.0,
+        loss_rate=0.05,
+        reorder_rate=0.15,
+    ).start()
+    stun_arg = f"127.0.0.1:{sim.stun_port}"
+    payload = os.urandom(256 * 1024)
+    rx = tx = None
+    try:
+        rx = LineProc(
+            ["--json", "p2p", "listen", "--stdio", "--stun", stun_arg] + _cand_args(ctx["no_host"]),
+            home=ctx["hb"], api_url=ctx["api"], binary_stdout=True,
+        )
+        rx.wait_err_state("listening")
+        t0 = time.time()
+        tx = LineProc(
+            ["--json", "p2p", "connect", ctx["bid"], "--stun", stun_arg] + _cand_args(ctx["no_host"]),
+            home=ctx["ha"], api_url=ctx["api"],
+        )
+        tx.wait_err_state("connected", timeout=12.0)
+        tx.send_stdin(payload)
+        tx.close_stdin()
+        assert_eq(tx.proc.wait(timeout=20), 0, f"t14 tx exit stderr={tx.err_dump()}")
+        assert_eq(rx.proc.wait(timeout=20), 0, f"t14 rx exit stderr={rx.err_dump()}")
+        elapsed = time.time() - t0
+        rx._out_done.wait(timeout=2.0)
+        assert_eq(hashlib.sha256(bytes(rx.out_bytes)).hexdigest(), hashlib.sha256(payload).hexdigest(), "t14 256KiB SHA-256")
+        assert_true(elapsed < 12.0, f"t14 sliding window expected <12s, took {elapsed:.2f}s")
+    finally:
+        if tx:
+            tx.close()
+        if rx:
+            rx.close()
+        sim.stop()
+
+
+def t15_daemon_lifecycle_and_auth(ctx):
+    ha = ctx["ha"]
+    api = ctx["api"]
+    try:
+        rc, out, err = run_cli(["--json", "p2p", "daemon", "start", "--stun", "none"], home=ha, api_url=api)
+        assert_eq(rc, 0, f"t15 daemon start rc={rc} err={err}")
+        st0 = json.loads(out)
+        assert_eq(st0["proto"], "fatext-p2p-v4", "t15 proto v4")
+
+        st = _wait_daemon_sse(ha, api)
+        assert_eq(st["agent_id"], ctx["aid"], "t15 agent_id")
+        assert_true(st["sse_connected"], "t15 sse_connected")
+
+        spath = os.path.join(ha, "p2p-daemon.json")
+        assert_true(os.path.exists(spath), "t15 p2p-daemon.json exists")
+        mode = os.stat(spath).st_mode & 0o777
+        assert_eq(mode, 0o600, f"t15 p2p-daemon.json mode={oct(mode)}")
+        with open(spath, "r", encoding="utf-8") as f:
+            sdata = json.load(f)
+
+        # Second daemon start must conflict (EXIT_CONFLICT = 6)
+        rc_dup, _, err_dup = run_cli(["--json", "p2p", "daemon", "start", "--stun", "none"], home=ha, api_url=api)
+        assert_eq(rc_dup, 6, f"t15 duplicate start exit code={rc_dup} err={err_dup}")
+
+        # Raw HTTP without/wrong Bearer token must return 401
+        for hdrs in ({}, {"Authorization": "Bearer wrong-token"}):
+            req = urllib.request.Request(f"http://{sdata['addr']}/v1/status", headers=hdrs)
+            try:
+                urllib.request.urlopen(req, timeout=3.0)
+                raise AssertionError("t15 expected 401")
+            except urllib.error.HTTPError as he:
+                assert_eq(he.code, 401, "t15 unauth status 401")
+
+        # Stop daemon cleanly
+        rc_stop, _, err_stop = run_cli(["--json", "p2p", "daemon", "stop"], home=ha, api_url=api)
+        assert_eq(rc_stop, 0, f"t15 daemon stop err={err_stop}")
+        assert_true(not os.path.exists(spath), "t15 p2p-daemon.json removed on stop")
+    finally:
+        _stop_daemon_safe(ha, api)
+
+
+def t16_daemon_send_recv_and_auto_dial(ctx):
+    ha, hb, api = ctx["ha"], ctx["hb"], ctx["api"]
+    aid, bid = ctx["aid"], ctx["bid"]
+    follow_proc = None
+    try:
+        assert_eq(run_cli(["--json", "p2p", "daemon", "start", "--stun", "none"], home=ha, api_url=api)[0], 0, "t16 start A")
+        assert_eq(run_cli(["--json", "p2p", "daemon", "start", "--stun", "none"], home=hb, api_url=api)[0], 0, "t16 start B")
+        _wait_daemon_sse(ha, api)
+        _wait_daemon_sse(hb, api)
+
+        # Auto-dial on first send, then reuse same session
+        rc1, out1, err1 = run_cli(["--json", "p2p", "send", bid, "msg1", "--topic", "chat"], home=ha, api_url=api)
+        assert_eq(rc1, 0, f"t16 send1 err={err1}")
+        s1 = json.loads(out1)["session"]
+        rc2, out2, err2 = run_cli(["--json", "p2p", "send", bid, "msg2", "--topic", "chat"], home=ha, api_url=api)
+        assert_eq(rc2, 0, f"t16 send2 err={err2}")
+        assert_eq(json.loads(out2)["session"], s1, "t16 session reused on send2")
+        rc3, out3, err3 = run_cli(["--json", "p2p", "send", bid, "msg3", "--topic", "ops"], home=ha, api_url=api)
+        assert_eq(rc3, 0, f"t16 send3 err={err3}")
+        assert_eq(json.loads(out3)["session"], s1, "t16 session reused on send3")
+
+        # Wait briefly for delivery and verify recv + since
+        deadline = time.time() + 5.0
+        msgs = []
+        while time.time() < deadline:
+            rc_r, out_r, _ = run_cli(["--json", "p2p", "recv"], home=hb, api_url=api)
+            assert_eq(rc_r, 0, "t16 recv")
+            msgs = json.loads(out_r)["messages"]
+            if len(msgs) >= 3:
+                break
+            time.sleep(0.05)
+        assert_eq([m["text"] for m in msgs], ["msg1", "msg2", "msg3"], "t16 recv all 3")
+        assert_eq(msgs[0]["from"], aid, "t16 from aid")
+        assert_eq(msgs[0]["topic"], "chat", "t16 topic")
+
+        rc_s, out_s, _ = run_cli(["--json", "p2p", "recv", "--since", "1"], home=hb, api_url=api)
+        assert_eq(rc_s, 0, "t16 recv since=1")
+        assert_eq([m["text"] for m in json.loads(out_s)["messages"]], ["msg2", "msg3"], "t16 since=1")
+
+        # Live follow stream
+        follow_proc = LineProc(["--json", "p2p", "recv", "--since", "3", "--follow"], home=hb, api_url=api)
+        time.sleep(0.2)
+        rc4, _, err4 = run_cli(["--json", "p2p", "send", bid, "msg4-live", "--topic", "chat"], home=ha, api_url=api)
+        assert_eq(rc4, 0, f"t16 send4 err={err4}")
+        ev4 = follow_proc.wait_out_json(lambda o: o.get("text") == "msg4-live", timeout=5.0, desc="follow msg4-live")
+        assert_eq(ev4["from"], aid, "t16 follow from")
+
+        rc_p, out_p, _ = run_cli(["--json", "p2p", "peers"], home=ha, api_url=api)
+        assert_eq(rc_p, 0, "t16 peers")
+        plist = json.loads(out_p)["peers"]
+        assert_eq(len(plist), 1, "t16 1 peer")
+        assert_eq(plist[0]["state"], "connected", "t16 peer connected")
+        assert_true(plist[0]["bytes_out"] > 0, "t16 bytes_out > 0")
+    finally:
+        if follow_proc:
+            follow_proc.close()
+        _stop_daemon_safe(ha, api)
+        _stop_daemon_safe(hb, api)
+
+
+def t17_daemon_multiplexed_concurrent_tcp_forward(ctx):
+    ha, hb, api = ctx["ha"], ctx["hb"], ctx["api"]
+    bid = ctx["bid"]
+    echo_port, stop_echo = _start_echo_server()
+    bad_port = free_tcp_port()
+    lport = free_tcp_port()
+    lport_bad = free_tcp_port()
+    try:
+        assert_eq(run_cli(["--json", "p2p", "daemon", "start", "--expose", str(echo_port), "--stun", "none"], home=hb, api_url=api)[0], 0, "t17 start B")
+        assert_eq(run_cli(["--json", "p2p", "daemon", "start", "--stun", "none"], home=ha, api_url=api)[0], 0, "t17 start A")
+        _wait_daemon_sse(ha, api)
+        _wait_daemon_sse(hb, api)
+
+        rc_f, _, err_f = run_cli(["--json", "p2p", "forward", "add", bid, f"{lport}:{echo_port}"], home=ha, api_url=api)
+        assert_eq(rc_f, 0, f"t17 forward add err={err_f}")
+        rc_fb, _, err_fb = run_cli(["--json", "p2p", "forward", "add", bid, f"{lport_bad}:{bad_port}"], home=ha, api_url=api)
+        assert_eq(rc_fb, 0, f"t17 forward add unexposed err={err_fb}")
+
+        # 8 concurrent TCP connections + concurrent p2p send
+        results = {}
+        errs = []
+
+        def _worker(idx: int):
+            try:
+                msg = f"CONC_STREAM_{idx}_".encode() + (b"Z" * 8192)
+                with socket.create_connection(("127.0.0.1", lport), timeout=10.0) as cs:
+                    cs.sendall(msg)
+                    cs.shutdown(socket.SHUT_WR)
+                    got = bytearray()
+                    while True:
+                        ch = cs.recv(4096)
+                        if not ch:
+                            break
+                        got.extend(ch)
+                results[idx] = (hashlib.sha256(msg).hexdigest(), hashlib.sha256(bytes(got)).hexdigest())
+            except Exception as exc:
+                errs.append((idx, str(exc)))
+
+        threads = [threading.Thread(target=_worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        assert_eq(run_cli(["--json", "p2p", "send", bid, "mux-coexist"], home=ha, api_url=api)[0], 0, "t17 mux msg")
+        for t in threads:
+            t.join(timeout=15.0)
+        assert_eq(errs, [], f"t17 concurrent stream errors: {errs}")
+        for i in range(8):
+            assert_eq(results[i][0], results[i][1], f"t17 stream {i} sha256")
+
+        # 3 sequential connections on the SAME forwarded port
+        for i in range(3):
+            with socket.create_connection(("127.0.0.1", lport), timeout=5.0) as cs:
+                p = f"SEQ_{i}".encode()
+                cs.sendall(p)
+                cs.shutdown(socket.SHUT_WR)
+                assert_eq(cs.recv(4096), p, f"t17 seq {i}")
+
+        # Unexposed port fails only its stream, tunnel remains intact
+        with socket.create_connection(("127.0.0.1", lport_bad), timeout=5.0) as cs_bad:
+            cs_bad.settimeout(3.0)
+            assert_eq(cs_bad.recv(1024), b"", "t17 unexposed stream closed cleanly")
+
+        # Verify mux msg arrived & tunnel still healthy
+        rc_r, out_r, _ = run_cli(["--json", "p2p", "recv"], home=hb, api_url=api)
+        assert_eq(rc_r, 0, "t17 recv")
+        assert_true(any(m["text"] == "mux-coexist" for m in json.loads(out_r)["messages"]), "t17 mux-coexist delivered")
+    finally:
+        _stop_daemon_safe(ha, api)
+        _stop_daemon_safe(hb, api)
+        stop_echo.set()
+
+
+def t18_daemon_persistent_auto_reconnect(ctx):
+    ha, hb, api = ctx["ha"], ctx["hb"], ctx["api"]
+    bid = ctx["bid"]
+    echo_port, stop_echo = _start_echo_server()
+    lport = free_tcp_port()
+    env_fast = {
+        "FATEXT_P2P_PING_MS": "250",
+        "FATEXT_P2P_IDLE_TIMEOUT_MS": "1000",
+        "FATEXT_P2P_RECONNECT_MS": "300",
+        "FATEXT_P2P_ANSWER_TIMEOUT_MS": "1200",
+    }
+    try:
+        assert_eq(run_cli(["--json", "p2p", "daemon", "start", "--expose", str(echo_port), "--stun", "none"], home=hb, api_url=api, extra_env=env_fast)[0], 0, "t18 start B1")
+        assert_eq(run_cli(["--json", "p2p", "daemon", "start", "--stun", "none"], home=ha, api_url=api, extra_env=env_fast)[0], 0, "t18 start A")
+        _wait_daemon_sse(ha, api)
+        _wait_daemon_sse(hb, api)
+
+        assert_eq(run_cli(["--json", "p2p", "dial", bid, "--persist"], home=ha, api_url=api)[0], 0, "t18 dial persist")
+        assert_eq(run_cli(["--json", "p2p", "forward", "add", bid, f"{lport}:{echo_port}"], home=ha, api_url=api)[0], 0, "t18 fwd add")
+
+        # Stop B completely, then restart B -> A must auto-reconnect & forward must recover
+        assert_eq(run_cli(["--json", "p2p", "daemon", "stop"], home=hb, api_url=api)[0], 0, "t18 stop B")
+        time.sleep(0.6)
+        assert_eq(run_cli(["--json", "p2p", "daemon", "start", "--expose", str(echo_port), "--stun", "none"], home=hb, api_url=api, extra_env=env_fast)[0], 0, "t18 start B2")
+        _wait_daemon_sse(hb, api)
+
+        _wait_peer_connected(ha, bid, api, timeout=12.0)
+        assert_eq(run_cli(["--json", "p2p", "send", bid, "after-reconnect"], home=ha, api_url=api)[0], 0, "t18 send after reconnect")
+        with socket.create_connection(("127.0.0.1", lport), timeout=5.0) as cs:
+            cs.sendall(b"RECOVERED_FWD_OK")
+            cs.shutdown(socket.SHUT_WR)
+            assert_eq(cs.recv(4096), b"RECOVERED_FWD_OK", "t18 forward recovered after reconnect")
+    finally:
+        _stop_daemon_safe(ha, api)
+        _stop_daemon_safe(hb, api)
+        stop_echo.set()
+
+
+def t19_daemon_simultaneous_dial_and_hangup(ctx):
+    ha, hb, api = ctx["ha"], ctx["hb"], ctx["api"]
+    aid, bid = ctx["aid"], ctx["bid"]
+    try:
+        assert_eq(run_cli(["--json", "p2p", "daemon", "start", "--stun", "none"], home=ha, api_url=api)[0], 0, "t19 start A")
+        assert_eq(run_cli(["--json", "p2p", "daemon", "start", "--stun", "none"], home=hb, api_url=api)[0], 0, "t19 start B")
+        _wait_daemon_sse(ha, api)
+        _wait_daemon_sse(hb, api)
+
+        res = {}
+
+        def _dial(tag: str, home: str, target: str):
+            res[tag] = run_cli(["--json", "p2p", "dial", target], home=home, api_url=api, timeout=15.0)
+
+        t1 = threading.Thread(target=_dial, args=("a", ha, bid))
+        t2 = threading.Thread(target=_dial, args=("b", hb, aid))
+        t1.start()
+        t2.start()
+        t1.join(timeout=16.0)
+        t2.join(timeout=16.0)
+        assert_eq(res["a"][0], 0, f"t19 dial A->B failed: {res['a']}")
+        assert_eq(res["b"][0], 0, f"t19 dial B->A failed: {res['b']}")
+
+        # Bidirectional messaging on converged tunnel
+        assert_eq(run_cli(["--json", "p2p", "send", bid, "ping-ab"], home=ha, api_url=api)[0], 0, "t19 send A->B")
+        assert_eq(run_cli(["--json", "p2p", "send", aid, "pong-ba"], home=hb, api_url=api)[0], 0, "t19 send B->A")
+
+        deadline = time.time() + 5.0
+        got_a = got_b = False
+        while time.time() < deadline and not (got_a and got_b):
+            ra = json.loads(run_cli(["--json", "p2p", "recv"], home=ha, api_url=api)[1])["messages"]
+            rb = json.loads(run_cli(["--json", "p2p", "recv"], home=hb, api_url=api)[1])["messages"]
+            got_a = any(m["text"] == "pong-ba" for m in ra)
+            got_b = any(m["text"] == "ping-ab" for m in rb)
+            time.sleep(0.05)
+        assert_true(got_a and got_b, f"t19 bidirectional messages got_a={got_a} got_b={got_b}")
+
+        # Hangup removes peer cleanly
+        rc_h, _, err_h = run_cli(["--json", "p2p", "hangup", bid], home=ha, api_url=api)
+        assert_eq(rc_h, 0, f"t19 hangup err={err_h}")
+        peers_a = json.loads(run_cli(["--json", "p2p", "peers"], home=ha, api_url=api)[1])["peers"]
+        assert_eq(peers_a, [], "t19 peers empty after hangup")
+    finally:
+        _stop_daemon_safe(ha, api)
+        _stop_daemon_safe(hb, api)
+
+
 TESTS = [
     ("T01_stun_discovery_and_failover", t01_stun_discovery_and_failover),
     ("T02_port_restricted_nat_and_noise", t02_port_restricted_nat_and_noise),
@@ -1682,6 +2029,12 @@ TESTS = [
     ("T11_star_max_peers_and_zombie_reap", t11_star_max_peers_and_zombie_reap),
     ("T12_signaling_security_and_key_rotation", t12_signaling_security_and_key_rotation),
     ("T13_replay_migration_and_zombie_spoof", t13_replay_migration_and_zombie_spoof),
+    ("T14_v4_sliding_window_throughput_and_ooo", t14_v4_sliding_window_throughput_and_ooo),
+    ("T15_daemon_lifecycle_and_auth", t15_daemon_lifecycle_and_auth),
+    ("T16_daemon_send_recv_and_auto_dial", t16_daemon_send_recv_and_auto_dial),
+    ("T17_daemon_multiplexed_concurrent_tcp_forward", t17_daemon_multiplexed_concurrent_tcp_forward),
+    ("T18_daemon_persistent_auto_reconnect", t18_daemon_persistent_auto_reconnect),
+    ("T19_daemon_simultaneous_dial_and_hangup", t19_daemon_simultaneous_dial_and_hangup),
 ]
 
 

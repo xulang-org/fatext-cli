@@ -1,0 +1,642 @@
+@main
+
+#errors
+#crypto/aes
+#crypto/cipher
+#crypto/ecdh
+#crypto/rand
+#crypto/rsa
+#crypto/sha256
+#encoding/base64
+#encoding/json
+#net
+#os
+#strconv
+#strings
+#time
+
+pub const P2P_PROTO_V4 = "fatext-p2p-v4"
+pub const P2P_PKT_PUNCH = 1
+pub const P2P_PKT_ACK = 2
+pub const P2P_PKT_DATA = 3
+pub const P2P_PKT_FIN = 4
+pub const P2P_PKT_PING = 5
+pub const P2P_PKT_PONG = 6
+pub const P2P_PKT_PATH_CHALLENGE = 7
+pub const P2P_PKT_PATH_RESPONSE = 8
+
+pub const P2P_REPLAY_WIN = 62
+pub const P2P_REPLAY_MASK = 4611686018427387903
+pub const P2P_MAX_PN = 4611686018427387900
+pub const P2P_MTU_CHUNK = 1150
+pub const P2P_MAX_RETRIES = 12
+pub const P2P_RTO_MIN_NS = 100000000
+pub const P2P_RTO_INIT_NS = 200000000
+pub const P2P_RTO_MAX_NS = 2000000000
+pub const P2P_WIN_SIZE = 32
+pub const P2P_SACK_BITS = 62
+pub const P2P_MAX_RX_OOO = 62
+pub const P2P_HDR_LEN = 21
+
+pub fn p2p_env_ms(name string, def_ms int, min_ms int, max_ms int) int {
+    raw := os.getenv(name)
+    s := strings.trim_space(&raw)
+    if s.len == 0 { << def_ms }
+    $v := strconv.atoi(&s) or (err) { << def_ms }
+    if v < min_ms { v = min_ms }
+    if v > max_ms { v = max_ms }
+    << v
+}
+
+pub struct P2PRtoState {
+    pub srtt_ns int
+    pub rto_ns int
+    pub cur_rto_ns int
+    pub last_backoff_ns int
+}
+
+pub fn rto_init() P2PRtoState {
+    << P2PRtoState{srtt_ns: 0, rto_ns: P2P_RTO_INIT_NS, cur_rto_ns: P2P_RTO_INIT_NS, last_backoff_ns: 0}
+}
+
+pub fn rto_on_ack(st $&P2PRtoState, sample_ns int, tries int) {
+    if tries != 1 { << }
+    $smp := sample_ns
+    if smp < 1000000 { smp = 1000000 }
+    if st.srtt_ns == 0 {
+        st.srtt_ns = smp
+    } else {
+        st.srtt_ns = (st.srtt_ns * 7 + smp) / 8
+    }
+    $r := st.srtt_ns * 2 + 80000000
+    if r < P2P_RTO_MIN_NS { r = P2P_RTO_MIN_NS }
+    if r > P2P_RTO_MAX_NS { r = P2P_RTO_MAX_NS }
+    st.rto_ns = r
+    st.cur_rto_ns = r
+}
+
+pub fn rto_on_timeout(st $&P2PRtoState, now_ns int) {
+    if st.last_backoff_ns > 0 && (now_ns - st.last_backoff_ns) < st.cur_rto_ns / 2 {
+        <<
+    }
+    $nxt := st.cur_rto_ns * 2
+    if nxt > P2P_RTO_MAX_NS { nxt = P2P_RTO_MAX_NS }
+    st.cur_rto_ns = nxt
+    st.last_backoff_ns = now_ns
+}
+
+pub fn udp_addr_eq(a &net.UDPAddr, b &net.UDPAddr) bool {
+    << a.port == b.port && a.ip == b.ip
+}
+
+pub struct P2PPeerState {
+    pub addr net.UDPAddr
+    pub last_rx_ns int
+    pub mig_pending bool
+    pub mig_cand net.UDPAddr
+    pub mig_token string
+    pub mig_sent_ns int
+}
+
+pub fn make_peer_state(addr &net.UDPAddr, now_ns int) P2PPeerState {
+    << P2PPeerState{
+        addr: net.UDPAddr{ip: addr.ip + "", port: addr.port, zone: ""},
+        last_rx_ns: now_ns,
+        mig_pending: false,
+        mig_cand: net.UDPAddr{ip: "", port: 0, zone: ""},
+        mig_token: "",
+        mig_sent_ns: 0
+    }
+}
+
+pub struct P2PCiphers {
+    pub tx aes.Cipher
+    pub rx aes.Cipher
+    pub tx_pn int
+    pub rx_max_pn int
+    pub rx_bitmap int
+}
+
+pub fn make_p2p_ciphers(tx_key &string, rx_key &string) P2PCiphers {
+    tx := aes.new_cipher(tx_key) or >>
+    rx := aes.new_cipher(rx_key) or >>
+    << P2PCiphers{tx: tx, rx: rx, tx_pn: 0, rx_max_pn: 0, rx_bitmap: 0}
+}
+
+pub struct P2PPacket {
+    pub ok bool
+    pub ptype int
+    pub pn int
+    pub stream_id int
+    pub seq int
+    pub is_newest bool
+    pub data string
+}
+
+pub fn push_be32(buf $&[]int, v int) {
+    buf.push((v >> 24) & 255)
+    buf.push((v >> 16) & 255)
+    buf.push((v >> 8) & 255)
+    buf.push(v & 255)
+}
+
+pub fn read_be32(raw &string, off int) int {
+    << ((raw[off] & 255) << 24) |
+        ((raw[off + 1] & 255) << 16) |
+        ((raw[off + 2] & 255) << 8) |
+        (raw[off + 3] & 255)
+}
+
+pub fn push_be64(buf $&[]int, v int) {
+    $sh := 56
+    while sh >= 0 {
+        buf.push((v >> sh) & 255)
+        sh -= 8
+    }
+}
+
+pub fn read_be64(raw &string, off int) int {
+    $v := 0
+    for i in 0:8 {
+        v = (v << 8) | (raw[off + i] & 255)
+    }
+    << v
+}
+
+pub fn be64_str(v int) string {
+    $b := []int{}
+    push_be64($&b, v)
+    << string_from_bytes(b)
+}
+
+pub fn p2p_derive_dir_key(
+    dir string,
+    session string,
+    init_id string,
+    resp_id string,
+    init_xpub string,
+    resp_xpub string,
+    shared_secret &string
+) string {
+    << sha256.sum256_bytes(
+        P2P_PROTO_V4 + "\n" + dir + "\n" + session + "\n" +
+        init_id + "\n" + resp_id + "\n" + init_xpub + "\n" + resp_xpub + "\n" + (shared_secret + "")
+    )
+}
+
+pub fn p2p_seal_packet_stream(ciph $&P2PCiphers, session string, ptype int, stream_id int, seq int, payload &string) string {
+    if ciph.tx_pn >= P2P_MAX_PN {
+        >> errors.new("p2p packet number exhausted")
+    }
+    ciph.tx_pn += 1
+    pn := ciph.tx_pn
+    $hdr := [ptype & 255]
+    push_be64($&hdr, pn)
+    push_be32($&hdr, stream_id)
+    push_be64($&hdr, seq)
+    $iv_b := [0, 0, 0, 0]
+    push_be64($&iv_b, pn)
+    iv := string_from_bytes(iv_b)
+    hdr_s := string_from_bytes(hdr)
+    aad := hdr_s + session
+    ct := cipher.seal_gcm(&ciph.tx, &iv, payload, &aad) or >>
+    << hdr_s + ct
+}
+
+pub fn p2p_seal_packet(ciph $&P2PCiphers, session string, ptype int, seq int, payload &string) string {
+    << p2p_seal_packet_stream(ciph, session, ptype, 0, seq, payload) or >>
+}
+
+pub fn p2p_open_packet(ciph $&P2PCiphers, session string, raw &string) P2PPacket {
+    if raw.len < P2P_HDR_LEN + 16 {
+        << P2PPacket{ok: false, ptype: 0, pn: 0, stream_id: 0, seq: 0, is_newest: false, data: ""}
+    }
+    ptype := raw[0] & 255
+    pn := read_be64(raw, 1)
+    if pn <= 0 {
+        << P2PPacket{ok: false, ptype: 0, pn: 0, stream_id: 0, seq: 0, is_newest: false, data: ""}
+    }
+    stream_id := read_be32(raw, 9)
+    seq := read_be64(raw, 13)
+    $iv_b := [0, 0, 0, 0]
+    push_be64($&iv_b, pn)
+    iv := string_from_bytes(iv_b)
+    hdr := raw[0:P2P_HDR_LEN]
+    ct := raw[P2P_HDR_LEN:raw.len]
+    aad := hdr + session
+    pt := cipher.open_gcm(&ciph.rx, &iv, &ct, &aad) or (err) {
+        << P2PPacket{ok: false, ptype: 0, pn: 0, stream_id: 0, seq: 0, is_newest: false, data: ""}
+    }
+    // Check 62-bit sliding anti-replay window only after AES-GCM tag verifies.
+    $is_newest := false
+    if pn > ciph.rx_max_pn {
+        diff := pn - ciph.rx_max_pn
+        if diff >= P2P_REPLAY_WIN {
+            ciph.rx_bitmap = 1
+        } else {
+            ciph.rx_bitmap = ((ciph.rx_bitmap << diff) & P2P_REPLAY_MASK) | 1
+        }
+        ciph.rx_max_pn = pn
+        is_newest = true
+    } else {
+        diff := ciph.rx_max_pn - pn
+        if diff >= P2P_REPLAY_WIN {
+            << P2PPacket{ok: false, ptype: 0, pn: 0, stream_id: 0, seq: 0, is_newest: false, data: ""}
+        }
+        bit := 1 << diff
+        if (ciph.rx_bitmap & bit) != 0 {
+            << P2PPacket{ok: false, ptype: 0, pn: 0, stream_id: 0, seq: 0, is_newest: false, data: ""}
+        }
+        ciph.rx_bitmap = ciph.rx_bitmap | bit
+    }
+    << P2PPacket{ok: true, ptype: ptype, pn: pn, stream_id: stream_id, seq: seq, is_newest: is_newest, data: pt}
+}
+
+pub fn seal_pkt_q(ciph $&P2PCiphers, session string, ptype int, seq int, payload &string) string {
+    << p2p_seal_packet(ciph, session, ptype, seq, payload) or (err) { << "" }
+}
+
+pub fn pconn_deadline_q(pconn $&net.PacketConn, dur_ns int) {
+    if dur_ns <= 0 {
+        pconn.set_read_deadline(0) or (err) { << }
+    } else {
+        pconn.set_read_deadline(time.now() + dur_ns) or (err) { << }
+    }
+}
+
+pub fn pconn_close_q(pconn $&net.PacketConn) {
+    pconn.close() or (err) { << }
+}
+
+pub fn pconn_write_q(pconn $&net.PacketConn, pkt &string, addr &net.UDPAddr) {
+    _ := pconn.write_to(pkt, addr) or (err) { << }
+}
+
+pub fn read_from_or(pconn $&net.PacketConn, n int) net.UDPPacket {
+    << pconn.read_from(n) or (err) { << net.UDPPacket{addr: net.UDPAddr{ip: "", port: 0, zone: ""}, data: ""} }
+}
+
+pub fn send_ack_q(pconn $&net.PacketConn, ciph $&P2PCiphers, sess string, seq int, sack_mask int, peer_addr &net.UDPAddr) {
+    $pl := ""
+    if sack_mask != 0 {
+        pl = be64_str(sack_mask)
+    }
+    apkt := seal_pkt_q(ciph, sess + "", P2P_PKT_ACK, seq, &pl)
+    if apkt.len > 0 { pconn_write_q(pconn, &apkt, peer_addr) }
+}
+
+pub fn send_ctrl_pkt_q(pconn $&net.PacketConn, ciph $&P2PCiphers, sess string, ptype int, peer_addr &net.UDPAddr) {
+    empty := ""
+    pkt := seal_pkt_q(ciph, sess + "", ptype, 0, &empty)
+    if pkt.len > 0 { pconn_write_q(pconn, &pkt, peer_addr) }
+}
+
+pub fn send_ping_q(pconn $&net.PacketConn, ciph $&P2PCiphers, sess string, now_ns int, peer_addr &net.UDPAddr) {
+    pl := be64_str(now_ns)
+    pkt := seal_pkt_q(ciph, sess + "", P2P_PKT_PING, 0, &pl)
+    if pkt.len > 0 { pconn_write_q(pconn, &pkt, peer_addr) }
+}
+
+pub fn send_pong_q(pconn $&net.PacketConn, ciph $&P2PCiphers, sess string, ping_pl &string, peer_addr &net.UDPAddr) {
+    $pl := ping_pl + ""
+    if pl.len > 32 { pl = pl[0:32] + "" }
+    pkt := seal_pkt_q(ciph, sess + "", P2P_PKT_PONG, 0, &pl)
+    if pkt.len > 0 { pconn_write_q(pconn, &pkt, peer_addr) }
+}
+
+// Validate peer address updates against anti-replay newest packets and PATH_CHALLENGE/RESPONSE.
+// Returns true if the packet was path-control (already handled) and should skip further dispatch.
+pub fn p2p_handle_rx_path(
+    pconn $&net.PacketConn,
+    ciph $&P2PCiphers,
+    sess &string,
+    ps $&P2PPeerState,
+    opened &P2PPacket,
+    src_addr &net.UDPAddr,
+    ack_seq_on_mig int,
+    sack_on_mig int
+) bool {
+    now_rx := time.now()
+    if opened.ptype == P2P_PKT_PATH_CHALLENGE {
+        if opened.is_newest && opened.data.len >= 8 && opened.data.len <= 32 {
+            rsp := seal_pkt_q(ciph, sess + "", P2P_PKT_PATH_RESPONSE, 0, &opened.data)
+            if rsp.len > 0 { pconn_write_q(pconn, &rsp, src_addr) }
+        }
+        if udp_addr_eq(&ps.addr, src_addr) {
+            ps.last_rx_ns = now_rx
+        }
+        << true
+    }
+    if opened.ptype == P2P_PKT_PATH_RESPONSE {
+        if ps.mig_pending && udp_addr_eq(&ps.mig_cand, src_addr) && opened.data == ps.mig_token {
+            ps.addr = net.UDPAddr{ip: ps.mig_cand.ip + "", port: ps.mig_cand.port, zone: ""}
+            ps.mig_pending = false
+            ps.last_rx_ns = now_rx
+            if ack_seq_on_mig > 0 || sack_on_mig != 0 {
+                send_ack_q(pconn, ciph, sess + "", ack_seq_on_mig, sack_on_mig, &ps.addr)
+            }
+        } else if udp_addr_eq(&ps.addr, src_addr) {
+            ps.last_rx_ns = now_rx
+        }
+        << true
+    }
+    if udp_addr_eq(&ps.addr, src_addr) {
+        ps.last_rx_ns = now_rx
+        << false
+    }
+    if opened.ptype != P2P_PKT_PUNCH && opened.is_newest && src_addr.port > 0 && src_addr.ip.len > 0 {
+        ps.last_rx_ns = now_rx
+        if !ps.mig_pending || !udp_addr_eq(&ps.mig_cand, src_addr) || (now_rx - ps.mig_sent_ns >= 150000000) {
+            if !ps.mig_pending || !udp_addr_eq(&ps.mig_cand, src_addr) {
+                tok := rand.read(8) or (err) { << false }
+                ps.mig_cand = net.UDPAddr{ip: src_addr.ip + "", port: src_addr.port, zone: ""}
+                ps.mig_token = tok
+                ps.mig_pending = true
+            }
+            ps.mig_sent_ns = now_rx
+            cpkt := seal_pkt_q(ciph, sess + "", P2P_PKT_PATH_CHALLENGE, 0, &ps.mig_token)
+            if cpkt.len > 0 { pconn_write_q(pconn, &cpkt, &ps.mig_cand) }
+        }
+    }
+    << false
+}
+
+pub fn push_mtu_chunks(q $&[]string, data &string) {
+    if data.len == 0 { << }
+    $off := 0
+    while off < data.len {
+        $end := off + P2P_MTU_CHUNK
+        if end > data.len { end = data.len }
+        q.push(data[off:end] + "")
+        off = end
+    }
+}
+
+pub fn atoi_or_0(s &string) int {
+    << strconv.atoi(s) or (err) { << 0 }
+}
+
+pub fn fd_write_q(fd int, s string) {
+    _ := os.fd_write(fd, s) or (err) { << }
+}
+
+pub fn encrypt_dm_or(sender_id string, sender_priv &rsa.PrivateKey, to_id string, to_pk &rsa.PublicKey, to_key_ver int, msg_type string, body_json string, conv_state string, ts int) string {
+    << encrypt_dm_frame(sender_id, sender_priv, to_id, to_pk, to_key_ver, msg_type, body_json, conv_state, ts) or (err) { << "" }
+}
+
+pub fn net_dial_or(addr string) int {
+    << net.dial(addr) or (err) { << -1 }
+}
+
+pub fn net_accept_or(lfd int) int {
+    << net.accept(lfd) or (err) { << -1 }
+}
+
+pub fn net_close_q(fd int) {
+    if fd >= 0 {
+        _ := net.conn_close(fd) or (err) { << }
+    }
+}
+
+pub fn net_close_write_q(fd int) {
+    if fd >= 0 {
+        _ := os.shutdown(fd, 1) or (err) { << }
+    }
+}
+
+pub fn net_write_q(fd int, data &string) {
+    if fd >= 0 {
+        _ := net.conn_write(fd, data) or (err) { << }
+    }
+}
+
+pub fn p2p_log(opts &CliOpts, state string, session string, peer string, extra_json string) {
+    if opts.json_mode {
+        $s := "{\"type\":\"p2p\",\"state\":" + json.quote(&state) + ",\"session\":" + json.quote(&session) + ",\"peer\":" + json.quote(&peer)
+        if extra_json.len > 0 {
+            s = s + "," + extra_json
+        }
+        s = s + "}"
+        eprintln(s)
+    } else {
+        eprintln("p2p [" + state + "] session=" + session + " peer=" + peer)
+    }
+}
+
+pub fn parse_host_port(hp string) []string {
+    $s := hp + ""
+    if strings.has_prefix(&s, "stun:") {
+        s = s[5:s.len]
+    }
+    $col := -1
+    for i in 0:s.len {
+        if (s[i] & 255) == 58 { col = i }
+    }
+    if col <= 0 || col + 1 >= s.len { << []string{} }
+    << [s[0:col], s[(col + 1):s.len]]
+}
+
+pub fn udp_addr_from_str(hp string) net.UDPAddr {
+    parts := parse_host_port(hp + "")
+    if parts.len != 2 {
+        >> errors.new("p2p: invalid host:port: " + hp)
+    }
+    port := strconv.atoi(&parts[1]) or >>
+    $ip := net.parse_ip(&parts[0])
+    if ip.len == 0 {
+        ips := net.lookup_ip(parts[0] + "") or >>
+        $found := false
+        for i in 0:ips.len {
+            if ips[i].len == 4 {
+                ip = ips[i] + ""
+                found = true
+                <-
+            }
+        }
+        if !found {
+            >> errors.new("p2p: cannot resolve IPv4 for " + parts[0])
+        }
+    }
+    << net.UDPAddr{ip: ip, port: port, zone: ""}
+}
+
+fn stun_discover_one(pconn $&net.PacketConn, stun_hp string) string {
+    raddr := udp_addr_from_str(stun_hp) or (err) { << "" }
+    for attempt in 0:2 {
+        tx := rand.read(12) or (err) { << "" }
+        // RFC 5389 Binding Request: type=0x0001, len=0x0000, magic=0x2112A442, 12-byte txid
+        $req := [0, 1, 0, 0, 33, 18, 164, 66]
+        for i in 0:12 { req.push(tx[i] & 255) }
+        pkt := string_from_bytes(req)
+        _ := pconn.write_to(&pkt, &raddr) or (err) {
+            pconn_deadline_q(pconn, 0)
+            << ""
+        }
+        deadline := time.now() + 800000000
+        while time.now() < deadline {
+            $rem := deadline - time.now()
+            if rem <= 0 { <- }
+            pconn_deadline_q(pconn, rem)
+            resp := pconn.read_from(2048) or (err) { <- }
+            d := resp.data + ""
+            if d.len < 20 { -> }
+            if (d[0] & 255) != 1 || (d[1] & 255) != 1 { -> }
+            if (d[4] & 255) != 33 || (d[5] & 255) != 18 || (d[6] & 255) != 164 || (d[7] & 255) != 66 { -> }
+            $tx_ok := true
+            for ti in 0:12 {
+                if (d[8 + ti] & 255) != (tx[ti] & 255) {
+                    tx_ok = false
+                    <-
+                }
+            }
+            if !tx_ok { -> }
+            $off := 20
+            while off + 4 <= d.len {
+                atype := ((d[off] & 255) << 8) | (d[off + 1] & 255)
+                alen := ((d[off + 2] & 255) << 8) | (d[off + 3] & 255)
+                off += 4
+                if off + alen > d.len { <- }
+                if (atype == 32 || atype == 1) && alen >= 8 {
+                    fam := d[off + 1] & 255
+                    if fam == 1 {
+                        $xport := ((d[off + 2] & 255) << 8) | (d[off + 3] & 255)
+                        $b0 := d[off + 4] & 255
+                        $b1 := d[off + 5] & 255
+                        $b2 := d[off + 6] & 255
+                        $b3 := d[off + 7] & 255
+                        if atype == 32 {
+                            xport = xport ^ 8466
+                            b0 = b0 ^ 33
+                            b1 = b1 ^ 18
+                            b2 = b2 ^ 164
+                            b3 = b3 ^ 66
+                        }
+                        pconn_deadline_q(pconn, 0)
+                        << strconv.itoa(b0) + "." + strconv.itoa(b1) + "." + strconv.itoa(b2) + "." + strconv.itoa(b3) + ":" + strconv.itoa(xport)
+                    }
+                }
+                $pad := alen % 4
+                if pad != 0 { pad = 4 - pad }
+                off = off + alen + pad
+            }
+        }
+    }
+    pconn_deadline_q(pconn, 0)
+    << ""
+}
+
+pub fn stun_discover(pconn $&net.PacketConn, stun_spec string) string {
+    trimmed := strings.trim_space(&stun_spec)
+    if trimmed.len == 0 || trimmed == "none" { << "" }
+    parts := strings.split(&trimmed, ",")
+    for i in 0:parts.len {
+        hp := strings.trim_space(&parts[i])
+        if hp.len == 0 || hp == "none" { -> }
+        mapped := stun_discover_one(pconn, hp + "")
+        if mapped.len > 0 { << mapped }
+    }
+    << ""
+}
+
+pub fn local_port_of(pconn &net.PacketConn) int {
+    loc := pconn.local_addr()
+    parts := parse_host_port(loc)
+    if parts.len == 2 {
+        << atoi_or_0(&parts[1])
+    }
+    << 0
+}
+
+pub fn discover_lan_ips() []string {
+    $out := []string{}
+    addrs := net.interface_addrs() or (err) { << out }
+    for i in 0:addrs.len {
+        a := addrs[i] + ""
+        $host := a
+        sl := strings.index_of(&host, "/")
+        if sl >= 0 { host = host[0:sl] }
+        ip := net.parse_ip(&host)
+        if ip.len != 4 { -> }
+        b0 := ip[0] & 255
+        b1 := ip[1] & 255
+        if b0 == 127 || b0 == 0 || (b0 == 169 && b1 == 254) || (b0 == 198 && (b1 == 18 || b1 == 19)) { -> }
+        $dup := false
+        for j in 0:out.len {
+            if out[j] == host { dup = true }
+        }
+        if !dup {
+            out.push(host)
+            if out.len >= 2 { <- }
+        }
+    }
+    << out
+}
+
+pub fn build_candidates_json(lport int, srflx string, include_host bool) string {
+    $cands := []string{}
+    if srflx.len > 0 {
+        cands.push("{\"t\":\"srflx\",\"a\":" + json.quote(&srflx) + "}")
+    }
+    if include_host {
+        lan := discover_lan_ips()
+        for i in 0:lan.len {
+            hp := lan[i] + ":" + strconv.itoa(lport)
+            cands.push("{\"t\":\"host\",\"a\":" + json.quote(&hp) + "}")
+        }
+        cands.push("{\"t\":\"host\",\"a\":\"127.0.0.1:" + strconv.itoa(lport) + "\"}")
+    }
+    << "[" + strings.join(cands, ",") + "]"
+}
+
+pub fn udp_addr_from_literal(hp string) net.UDPAddr {
+    parts := parse_host_port(hp + "")
+    if parts.len != 2 {
+        >> errors.new("p2p: invalid candidate host:port")
+    }
+    port := strconv.atoi(&parts[1]) or >>
+    if port <= 0 || port > 65535 {
+        >> errors.new("p2p: invalid candidate port")
+    }
+    ip := net.parse_ip(&parts[0])
+    if ip.len != 4 {
+        >> errors.new("p2p: candidate must be IPv4 literal")
+    }
+    if (ip[0] & 255) == 0 && (ip[1] & 255) == 0 && (ip[2] & 255) == 0 && (ip[3] & 255) == 0 {
+        >> errors.new("p2p: zero candidate IP not allowed")
+    }
+    << net.UDPAddr{ip: ip, port: port, zone: ""}
+}
+
+pub fn extract_candidate_addrs(doc &json.Doc, arr_node int) []net.UDPAddr {
+    $out := []net.UDPAddr{}
+    if !doc.is_list(arr_node) { << out }
+    for i in 0:doc.count(arr_node) {
+        if out.len >= 8 { <- }
+        el := doc.at(arr_node, i)
+        if doc.is_dict(el) && doc.has(el, "a") {
+            astr := json_str_or(doc, doc.get(el, "a"), "")
+            addr := udp_addr_from_literal(astr + "") or (err) { -> }
+            out.push(addr)
+        }
+    }
+    << out
+}
+
+pub fn check_is_friend(api_base string, timeout_sec int, self_id string, priv &rsa.PrivateKey, peer_id string) bool {
+    empty := ""
+    r := api_call(api_base, timeout_sec, self_id, priv, true, "GET", "/v1/friends", &empty, "")
+    if !r.ok { << false }
+    doc := json.parse(&r.body)
+    if !doc.ok() || !doc.has(doc.root(), "friends") { << false }
+    arr := doc.get(doc.root(), "friends")
+    if !doc.is_list(arr) { << false }
+    for i in 0:doc.count(arr) {
+        el := doc.at(arr, i)
+        if doc.is_string(el) {
+            if json_str_or(&doc, el, "") == peer_id { << true }
+        } else if doc.is_dict(el) && doc.has(el, "agent_id") {
+            if json_str_or(&doc, doc.get(el, "agent_id"), "") == peer_id { << true }
+        }
+    }
+    << false
+}

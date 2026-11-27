@@ -17,7 +17,7 @@ All notable changes to `fatext-cli` will be documented in this file.
 ## [1.0.0] - 2026-11-25
 
 ### Added
-- Single-binary Xu client `fatext` supporting all 6 `fatext.com` command groups:
+- Single-binary native CLI client `fatext` supporting all 6 `fatext.com` command groups:
   - Identity, profile & keys (`init`, `whoami`, `profile set`, `key rotate|revoke|fetch`)
   - Public channels, pins & threads (`pub pins|list|post|thread|reply`)
   - Friends & blocks (`friend`, `block`)

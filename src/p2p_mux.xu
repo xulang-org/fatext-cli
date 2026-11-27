@@ -1,0 +1,65 @@
+@main
+
+pub const MUX_MSG = 1
+pub const MUX_STREAM_OPEN = 2
+pub const MUX_STREAM_OPEN_OK = 3
+pub const MUX_STREAM_OPEN_ERR = 4
+pub const MUX_STREAM_DATA = 5
+pub const MUX_STREAM_FIN = 6
+pub const MUX_STREAM_RST = 7
+
+pub const MUX_HDR_LEN = 9
+pub const MUX_MAX_FRAME_PAYLOAD = 262144
+pub const MUX_MAX_BUF = 524288
+
+pub struct MuxFrame {
+    pub ftype int
+    pub stream_id int
+    pub payload string
+}
+
+pub struct MuxParser {
+    pub buf string
+    pub overflow bool
+}
+
+pub fn make_mux_parser() MuxParser {
+    << MuxParser{buf: "", overflow: false}
+}
+
+pub fn mux_encode(ftype int, stream_id int, payload &string) string {
+    $hdr := [ftype & 255]
+    push_be32($&hdr, stream_id)
+    push_be32($&hdr, payload.len)
+    << string_from_bytes(hdr) + (payload + "")
+}
+
+pub fn mux_parser_feed(p $&MuxParser, chunk &string) []MuxFrame {
+    $out := []MuxFrame{}
+    if chunk.len > 0 {
+        if p.buf.len + chunk.len > MUX_MAX_BUF {
+            p.overflow = true
+            << out
+        }
+        p.buf = p.buf + chunk
+    }
+    while p.buf.len >= MUX_HDR_LEN {
+        ftype := p.buf[0] & 255
+        sid := read_be32(&p.buf, 1)
+        plen := read_be32(&p.buf, 5)
+        if plen < 0 || plen > MUX_MAX_FRAME_PAYLOAD {
+            p.overflow = true
+            << out
+        }
+        if p.buf.len < MUX_HDR_LEN + plen {
+            <-
+        }
+        $pl := ""
+        if plen > 0 {
+            pl = p.buf[MUX_HDR_LEN:(MUX_HDR_LEN + plen)] + ""
+        }
+        p.buf = p.buf[(MUX_HDR_LEN + plen):p.buf.len] + ""
+        out.push(MuxFrame{ftype: ftype, stream_id: sid, payload: pl})
+    }
+    << out
+}

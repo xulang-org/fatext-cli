@@ -1,0 +1,443 @@
+@main
+
+#net
+#time
+
+pub struct P2PTxSlot {
+    pub seq int
+    pub data string
+    pub first_tx_ns int
+    pub last_tx_ns int
+    pub tries int
+    pub acked bool
+    pub sack_hits int
+}
+
+pub struct P2PRxSlot {
+    pub seq int
+    pub data string
+}
+
+pub struct P2PTransport {
+    pub session string
+    pub peer_id string
+    pub ps P2PPeerState
+    pub rto P2PRtoState
+    pub next_seq int
+    pub expected_seq int
+    pub tx_q []string
+    pub tx_head int
+    pub inflight []P2PTxSlot
+    pub ooo []P2PRxSlot
+    pub bytes_in int
+    pub bytes_out int
+    pub rtt_ms int
+    pub last_tx_ns int
+    pub ping_ns int
+    pub idle_timeout_ns int
+    pub local_fin bool
+    pub remote_fin bool
+    pub fin_seq int
+    pub last_fin_tx_ns int
+    pub rx_delivered string
+    pub failed bool
+    pub fail_reason string
+}
+
+pub fn make_p2p_transport(session string, peer_id string, init_addr &net.UDPAddr) P2PTransport {
+    now_ns := time.now()
+    << P2PTransport{
+        session: session + "",
+        peer_id: peer_id + "",
+        ps: make_peer_state(init_addr, now_ns),
+        rto: rto_init(),
+        next_seq: 1,
+        expected_seq: 1,
+        tx_q: []string{},
+        tx_head: 0,
+        inflight: []P2PTxSlot{},
+        ooo: []P2PRxSlot{},
+        bytes_in: 0,
+        bytes_out: 0,
+        rtt_ms: -1,
+        last_tx_ns: now_ns,
+        ping_ns: p2p_env_ms("FATEXT_P2P_PING_MS", 5000, 100, 60000) * 1000000,
+        idle_timeout_ns: p2p_env_ms("FATEXT_P2P_IDLE_TIMEOUT_MS", 30000, 500, 300000) * 1000000,
+        local_fin: false,
+        remote_fin: false,
+        fin_seq: -1,
+        last_fin_tx_ns: 0,
+        rx_delivered: "",
+        failed: false,
+        fail_reason: ""
+    }
+}
+
+pub fn p2p_tr_enqueue(tr $&P2PTransport, data &string) {
+    push_mtu_chunks($&tr.tx_q, data)
+}
+
+pub fn p2p_tr_tx_pending(tr &P2PTransport) int {
+    << (tr.tx_q.len - tr.tx_head) + tr.inflight.len
+}
+
+pub fn p2p_tr_take_rx(tr $&P2PTransport) string {
+    if tr.rx_delivered.len == 0 { << "" }
+    out := tr.rx_delivered + ""
+    tr.rx_delivered = ""
+    << out
+}
+
+pub fn p2p_tr_sack_mask(tr &P2PTransport) int {
+    $mask := 0
+    for i in 0:tr.ooo.len {
+        d := tr.ooo[i].seq - tr.expected_seq
+        if d >= 1 && d <= P2P_SACK_BITS {
+            mask = mask | (1 << (d - 1))
+        }
+    }
+    << mask
+}
+
+fn p2p_tr_check_fin_complete(tr $&P2PTransport) {
+    if tr.fin_seq >= 0 && tr.expected_seq >= tr.fin_seq {
+        tr.remote_fin = true
+    }
+}
+
+pub fn p2p_tr_on_data(tr $&P2PTransport, pconn $&net.PacketConn, ciph $&P2PCiphers, seq int, payload &string) {
+    if seq == tr.expected_seq {
+        tr.rx_delivered = tr.rx_delivered + payload
+        tr.bytes_in += payload.len
+        tr.expected_seq += 1
+        $progressed := true
+        while progressed {
+            progressed = false
+            $next_ooo := []P2PRxSlot{}
+            for i in 0:tr.ooo.len {
+                if tr.ooo[i].seq == tr.expected_seq {
+                    tr.rx_delivered = tr.rx_delivered + tr.ooo[i].data
+                    tr.bytes_in += tr.ooo[i].data.len
+                    tr.expected_seq += 1
+                    progressed = true
+                } else if tr.ooo[i].seq > tr.expected_seq {
+                    next_ooo.push(P2PRxSlot{seq: tr.ooo[i].seq, data: tr.ooo[i].data + ""})
+                }
+            }
+            tr.ooo = next_ooo
+        }
+        p2p_tr_check_fin_complete(tr)
+    } else if seq > tr.expected_seq && seq <= tr.expected_seq + P2P_MAX_RX_OOO {
+        $dup := false
+        for i in 0:tr.ooo.len {
+            if tr.ooo[i].seq == seq {
+                dup = true
+                <-
+            }
+        }
+        if !dup && tr.ooo.len < P2P_MAX_RX_OOO {
+            tr.ooo.push(P2PRxSlot{seq: seq, data: payload + ""})
+        }
+    }
+    send_ack_q(pconn, ciph, tr.session + "", tr.expected_seq - 1, p2p_tr_sack_mask(tr), &tr.ps.addr)
+}
+
+pub fn p2p_tr_on_ack(tr $&P2PTransport, pconn $&net.PacketConn, ciph $&P2PCiphers, cum_ack int, sack_pl &string) {
+    $sack_mask := 0
+    if sack_pl.len >= 8 {
+        sack_mask = read_be64(sack_pl, 0)
+    }
+    now := tr.ps.last_rx_ns
+    $max_sacked := 0
+    $kept := []P2PTxSlot{}
+    for i in 0:tr.inflight.len {
+        s_seq := tr.inflight[i].seq
+        s_acked := tr.inflight[i].acked
+        s_tries := tr.inflight[i].tries
+        s_ftx := tr.inflight[i].first_tx_ns
+        s_ltx := tr.inflight[i].last_tx_ns
+        s_hits := tr.inflight[i].sack_hits
+        s_data := tr.inflight[i].data + ""
+        if s_seq <= cum_ack {
+            if !s_acked && s_tries == 1 {
+                smp := now - s_ftx
+                rto_on_ack($&tr.rto, smp, 1)
+                $ms := smp / 1000000
+                if ms < 0 { ms = 0 }
+                tr.rtt_ms = ms
+            }
+            ->
+        }
+        $is_acked := s_acked
+        d := s_seq - (cum_ack + 1)
+        if !is_acked && sack_mask != 0 && d >= 1 && d <= P2P_SACK_BITS {
+            bit := 1 << (d - 1)
+            if (sack_mask & bit) != 0 {
+                is_acked = true
+                if s_tries == 1 {
+                    smp := now - s_ftx
+                    rto_on_ack($&tr.rto, smp, 1)
+                    $ms := smp / 1000000
+                    if ms < 0 { ms = 0 }
+                    tr.rtt_ms = ms
+                }
+            }
+        }
+        if is_acked && s_seq > max_sacked {
+            max_sacked = s_seq
+        }
+        kept.push(P2PTxSlot{
+            seq: s_seq,
+            data: s_data,
+            first_tx_ns: s_ftx,
+            last_tx_ns: s_ltx,
+            tries: s_tries,
+            acked: is_acked,
+            sack_hits: s_hits
+        })
+    }
+
+    if max_sacked > 0 {
+        now_rt := time.now()
+        $min_gap := tr.rto.srtt_ns
+        if min_gap < 25000000 { min_gap = 25000000 }
+        if min_gap > 250000000 { min_gap = 250000000 }
+        for i in 0:kept.len {
+            if !kept[i].acked && kept[i].seq < max_sacked {
+                kept[i].sack_hits += 1
+                if kept[i].sack_hits >= 3 && (now_rt - kept[i].last_tx_ns) >= min_gap {
+                    rpkt := seal_pkt_q(ciph, tr.session + "", P2P_PKT_DATA, kept[i].seq, &kept[i].data)
+                    if rpkt.len > 0 { pconn_write_q(pconn, &rpkt, &tr.ps.addr) }
+                    kept[i].last_tx_ns = now_rt
+                    if kept[i].tries == 1 { kept[i].tries = 2 }
+                    kept[i].sack_hits = 0
+                    tr.last_tx_ns = now_rt
+                }
+            }
+        }
+    }
+    tr.inflight = kept
+}
+
+pub fn p2p_tr_send_fin(tr $&P2PTransport, pconn $&net.PacketConn, ciph $&P2PCiphers) {
+    empty := ""
+    tr.local_fin = true
+    tr.last_fin_tx_ns = time.now()
+    for r in 0:5 {
+        fin_pkt := seal_pkt_q(ciph, tr.session + "", P2P_PKT_FIN, tr.next_seq, &empty)
+        if fin_pkt.len > 0 { pconn_write_q(pconn, &fin_pkt, &tr.ps.addr) }
+    }
+    tr.last_tx_ns = tr.last_fin_tx_ns
+}
+
+pub fn p2p_tr_flush_tx(tr $&P2PTransport, pconn $&net.PacketConn, ciph $&P2PCiphers) bool {
+    if tr.failed { << false }
+    while tr.inflight.len < P2P_WIN_SIZE && tr.tx_head < tr.tx_q.len {
+        ch_s := tr.tx_q[tr.tx_head] + ""
+        tr.tx_head += 1
+        dpkt := seal_pkt_q(ciph, tr.session + "", P2P_PKT_DATA, tr.next_seq, &ch_s)
+        if dpkt.len > 0 {
+            pconn.write_to(&dpkt, &tr.ps.addr) or (err) {
+                tr.failed = true
+                tr.fail_reason = "udp_write_failed"
+                << false
+            }
+            now_tx := time.now()
+            tr.bytes_out += ch_s.len
+            tr.inflight.push(P2PTxSlot{
+                seq: tr.next_seq,
+                data: ch_s + "",
+                first_tx_ns: now_tx,
+                last_tx_ns: now_tx,
+                tries: 1,
+                acked: false,
+                sack_hits: 0
+            })
+            tr.last_tx_ns = now_tx
+            tr.next_seq += 1
+        }
+    }
+    if tr.tx_head >= tr.tx_q.len {
+        if tr.tx_q.len > 0 {
+            tr.tx_q = []string{}
+            tr.tx_head = 0
+        }
+    } else if tr.tx_head >= 64 {
+        $rem_q := []string{}
+        for i in tr.tx_head:tr.tx_q.len {
+            rem_q.push(tr.tx_q[i] + "")
+        }
+        tr.tx_q = rem_q
+        tr.tx_head = 0
+    }
+
+    now := time.now()
+    for i in 0:tr.inflight.len {
+        if tr.inflight[i].acked { -> }
+        $slot_rto := tr.rto.rto_ns
+        $k := 1
+        while k < tr.inflight[i].tries {
+            slot_rto = slot_rto * 2
+            if slot_rto >= P2P_RTO_MAX_NS {
+                slot_rto = P2P_RTO_MAX_NS
+                <-
+            }
+            k += 1
+        }
+        if slot_rto < tr.rto.cur_rto_ns {
+            slot_rto = tr.rto.cur_rto_ns
+        }
+        if now - tr.inflight[i].last_tx_ns >= slot_rto {
+            if tr.inflight[i].tries >= P2P_MAX_RETRIES {
+                tr.failed = true
+                tr.fail_reason = "retransmit_exceeded"
+                << false
+            }
+            rpkt := seal_pkt_q(ciph, tr.session + "", P2P_PKT_DATA, tr.inflight[i].seq, &tr.inflight[i].data)
+            if rpkt.len > 0 {
+                pconn.write_to(&rpkt, &tr.ps.addr) or (err) {
+                    tr.failed = true
+                    tr.fail_reason = "udp_write_failed"
+                    << false
+                }
+            }
+            tr.inflight[i].last_tx_ns = now
+            tr.inflight[i].tries += 1
+            tr.inflight[i].sack_hits = 0
+            tr.last_tx_ns = now
+            rto_on_timeout($&tr.rto, now)
+        }
+    }
+
+    if tr.local_fin && !tr.remote_fin && (now - tr.last_fin_tx_ns >= 400000000) {
+        empty := ""
+        fin_pkt := seal_pkt_q(ciph, tr.session + "", P2P_PKT_FIN, tr.next_seq, &empty)
+        if fin_pkt.len > 0 { pconn_write_q(pconn, &fin_pkt, &tr.ps.addr) }
+        tr.last_fin_tx_ns = now
+        tr.last_tx_ns = now
+    }
+
+    if now - tr.last_tx_ns >= tr.ping_ns {
+        send_ping_q(pconn, ciph, tr.session + "", now, &tr.ps.addr)
+        tr.last_tx_ns = now
+    }
+    if now - tr.ps.last_rx_ns >= tr.idle_timeout_ns {
+        tr.failed = true
+        tr.fail_reason = "idle_timeout"
+        << false
+    }
+    << true
+}
+
+pub fn p2p_tr_poll_udp(tr $&P2PTransport, pconn $&net.PacketConn, ciph $&P2PCiphers, first_wait_ns int, max_pkts int) {
+    $limit := max_pkts
+    if limit <= 0 { limit = 1 }
+    for pkt_i in 0:limit {
+        $dl := first_wait_ns
+        if pkt_i > 0 { dl = 200000 }
+        pconn_deadline_q(pconn, dl)
+        upkt := read_from_or(pconn, 65535)
+        if upkt.data.len == 0 { <- }
+        opened := p2p_open_packet(ciph, tr.session + "", &upkt.data)
+        if !opened.ok { -> }
+        ack_mig := tr.expected_seq - 1
+        sm_mig := p2p_tr_sack_mask(tr)
+        sess_copy := tr.session + ""
+        if p2p_handle_rx_path(pconn, ciph, &sess_copy, $&tr.ps, &opened, &upkt.addr, ack_mig, sm_mig) {
+            ->
+        }
+        if opened.ptype == P2P_PKT_ACK {
+            p2p_tr_on_ack(tr, pconn, ciph, opened.seq, &opened.data)
+        } else if opened.ptype == P2P_PKT_PUNCH {
+            if udp_addr_eq(&tr.ps.addr, &upkt.addr) {
+                send_ack_q(pconn, ciph, tr.session + "", tr.expected_seq - 1, p2p_tr_sack_mask(tr), &tr.ps.addr)
+            }
+        } else if opened.ptype == P2P_PKT_PING {
+            send_pong_q(pconn, ciph, tr.session + "", &opened.data, &tr.ps.addr)
+        } else if opened.ptype == P2P_PKT_PONG {
+            if opened.data.len >= 8 {
+                sent_ns := read_be64(&opened.data, 0)
+                if sent_ns > 0 {
+                    rtt := (time.now() - sent_ns) / 1000000
+                    if rtt >= 0 && rtt < 60000 {
+                        tr.rtt_ms = rtt
+                    }
+                }
+            }
+        } else if opened.ptype == P2P_PKT_DATA {
+            p2p_tr_on_data(tr, pconn, ciph, opened.seq, &opened.data)
+        } else if opened.ptype == P2P_PKT_FIN {
+            if tr.fin_seq < 0 || opened.seq > tr.fin_seq {
+                if opened.seq <= 0 {
+                    tr.fin_seq = tr.expected_seq
+                } else {
+                    tr.fin_seq = opened.seq
+                }
+            }
+            p2p_tr_check_fin_complete(tr)
+            send_ack_q(pconn, ciph, tr.session + "", tr.expected_seq - 1, p2p_tr_sack_mask(tr), &tr.ps.addr)
+        }
+    }
+}
+
+pub fn p2p_punch_handshake(
+    opts &CliOpts,
+    pconn $&net.PacketConn,
+    ciph $&P2PCiphers,
+    session string,
+    peer_id string,
+    cands &[]net.UDPAddr,
+    tr $&P2PTransport
+) bool {
+    empty := ""
+    punch_timeout_ns := p2p_env_ms("FATEXT_P2P_PUNCH_TIMEOUT_MS", 10000, 1000, 60000) * 1000000
+    t_start_ns := time.now()
+    while time.now() - t_start_ns < punch_timeout_ns {
+        for i in 0:cands.len {
+            punch_pkt := seal_pkt_q(ciph, session + "", P2P_PKT_PUNCH, 0, &empty)
+            if punch_pkt.len > 0 { pconn_write_q(pconn, &punch_pkt, &cands[i]) }
+        }
+        round_end := time.now() + 50000000
+        while time.now() < round_end {
+            $rem := round_end - time.now()
+            if rem <= 0 { <- }
+            pconn_deadline_q(pconn, rem)
+            upkt := read_from_or(pconn, 4096)
+            if upkt.data.len == 0 { <- }
+            opened := p2p_open_packet(ciph, session + "", &upkt.data)
+            if opened.ok {
+                pa := net.UDPAddr{ip: upkt.addr.ip + "", port: upkt.addr.port, zone: ""}
+                if opened.ptype == P2P_PKT_PATH_CHALLENGE {
+                    if opened.is_newest && opened.data.len >= 8 && opened.data.len <= 32 {
+                        rsp := seal_pkt_q(ciph, session + "", P2P_PKT_PATH_RESPONSE, 0, &opened.data)
+                        if rsp.len > 0 { pconn_write_q(pconn, &rsp, &pa) }
+                    }
+                    ->
+                }
+                tr.ps = make_peer_state(&pa, time.now())
+                if opened.ptype == P2P_PKT_PUNCH {
+                    for r in 0:2 {
+                        send_ack_q(pconn, ciph, session + "", 0, 0, &tr.ps.addr)
+                    }
+                    << true
+                } else if opened.ptype == P2P_PKT_ACK || opened.ptype == P2P_PKT_PING || opened.ptype == P2P_PKT_PONG {
+                    << true
+                } else if opened.ptype == P2P_PKT_DATA {
+                    p2p_tr_on_data(tr, pconn, ciph, opened.seq, &opened.data)
+                    << true
+                } else if opened.ptype == P2P_PKT_FIN {
+                    if opened.seq <= 0 {
+                        tr.fin_seq = tr.expected_seq
+                    } else {
+                        tr.fin_seq = opened.seq
+                    }
+                    p2p_tr_check_fin_complete(tr)
+                    send_ack_q(pconn, ciph, session + "", tr.expected_seq - 1, p2p_tr_sack_mask(tr), &tr.ps.addr)
+                    << true
+                }
+            }
+        }
+    }
+    p2p_log(opts, "failed", session + "", peer_id + "", "\"reason\":\"punch_timeout\"")
+    << false
+}

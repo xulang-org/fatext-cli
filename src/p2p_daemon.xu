@@ -1,0 +1,3153 @@
+@main
+
+#errors
+#crypto/ecdh
+#crypto/rand
+#crypto/rsa
+#encoding/base64
+#encoding/hex
+#encoding/json
+#flag
+#net
+#os
+#os/exec
+#os/signal
+#strconv
+#strings
+#time
+
+extern "C" {
+    fn libc_exit(code c_int) c_int = "exit"
+}
+
+const CORE_STATUS = 1
+const CORE_PEERS = 2
+const CORE_SSE_STATE = 3
+const CORE_DIAL = 4
+const CORE_REGISTER_PENDING = 5
+const CORE_RESOLVE_PENDING = 6
+const CORE_INBOUND_OFFER = 7
+const CORE_PEER_CONNECTED = 8
+const CORE_PEER_STATS = 9
+const CORE_PEER_CLOSED = 10
+const CORE_RECONNECT_FIRE = 11
+const CORE_HANGUP = 12
+const CORE_SEND_MSG = 13
+const CORE_INBOUND_MSG = 14
+const CORE_RECV_QUERY = 15
+const CORE_RECV_SUB = 16
+const CORE_RECV_UNSUB = 17
+const CORE_FWD_ADD = 18
+const CORE_FWD_DEL = 19
+const CORE_FWD_LIST = 20
+const CORE_FWD_OPEN_TCP = 21
+const CORE_CHECK_EXPOSE = 22
+const CORE_EXPOSE_LIST = 23
+const CORE_EXPOSE_ADD = 24
+const CORE_EXPOSE_DEL = 25
+const CORE_SHUTDOWN = 26
+
+const WCMD_SEND_MSG = 1
+const WCMD_OPEN_TCP = 2
+const WCMD_STOP = 3
+
+const MSTREAM_CONNECTING = 1
+const MSTREAM_OPEN = 2
+
+const CREDS_GET = 1
+const CREDS_SET = 2
+
+struct DaemonStateFile {
+    pub pid int
+    pub agent_id string
+    pub addr string
+    pub token string
+    pub proto string
+    pub started_at int
+    pub api_base string
+    pub log_file string
+}
+
+struct DaemonCreds {
+    pub agent_id string
+    pub api_base string
+    pub home string
+    pub key_version int
+    pub priv_pem string
+}
+
+struct CredsReq {
+    pub kind int
+    pub creds DaemonCreds
+    pub reply chan DaemonCreds
+}
+
+fn clone_daemon_creds(c &DaemonCreds) DaemonCreds {
+    << DaemonCreds{
+        agent_id: c.agent_id + "",
+        api_base: c.api_base + "",
+        home: c.home + "",
+        key_version: c.key_version,
+        priv_pem: c.priv_pem + ""
+    }
+}
+
+fn daemon_creds_loop(init_creds DaemonCreds, ch chan CredsReq) {
+    $cur := clone_daemon_creds(&init_creds)
+    while true {
+        req := <-ch
+        if req.kind == CREDS_SET {
+            cur = clone_daemon_creds(&req.creds)
+        } else {
+            req.reply <- clone_daemon_creds(&cur)
+        }
+    }
+}
+
+fn get_daemon_creds(ch chan CredsReq) DaemonCreds {
+    rc := chan DaemonCreds{cap: 1}
+    empty := DaemonCreds{agent_id: "", api_base: "", home: "", key_version: 0, priv_pem: ""}
+    ch <- CredsReq{kind: CREDS_GET, creds: empty, reply: rc}
+    << <-rc
+}
+
+fn set_daemon_creds(ch chan CredsReq, c &DaemonCreds) {
+    ch <- CredsReq{kind: CREDS_SET, creds: clone_daemon_creds(c), reply: chan DaemonCreds{cap: 1}}
+}
+
+fn read_priv_pem_checked(home string) string {
+    _ := load_private_key_checked(home + "") or >>
+    << os.read(home + "/private.pem") or >>
+}
+
+fn decode_creds_priv(c &DaemonCreds) rsa.PrivateKey {
+    << decode_rsa_private_pem(&c.priv_pem) or >>
+}
+
+struct PeerWorkerCmd {
+    pub kind int
+    pub text string
+    pub port int
+    pub tcp_fd int
+}
+
+struct CoreResp {
+    pub ok bool
+    pub code string
+    pub err string
+    pub body string
+    pub num int
+    pub flag bool
+}
+
+struct CoreReq {
+    pub kind int
+    pub str1 string
+    pub str2 string
+    pub str3 string
+    pub str4 string
+    pub str5 string
+    pub num1 int
+    pub num2 int
+    pub num3 int
+    pub flag bool
+    pub flag2 bool
+    pub has_reply bool
+    pub reply chan CoreResp
+    pub wait_ch chan CoreResp
+    pub worker_ch chan string
+    pub ans_ch chan string
+    pub sub_ch chan string
+}
+
+fn empty_core_resp_ch() chan CoreResp { << chan CoreResp{cap: 1} }
+fn empty_wcmd_ch() chan string { << chan string{cap: 1} }
+fn empty_str_ch() chan string { << chan string{cap: 1} }
+
+fn core_call(core_ch chan CoreReq, req_in CoreReq) CoreResp {
+    $req := req_in
+    rc := chan CoreResp{cap: 1}
+    req.has_reply = true
+    req.reply = rc
+    core_ch <- req
+    << <-rc
+}
+
+fn core_cast(core_ch chan CoreReq, req_in CoreReq) {
+    $req := req_in
+    req.has_reply = false
+    req.reply = empty_core_resp_ch()
+    core_ch <- req
+}
+
+fn make_core_req(kind int) CoreReq {
+    << CoreReq{
+        kind: kind,
+        str1: "",
+        str2: "",
+        str3: "",
+        str4: "",
+        str5: "",
+        num1: 0,
+        num2: 0,
+        num3: 0,
+        flag: false,
+        flag2: false,
+        has_reply: false,
+        reply: empty_core_resp_ch(),
+        wait_ch: empty_core_resp_ch(),
+        worker_ch: empty_wcmd_ch(),
+        ans_ch: empty_str_ch(),
+        sub_ch: empty_str_ch()
+    }
+}
+
+struct DaemonPeer {
+    pub agent_id string
+    pub state string
+    pub direction string
+    pub session string
+    pub persistent bool
+    pub dial_gen int
+    pub rtt_ms int
+    pub bytes_in int
+    pub bytes_out int
+    pub active_streams int
+    pub connected_at int
+    pub last_error string
+    pub reconnect_attempts int
+    pub cmd_ch chan string
+    pub waiters []chan CoreResp
+}
+
+struct PendingAnswer {
+    pub session string
+    pub ans_ch chan string
+}
+
+struct DaemonInboxMsg {
+    pub seq int
+    pub id string
+    pub from_id string
+    pub topic string
+    pub text string
+    pub session string
+    pub ts int
+}
+
+struct InboxSub {
+    pub id string
+    pub peer_filter string
+    pub topic_filter string
+    pub ch chan string
+}
+
+struct ForwardRule {
+    pub id string
+    pub peer_id string
+    pub bind string
+    pub local_port int
+    pub remote_port int
+    pub lfd int
+}
+
+struct DaemonCoreCtx {
+    pub self_id string
+    pub api_base string
+    pub timeout_sec int
+    pub friends_only bool
+    pub max_peers int
+    pub stun_hp string
+    pub include_host bool
+    pub started_at int
+    pub ctl_addr string
+    pub core_ch chan CoreReq
+    pub creds_ch chan CredsReq
+    pub stop_ch chan int
+}
+
+struct MuxTcpStream {
+    pub sid int
+    pub fd int
+    pub state int
+    pub local_eof bool
+    pub remote_eof bool
+    pub created_ns int
+}
+
+struct AsyncDialRes {
+    pub sid int
+    pub fd int
+}
+
+struct CtlHttpReq {
+    pub ok bool
+    pub method string
+    pub path string
+    pub query string
+    pub host string
+    pub auth string
+    pub body string
+    pub err_code string
+    pub err_msg string
+    pub http_status int
+}
+
+struct CtlClientResp {
+    pub ok bool
+    pub not_running bool
+    pub http_status int
+    pub body string
+    pub err_code string
+    pub err_msg string
+}
+
+fn daemon_state_path(home string) string {
+    << home + "/p2p-daemon.json"
+}
+
+fn daemon_log_path(home string) string {
+    << home + "/p2p-daemon.log"
+}
+
+fn const_time_eq(a &string, b &string) bool {
+    if a.len != b.len || a.len == 0 { << false }
+    $diff := 0
+    for i in 0:a.len {
+        diff = diff | ((a[i] & 255) ^ (b[i] & 255))
+    }
+    << diff == 0
+}
+
+fn read_daemon_state(home string) DaemonStateFile {
+    spath := daemon_state_path(home + "")
+    check_private_key_perms(spath + "") or >>
+    raw := os.read(spath + "") or >>
+    doc := json.parse(&raw)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        >> errors.new("invalid p2p-daemon.json")
+    }
+    r := doc.root()
+    addr := json_has_str(&doc, r, "addr", "")
+    tok := json_has_str(&doc, r, "token", "")
+    if addr.len == 0 || tok.len == 0 {
+        >> errors.new("incomplete p2p-daemon.json")
+    }
+    << DaemonStateFile{
+        pid: json_has_int(&doc, r, "pid", 0),
+        agent_id: json_has_str(&doc, r, "agent_id", ""),
+        addr: addr,
+        token: tok,
+        proto: json_has_str(&doc, r, "proto", ""),
+        started_at: json_has_int(&doc, r, "started_at", 0),
+        api_base: json_has_str(&doc, r, "api_base", ""),
+        log_file: json_has_str(&doc, r, "log_file", "")
+    }
+}
+
+fn write_daemon_state(home string, st &DaemonStateFile) int {
+    ensure_dir_mode(home + "", 448) or >>
+    body := "{" +
+        "\"pid\":" + strconv.itoa(st.pid) + "," +
+        "\"agent_id\":" + json.quote(&st.agent_id) + "," +
+        "\"addr\":" + json.quote(&st.addr) + "," +
+        "\"token\":" + json.quote(&st.token) + "," +
+        "\"proto\":" + json.quote(&st.proto) + "," +
+        "\"started_at\":" + strconv.itoa(st.started_at) + "," +
+        "\"api_base\":" + json.quote(&st.api_base) + "," +
+        "\"log_file\":" + json.quote(&st.log_file) +
+        "}\n"
+    << write_atomic_mode(daemon_state_path(home + ""), &body, 384) or >>
+}
+
+fn remove_daemon_state_if_token(home string, token string) {
+    st := read_daemon_state(home + "") or (err) { << }
+    if st.token == token {
+        _ := os.remove(daemon_state_path(home + "")) or (err) { << }
+    }
+}
+
+fn daemon_timeout_pulse(ch chan int, delay_ms int) {
+    $d := delay_ms
+    if d < 10 { d = 10 }
+    time.sleep(d * 1000000)
+    select {
+        ch <- 1 {}
+        else {}
+    }
+}
+
+fn daemon_reconnect_timer(core_ch chan CoreReq, peer_id string, gen int, delay_ms int) {
+    time.sleep(jitter_ms(delay_ms) * 1000000)
+    $req := make_core_req(CORE_RECONNECT_FIRE)
+    req.str1 = peer_id + ""
+    req.num1 = gen
+    core_cast(core_ch, req)
+}
+
+fn peer_to_json(p &DaemonPeer) string {
+    $ps := "false"
+    if p.persistent { ps = "true" }
+    << "{\"agent_id\":" + json.quote(&p.agent_id) +
+        ",\"state\":" + json.quote(&p.state) +
+        ",\"direction\":" + json.quote(&p.direction) +
+        ",\"session\":" + json.quote(&p.session) +
+        ",\"persistent\":" + ps +
+        ",\"rtt_ms\":" + strconv.itoa(p.rtt_ms) +
+        ",\"bytes_in\":" + strconv.itoa(p.bytes_in) +
+        ",\"bytes_out\":" + strconv.itoa(p.bytes_out) +
+        ",\"active_streams\":" + strconv.itoa(p.active_streams) +
+        ",\"connected_at\":" + strconv.itoa(p.connected_at) +
+        ",\"last_error\":" + json.quote(&p.last_error) +
+        ",\"reconnect_attempts\":" + strconv.itoa(p.reconnect_attempts) + "}"
+}
+
+fn inbox_msg_to_json(m &DaemonInboxMsg) string {
+    << "{\"seq\":" + strconv.itoa(m.seq) +
+        ",\"id\":" + json.quote(&m.id) +
+        ",\"from\":" + json.quote(&m.from_id) +
+        ",\"topic\":" + json.quote(&m.topic) +
+        ",\"text\":" + json.quote(&m.text) +
+        ",\"session\":" + json.quote(&m.session) +
+        ",\"ts\":" + strconv.itoa(m.ts) + "}"
+}
+
+fn fwd_to_json(f &ForwardRule) string {
+    << "{\"id\":" + json.quote(&f.id) +
+        ",\"peer\":" + json.quote(&f.peer_id) +
+        ",\"bind\":" + json.quote(&f.bind) +
+        ",\"local_port\":" + strconv.itoa(f.local_port) +
+        ",\"remote_port\":" + strconv.itoa(f.remote_port) + "}"
+}
+
+fn clone_core_ctx(c &DaemonCoreCtx) DaemonCoreCtx {
+    << DaemonCoreCtx{
+        self_id: c.self_id + "",
+        api_base: c.api_base + "",
+        timeout_sec: c.timeout_sec,
+        friends_only: c.friends_only,
+        max_peers: c.max_peers,
+        stun_hp: c.stun_hp + "",
+        include_host: c.include_host,
+        started_at: c.started_at,
+        ctl_addr: c.ctl_addr + "",
+        core_ch: c.core_ch,
+        creds_ch: c.creds_ch,
+        stop_ch: c.stop_ch
+    }
+}
+
+fn resolve_waiters(waiters &[]chan CoreResp, resp &CoreResp) {
+    for i in 0:waiters.len {
+        w := waiters[i]
+        msg := CoreResp{ok: resp.ok, code: resp.code + "", err: resp.err + "", body: resp.body + "", num: resp.num, flag: resp.flag}
+        w <- msg
+    }
+}
+
+fn stop_worker_q(ch chan string) {
+    s := "STOP"
+    select {
+        ch <- s {}
+        else {}
+    }
+}
+
+fn net_write_checked(fd int, data &string) int {
+    << net.conn_write(fd, data) or (err) { << -1 }
+}
+
+fn clone_cli_opts(o &CliOpts) CliOpts {
+    << CliOpts{
+        json_mode: o.json_mode,
+        config_path: o.config_path + "",
+        api_override: o.api_override + "",
+        timeout_sec: o.timeout_sec,
+        pow_bits_override: o.pow_bits_override
+    }
+}
+
+fn daemon_mux_dial_local(res_ch chan AsyncDialRes, sid int, port int) {
+    fd := net.dial_ns("127.0.0.1:" + strconv.itoa(port), 3000000000) or (err) {
+        res_ch <- AsyncDialRes{sid: sid, fd: -1}
+        <<
+    }
+    res_ch <- AsyncDialRes{sid: sid, fd: fd}
+}
+
+fn daemon_forward_accept_loop(core_ch chan CoreReq, peer_id string, remote_port int, lfd int) {
+    while true {
+        cfd := net.accept(lfd) or (err) { <- }
+        $req := make_core_req(CORE_FWD_OPEN_TCP)
+        req.str1 = peer_id + ""
+        req.num1 = remote_port
+        req.num3 = cfd
+        core_cast(core_ch, req)
+    }
+}
+
+fn daemon_peer_mux_worker(
+    ctx DaemonCoreCtx,
+    pconn_in net.PacketConn,
+    ciph_in P2PCiphers,
+    sess string,
+    peer_id string,
+    cands []net.UDPAddr,
+    gen int,
+    direction string
+) {
+    $pconn := pconn_in
+    $ciph := ciph_in
+    $tr := make_p2p_transport(sess + "", peer_id + "", &net.UDPAddr{ip: "", port: 0, zone: ""})
+    opts := CliOpts{json_mode: true, config_path: "", api_override: "", timeout_sec: ctx.timeout_sec, pow_bits_override: 0}
+
+    if !p2p_punch_handshake(&opts, $&pconn, $&ciph, sess + "", peer_id + "", &cands, $&tr) {
+        pconn_close_q($&pconn)
+        $creq := make_core_req(CORE_PEER_CLOSED)
+        creq.str1 = peer_id + ""
+        creq.str2 = "punch_timeout"
+        creq.num1 = gen
+        core_cast(ctx.core_ch, creq)
+        <<
+    }
+
+    cmd_ch := chan string{cap: 64}
+    $reg := make_core_req(CORE_PEER_CONNECTED)
+    reg.str1 = peer_id + ""
+    reg.str2 = direction + ""
+    reg.str3 = sess + ""
+    reg.num1 = gen
+    reg.worker_ch = cmd_ch
+    rres := core_call(ctx.core_ch, reg)
+    if !rres.ok {
+        p2p_tr_send_fin($&tr, $&pconn, $&ciph)
+        pconn_close_q($&pconn)
+        <<
+    }
+
+    $next_sid := 2
+    if direction == "out" { next_sid = 1 }
+    $streams := []MuxTcpStream{}
+    $mparser := make_mux_parser()
+    dial_res_ch := chan AsyncDialRes{cap: 32}
+    $last_stats_ns := time.now()
+    $last_b_in := 0
+    $last_b_out := 0
+    $alive := true
+    $close_reason := "peer_closed"
+
+    while alive {
+        $drain_cmd := true
+        while drain_cmd {
+            select {
+                raw_cmd := <-cmd_ch {
+                    if raw_cmd == "STOP" {
+                        p2p_tr_send_fin($&tr, $&pconn, $&ciph)
+                        close_reason = "stopped"
+                        alive = false
+                        <-
+                    } else if strings.has_prefix(&raw_cmd, "MSG:") {
+                        msg_pl := raw_cmd[4:raw_cmd.len] + ""
+                        fr := mux_encode(MUX_MSG, 0, &msg_pl)
+                        p2p_tr_enqueue($&tr, &fr)
+                    } else if strings.has_prefix(&raw_cmd, "TCP:") {
+                        rest_c := raw_cmd[4:raw_cmd.len] + ""
+                        cparts := strings.split(&rest_c, ":")
+                        if cparts.len == 2 {
+                            cport := atoi_or_0(&cparts[0])
+                            cfd := atoi_or_0(&cparts[1])
+                            if streams.len >= 64 || cport <= 0 || cfd < 0 {
+                                net_close_q(cfd)
+                            } else {
+                                sid := next_sid
+                                next_sid += 2
+                                streams.push(MuxTcpStream{
+                                    sid: sid,
+                                    fd: cfd,
+                                    state: MSTREAM_CONNECTING,
+                                    local_eof: false,
+                                    remote_eof: false,
+                                    created_ns: time.now()
+                                })
+                                opl := "{\"kind\":\"tcp\",\"port\":" + strconv.itoa(cport) + "}"
+                                fr := mux_encode(MUX_STREAM_OPEN, sid, &opl)
+                                p2p_tr_enqueue($&tr, &fr)
+                            }
+                        }
+                    }
+                }
+                else {
+                    drain_cmd = false
+                }
+            }
+        }
+        if !alive { <- }
+
+        $drain_dial := true
+        while drain_dial {
+            select {
+                dr := <-dial_res_ch {
+                    if dr.fd >= 0 {
+                        streams.push(MuxTcpStream{
+                            sid: dr.sid,
+                            fd: dr.fd,
+                            state: MSTREAM_OPEN,
+                            local_eof: false,
+                            remote_eof: false,
+                            created_ns: time.now()
+                        })
+                        empty := ""
+                        fr := mux_encode(MUX_STREAM_OPEN_OK, dr.sid, &empty)
+                        p2p_tr_enqueue($&tr, &fr)
+                    } else {
+                        err_s := "dial_failed"
+                        fr := mux_encode(MUX_STREAM_OPEN_ERR, dr.sid, &err_s)
+                        p2p_tr_enqueue($&tr, &fr)
+                    }
+                }
+                else {
+                    drain_dial = false
+                }
+            }
+        }
+
+        for si in 0:streams.len {
+            if streams[si].state == MSTREAM_OPEN && !streams[si].local_eof && streams[si].fd >= 0 {
+                if p2p_tr_tx_pending(&tr) < 128 {
+                    $reads := 0
+                    while reads < 4 && p2p_tr_tx_pending(&tr) < 128 {
+                        ev_m := os.socket_wait(streams[si].fd, 1, -1) or (err) {
+                            streams[si].local_eof = true
+                            empty := ""
+                            ffr := mux_encode(MUX_STREAM_FIN, streams[si].sid, &empty)
+                            p2p_tr_enqueue($&tr, &ffr)
+                            <-
+                        }
+                        if (ev_m & 13) == 0 { <- }
+                        chunk := net.conn_read(streams[si].fd, 4096) or (err) {
+                            streams[si].local_eof = true
+                            empty := ""
+                            ffr := mux_encode(MUX_STREAM_FIN, streams[si].sid, &empty)
+                            p2p_tr_enqueue($&tr, &ffr)
+                            <-
+                        }
+                        if chunk.len == 0 {
+                            streams[si].local_eof = true
+                            empty := ""
+                            ffr := mux_encode(MUX_STREAM_FIN, streams[si].sid, &empty)
+                            p2p_tr_enqueue($&tr, &ffr)
+                            <-
+                        }
+                        dfr := mux_encode(MUX_STREAM_DATA, streams[si].sid, &chunk)
+                        p2p_tr_enqueue($&tr, &dfr)
+                        reads += 1
+                    }
+                }
+            }
+        }
+
+        if !p2p_tr_flush_tx($&tr, $&pconn, $&ciph) {
+            close_reason = tr.fail_reason + ""
+            alive = false
+            <-
+        }
+
+        $wait_ns := 10000000
+        if p2p_tr_tx_pending(&tr) > 0 || streams.len > 0 {
+            wait_ns = 2000000
+        }
+        p2p_tr_poll_udp($&tr, $&pconn, $&ciph, wait_ns, 32)
+
+        rx := p2p_tr_take_rx($&tr)
+        if rx.len > 0 {
+            frames := mux_parser_feed($&mparser, &rx)
+            if mparser.overflow {
+                close_reason = "mux_overflow"
+                alive = false
+                <-
+            }
+            for fi in 0:frames.len {
+                f := &frames[fi]
+                if f.ftype == MUX_MSG {
+                    md := json.parse(&f.payload)
+                    if md.ok() && md.is_dict(md.root()) {
+                        mr := md.root()
+                        $mreq := make_core_req(CORE_INBOUND_MSG)
+                        mreq.str1 = peer_id + ""
+                        mreq.str2 = json_has_str(&md, mr, "topic", "")
+                        mreq.str3 = json_has_str(&md, mr, "id", "")
+                        mreq.str4 = json_has_str(&md, mr, "text", "")
+                        mreq.str5 = sess + ""
+                        mreq.num1 = json_has_int(&md, mr, "ts", time.now_time().unix())
+                        core_cast(ctx.core_ch, mreq)
+                    }
+                } else if f.ftype == MUX_STREAM_OPEN {
+                    od := json.parse(&f.payload)
+                    $port := 0
+                    $kind_s := ""
+                    if od.ok() && od.is_dict(od.root()) {
+                        kind_s = json_has_str(&od, od.root(), "kind", "")
+                        port = json_has_int(&od, od.root(), "port", 0)
+                    }
+                    if kind_s != "tcp" || port <= 0 || port > 65535 {
+                        ers := "invalid_stream_open"
+                        efr := mux_encode(MUX_STREAM_OPEN_ERR, f.stream_id, &ers)
+                        p2p_tr_enqueue($&tr, &efr)
+                    } else if streams.len >= 64 {
+                        ers := "too_many_streams"
+                        efr := mux_encode(MUX_STREAM_OPEN_ERR, f.stream_id, &ers)
+                        p2p_tr_enqueue($&tr, &efr)
+                    } else {
+                        $chk := make_core_req(CORE_CHECK_EXPOSE)
+                        chk.num1 = port
+                        cres := core_call(ctx.core_ch, chk)
+                        if !cres.ok {
+                            ers := "port_not_exposed"
+                            efr := mux_encode(MUX_STREAM_OPEN_ERR, f.stream_id, &ers)
+                            p2p_tr_enqueue($&tr, &efr)
+                        } else {
+                            xu daemon_mux_dial_local(dial_res_ch, f.stream_id, port)
+                        }
+                    }
+                } else if f.ftype == MUX_STREAM_OPEN_OK {
+                    for si in 0:streams.len {
+                        if streams[si].sid == f.stream_id {
+                            streams[si].state = MSTREAM_OPEN
+                            <-
+                        }
+                    }
+                } else if f.ftype == MUX_STREAM_OPEN_ERR {
+                    $next_st := []MuxTcpStream{}
+                    for si in 0:streams.len {
+                        if streams[si].sid == f.stream_id {
+                            net_close_q(streams[si].fd)
+                        } else {
+                            next_st.push(streams[si])
+                        }
+                    }
+                    streams = next_st
+                } else if f.ftype == MUX_STREAM_DATA {
+                    $kill_sid := -1
+                    for si in 0:streams.len {
+                        if streams[si].sid == f.stream_id {
+                            if streams[si].fd >= 0 && !streams[si].remote_eof {
+                                wn := net_write_checked(streams[si].fd, &f.payload)
+                                if wn < 0 {
+                                    kill_sid = f.stream_id
+                                }
+                            }
+                            <-
+                        }
+                    }
+                    if kill_sid >= 0 {
+                        empty := ""
+                        rfr := mux_encode(MUX_STREAM_RST, kill_sid, &empty)
+                        p2p_tr_enqueue($&tr, &rfr)
+                        $next_st := []MuxTcpStream{}
+                        for si in 0:streams.len {
+                            if streams[si].sid == kill_sid {
+                                net_close_q(streams[si].fd)
+                            } else {
+                                next_st.push(streams[si])
+                            }
+                        }
+                        streams = next_st
+                    }
+                } else if f.ftype == MUX_STREAM_FIN {
+                    for si in 0:streams.len {
+                        if streams[si].sid == f.stream_id {
+                            net_close_write_q(streams[si].fd)
+                            streams[si].remote_eof = true
+                            <-
+                        }
+                    }
+                } else if f.ftype == MUX_STREAM_RST {
+                    $next_st := []MuxTcpStream{}
+                    for si in 0:streams.len {
+                        if streams[si].sid == f.stream_id {
+                            net_close_q(streams[si].fd)
+                        } else {
+                            next_st.push(streams[si])
+                        }
+                    }
+                    streams = next_st
+                }
+            }
+        }
+
+        now_gc := time.now()
+        $kept_st := []MuxTcpStream{}
+        for si in 0:streams.len {
+            s := &streams[si]
+            if (s.local_eof && s.remote_eof) || (s.state == MSTREAM_CONNECTING && now_gc - s.created_ns >= 15000000000) {
+                net_close_q(s.fd)
+            } else {
+                kept_st.push(streams[si])
+            }
+        }
+        streams = kept_st
+
+        if tr.remote_fin {
+            close_reason = "remote_fin"
+            alive = false
+        }
+
+        now_st := time.now()
+        stats_dirty := (tr.bytes_in != last_b_in || tr.bytes_out != last_b_out) && (now_st - last_stats_ns >= 50000000)
+        if now_st - last_stats_ns >= 400000000 || stats_dirty || !alive {
+            last_stats_ns = now_st
+            last_b_in = tr.bytes_in
+            last_b_out = tr.bytes_out
+            $sreq := make_core_req(CORE_PEER_STATS)
+            sreq.str1 = peer_id + ""
+            sreq.num1 = gen
+            sreq.num2 = tr.rtt_ms
+            sreq.num3 = tr.bytes_in
+            sreq.str2 = strconv.itoa(tr.bytes_out)
+            sreq.str3 = strconv.itoa(streams.len)
+            core_cast(ctx.core_ch, sreq)
+        }
+    }
+
+    for si in 0:streams.len {
+        net_close_q(streams[si].fd)
+    }
+    pconn_close_q($&pconn)
+    $creq := make_core_req(CORE_PEER_CLOSED)
+    creq.str1 = peer_id + ""
+    creq.str2 = close_reason + ""
+    creq.num1 = gen
+    core_cast(ctx.core_ch, creq)
+}
+
+fn daemon_outbound_dial_worker(ctx DaemonCoreCtx, peer_id string, gen int) {
+    creds := get_daemon_creds(ctx.creds_ch)
+    priv := decode_creds_priv(&creds) or (err) {
+        $creq := make_core_req(CORE_PEER_CLOSED)
+        creq.str1 = peer_id + ""
+        creq.str2 = err.msg()
+        creq.num1 = gen
+        core_cast(ctx.core_ch, creq)
+        <<
+    }
+
+    fk := fetch_agent_key(creds.api_base + "", ctx.timeout_sec, peer_id + "")
+    if !fk.ok {
+        $creq := make_core_req(CORE_PEER_CLOSED)
+        creq.str1 = peer_id + ""
+        creq.str2 = fk.err_code + ":" + fk.err_msg
+        creq.num1 = gen
+        core_cast(ctx.core_ch, creq)
+        <<
+    }
+
+    $attempt := 0
+    while attempt < 2 {
+        attempt += 1
+        $pconn := net.listen_packet("udp4", "0.0.0.0:0") or (err) {
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = err.msg()
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+        lport := local_port_of(&pconn)
+        srflx := stun_discover($&pconn, ctx.stun_hp + "")
+        xpriv := ecdh.generate_key(ecdh.x25519()) or (err) {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = err.msg()
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+        xpub_b64 := base64.encode_to_string(xpriv.public_key().bytes())
+        sess := generate_session_id() or (err) {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = err.msg()
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+
+        ans_ch := chan string{cap: 1}
+        $preg := make_core_req(CORE_REGISTER_PENDING)
+        preg.str1 = sess + ""
+        preg.ans_ch = ans_ch
+        core_call(ctx.core_ch, preg)
+
+        now := time.now_time().unix()
+        cands_json := build_candidates_json(lport, srflx, ctx.include_host)
+        offer_body := "{\"session\":" + json.quote(&sess) +
+            ",\"proto\":" + json.quote(&P2P_PROTO_V4) +
+            ",\"candidates\":" + cands_json +
+            ",\"x25519_pub\":" + json.quote(&xpub_b64) +
+            ",\"mode\":\"mux\",\"remote_port\":0,\"relay\":false,\"expires_at\":" + strconv.itoa(now + 60) + "}"
+
+        offer_frame := encrypt_dm_frame(creds.agent_id + "", &priv, peer_id + "", &fk.pk, fk.key_version, "p2p_offer", offer_body, "open", now) or (err) {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = err.msg()
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+        dm_r := api_call(creds.api_base + "", ctx.timeout_sec, creds.agent_id + "", &priv, true, "POST", "/v1/dm/" + (peer_id + ""), &offer_frame, "")
+        if !dm_r.ok {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = dm_r.err_code + ":" + dm_r.err_msg
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+
+        to_ch := chan int{cap: 1}
+        ans_to_ms := p2p_env_ms("FATEXT_P2P_ANSWER_TIMEOUT_MS", 10000, 500, 75000)
+        xu daemon_timeout_pulse(to_ch, ans_to_ms)
+
+        $ans_json := ""
+        $got := false
+        $cancelled := false
+        select {
+            aj := <-ans_ch {
+                if aj == "__CANCEL__" {
+                    cancelled = true
+                } else {
+                    ans_json = aj + ""
+                    got = true
+                }
+            }
+            _ := <-to_ch {
+                got = false
+            }
+        }
+        if cancelled {
+            pconn_close_q($&pconn)
+            <<
+        }
+        if !got || ans_json.len == 0 {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = "answer_timeout"
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+
+        ad := json.parse(&ans_json)
+        if !ad.ok() || !ad.is_dict(ad.root()) {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = "invalid_answer"
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+        ar := ad.root()
+        if !json_bool_or(&ad, ad.get(ar, "accept"), false) {
+            rsn := json_str_or(&ad, ad.get(ar, "reason"), "rejected")
+            pconn_close_q($&pconn)
+            if rsn == "glare_retry" && attempt == 1 {
+                time.sleep(350000000)
+                ->
+            }
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = "rejected:" + rsn
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+        if json_str_or(&ad, ad.get(ar, "proto"), "") != P2P_PROTO_V4 {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = "unsupported_p2p_proto"
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+        peer_cands := extract_candidate_addrs(&ad, ad.get(ar, "candidates"))
+        peer_xpub_b64 := json_str_or(&ad, ad.get(ar, "x25519_pub"), "")
+        if peer_cands.len == 0 || peer_xpub_b64.len == 0 {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = "empty_answer_candidates"
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+
+        px_raw := base64.decode_string(peer_xpub_b64 + "") or (err) {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = "invalid_peer_x25519"
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+        px := ecdh.new_public_key(ecdh.x25519(), &px_raw) or (err) {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = "invalid_peer_x25519"
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+        shared := xpriv.ecdh(&px) or (err) {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = err.msg()
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+        k_i2r := p2p_derive_dir_key("i2r", sess + "", creds.agent_id + "", peer_id + "", xpub_b64 + "", peer_xpub_b64 + "", &shared)
+        k_r2i := p2p_derive_dir_key("r2i", sess + "", creds.agent_id + "", peer_id + "", xpub_b64 + "", peer_xpub_b64 + "", &shared)
+        $ciph := make_p2p_ciphers(&k_i2r, &k_r2i) or (err) {
+            pconn_close_q($&pconn)
+            $creq := make_core_req(CORE_PEER_CLOSED)
+            creq.str1 = peer_id + ""
+            creq.str2 = err.msg()
+            creq.num1 = gen
+            core_cast(ctx.core_ch, creq)
+            <<
+        }
+        daemon_peer_mux_worker(ctx, pconn, ciph, sess + "", peer_id + "", peer_cands, gen, "out")
+        <<
+    }
+}
+
+fn daemon_legacy_forward_worker(
+    ctx DaemonCoreCtx,
+    pconn_in net.PacketConn,
+    ciph_in P2PCiphers,
+    sess string,
+    from_id string,
+    cands []net.UDPAddr,
+    rport int,
+    gen int
+) {
+    $pconn := pconn_in
+    $ciph := ciph_in
+    cmd_ch := chan string{cap: 8}
+    $reg := make_core_req(CORE_PEER_CONNECTED)
+    reg.str1 = from_id + ""
+    reg.str2 = "in"
+    reg.str3 = sess + ""
+    reg.num1 = gen
+    reg.worker_ch = cmd_ch
+    rres := core_call(ctx.core_ch, reg)
+    if rres.ok {
+        opts := CliOpts{json_mode: true, config_path: "", api_override: "", timeout_sec: ctx.timeout_sec, pow_bits_override: 0}
+        _ := p2p_punch_and_session(&opts, $&pconn, $&ciph, sess + "", from_id + "", &cands, false, false, -1, -1, rport)
+    }
+    pconn_close_q($&pconn)
+    $creq := make_core_req(CORE_PEER_CLOSED)
+    creq.str1 = from_id + ""
+    creq.str2 = "legacy_closed"
+    creq.num1 = gen
+    core_cast(ctx.core_ch, creq)
+}
+
+fn str_lt(a &string, b &string) bool {
+    $n := a.len
+    if b.len < n { n = b.len }
+    for i in 0:n {
+        ca := a[i] & 255
+        cb := b[i] & 255
+        if ca < cb { << true }
+        if ca > cb { << false }
+    }
+    << a.len < b.len
+}
+
+fn clone_daemon_peer(p &DaemonPeer) DaemonPeer {
+    $ws := []chan CoreResp{}
+    for i in 0:p.waiters.len {
+        ws.push(p.waiters[i])
+    }
+    << DaemonPeer{
+        agent_id: p.agent_id + "",
+        state: p.state + "",
+        direction: p.direction + "",
+        session: p.session + "",
+        persistent: p.persistent,
+        dial_gen: p.dial_gen,
+        rtt_ms: p.rtt_ms,
+        bytes_in: p.bytes_in,
+        bytes_out: p.bytes_out,
+        active_streams: p.active_streams,
+        connected_at: p.connected_at,
+        last_error: p.last_error + "",
+        reconnect_attempts: p.reconnect_attempts,
+        cmd_ch: p.cmd_ch,
+        waiters: ws
+    }
+}
+
+fn send_core_reply(ch chan CoreResp, r &CoreResp) {
+    ch <- CoreResp{ok: r.ok, code: r.code + "", err: r.err + "", body: r.body + "", num: r.num, flag: r.flag}
+}
+
+fn daemon_core_loop(ctx DaemonCoreCtx, init_expose []int, init_peers []string, ctl_lfd int) {
+    $peers := []DaemonPeer{}
+    $pending := []PendingAnswer{}
+    $inbox := []DaemonInboxMsg{}
+    $subs := []InboxSub{}
+    $forwards := []ForwardRule{}
+    $expose := init_expose
+    $sse_connected := false
+    $shutting_down := false
+    $next_msg_seq := 0
+    $next_fwd_id := 0
+
+    for i in 0:init_peers.len {
+        pid := init_peers[i] + ""
+        if pid.len > 0 && pid != ctx.self_id {
+            peers.push(DaemonPeer{
+                agent_id: pid,
+                state: "connecting",
+                direction: "out",
+                session: "",
+                persistent: true,
+                dial_gen: 1,
+                rtt_ms: -1,
+                bytes_in: 0,
+                bytes_out: 0,
+                active_streams: 0,
+                connected_at: 0,
+                last_error: "",
+                reconnect_attempts: 0,
+                cmd_ch: empty_wcmd_ch(),
+                waiters: []chan CoreResp{}
+            })
+            xu daemon_outbound_dial_worker(clone_core_ctx(&ctx), pid, 1)
+        }
+    }
+
+    while true {
+        req := <-ctx.core_ch
+        $resp := CoreResp{ok: true, code: "", err: "", body: "", num: 0, flag: false}
+
+        if req.kind == CORE_STATUS {
+            $p_conn := 0
+            for i in 0:peers.len {
+                if peers[i].state == "connected" { p_conn += 1 }
+            }
+            $exp_items := []string{}
+            for i in 0:expose.len { exp_items.push(strconv.itoa(expose[i])) }
+            $sse_s := "false"
+            if sse_connected { sse_s = "true" }
+            $fo_s := "false"
+            if ctx.friends_only { fo_s = "true" }
+            $up := time.now_time().unix() - ctx.started_at
+            if up < 0 { up = 0 }
+            resp.body = "{" +
+                "\"ok\":true," +
+                "\"pid\":" + strconv.itoa(os.getpid()) + "," +
+                "\"agent_id\":" + json.quote(&ctx.self_id) + "," +
+                "\"proto\":" + json.quote(&P2P_PROTO_V4) + "," +
+                "\"addr\":" + json.quote(&ctx.ctl_addr) + "," +
+                "\"api_base\":" + json.quote(&ctx.api_base) + "," +
+                "\"started_at\":" + strconv.itoa(ctx.started_at) + "," +
+                "\"uptime_sec\":" + strconv.itoa(up) + "," +
+                "\"sse_connected\":" + sse_s + "," +
+                "\"friends_only\":" + fo_s + "," +
+                "\"max_peers\":" + strconv.itoa(ctx.max_peers) + "," +
+                "\"peers_total\":" + strconv.itoa(peers.len) + "," +
+                "\"peers_connected\":" + strconv.itoa(p_conn) + "," +
+                "\"forwards_count\":" + strconv.itoa(forwards.len) + "," +
+                "\"expose_ports\":[" + strings.join(exp_items, ",") + "]," +
+                "\"inbox_count\":" + strconv.itoa(inbox.len) + "}"
+        } else if req.kind == CORE_PEERS {
+            $arr := []string{}
+            for i in 0:peers.len {
+                arr.push(peer_to_json(&peers[i]))
+            }
+            resp.body = "{\"ok\":true,\"peers\":[" + strings.join(arr, ",") + "]}"
+        } else if req.kind == CORE_SSE_STATE {
+            sse_connected = req.flag
+        } else if req.kind == CORE_DIAL {
+            pid := req.str1 + ""
+            if pid == ctx.self_id {
+                resp.ok = false
+                resp.code = "ERR_USAGE"
+                resp.err = "cannot dial self"
+            } else if shutting_down {
+                resp.ok = false
+                resp.code = "ERR_P2P"
+                resp.err = "daemon shutting down"
+            } else {
+                $idx := -1
+                for i in 0:peers.len {
+                    if peers[i].agent_id == pid {
+                        idx = i
+                        <-
+                    }
+                }
+                if idx < 0 && peers.len >= ctx.max_peers {
+                    resp.ok = false
+                    resp.code = "ERR_P2P"
+                    resp.err = "max_peers_reached"
+                } else if idx >= 0 && peers[idx].state == "connected" {
+                    if req.flag { peers[idx].persistent = true }
+                    resp.code = "CONNECTED"
+                    resp.body = peer_to_json(&peers[idx])
+                } else {
+                    if idx < 0 {
+                        peers.push(DaemonPeer{
+                            agent_id: pid,
+                            state: "connecting",
+                            direction: "out",
+                            session: "",
+                            persistent: req.flag,
+                            dial_gen: 1,
+                            rtt_ms: -1,
+                            bytes_in: 0,
+                            bytes_out: 0,
+                            active_streams: 0,
+                            connected_at: 0,
+                            last_error: "",
+                            reconnect_attempts: 0,
+                            cmd_ch: empty_wcmd_ch(),
+                            waiters: []chan CoreResp{}
+                        })
+                        idx = peers.len - 1
+                        if req.flag2 {
+                            peers[idx].waiters.push(req.wait_ch)
+                        }
+                        xu daemon_outbound_dial_worker(clone_core_ctx(&ctx), pid, 1)
+                    } else {
+                        if req.flag { peers[idx].persistent = true }
+                        if req.flag2 {
+                            peers[idx].waiters.push(req.wait_ch)
+                        }
+                        if peers[idx].state != "connecting" {
+                            peers[idx].state = "connecting"
+                            peers[idx].direction = "out"
+                            peers[idx].dial_gen += 1
+                            peers[idx].last_error = ""
+                            g := peers[idx].dial_gen
+                            xu daemon_outbound_dial_worker(clone_core_ctx(&ctx), pid, g)
+                        }
+                    }
+                    resp.code = "WAIT"
+                    resp.body = peer_to_json(&peers[idx])
+                }
+            }
+        } else if req.kind == CORE_REGISTER_PENDING {
+            pending.push(PendingAnswer{session: req.str1 + "", ans_ch: req.ans_ch})
+        } else if req.kind == CORE_RESOLVE_PENDING {
+            $next_p := []PendingAnswer{}
+            for i in 0:pending.len {
+                if pending[i].session == req.str1 {
+                    select {
+                        pending[i].ans_ch <- (req.str2 + "") {}
+                        else {}
+                    }
+                    resp.flag = true
+                } else {
+                    next_p.push(pending[i])
+                }
+            }
+            pending = next_p
+        } else if req.kind == CORE_INBOUND_OFFER {
+            pid := req.str1 + ""
+            sess := req.str2 + ""
+            mode := req.str3 + ""
+            rport := req.num1
+            if shutting_down {
+                resp.ok = false
+                resp.code = "shutting_down"
+            } else if mode == "forward" {
+                $allowed := false
+                for j in 0:expose.len {
+                    if expose[j] == rport { allowed = true }
+                }
+                if !allowed {
+                    resp.ok = false
+                    resp.code = "port_not_exposed"
+                }
+            } else if mode != "mux" {
+                resp.ok = false
+                resp.code = "unsupported_mode"
+            }
+            if resp.ok {
+                $idx := -1
+                for i in 0:peers.len {
+                    if peers[i].agent_id == pid {
+                        idx = i
+                        <-
+                    }
+                }
+                if idx < 0 && peers.len >= ctx.max_peers {
+                    resp.ok = false
+                    resp.code = "max_peers_reached"
+                } else if idx >= 0 && peers[idx].state == "connecting" && peers[idx].direction == "out" {
+                    if str_lt(&ctx.self_id, &pid) {
+                        resp.ok = false
+                        resp.code = "glare_retry"
+                    } else {
+                        old_sess := peers[idx].session + ""
+                        peers[idx].dial_gen += 1
+                        peers[idx].direction = "in"
+                        peers[idx].session = sess + ""
+                        resp.num = peers[idx].dial_gen
+                        if old_sess.len > 0 {
+                            $np := []PendingAnswer{}
+                            for k in 0:pending.len {
+                                if pending[k].session == old_sess {
+                                    select {
+                                        pending[k].ans_ch <- "__CANCEL__" {}
+                                        else {}
+                                    }
+                                } else {
+                                    np.push(pending[k])
+                                }
+                            }
+                            pending = np
+                        }
+                    }
+                } else if idx >= 0 {
+                    if peers[idx].state == "connected" {
+                        stop_worker_q(peers[idx].cmd_ch)
+                    }
+                    peers[idx].dial_gen += 1
+                    peers[idx].state = "connecting"
+                    peers[idx].direction = "in"
+                    peers[idx].session = sess + ""
+                    resp.num = peers[idx].dial_gen
+                } else {
+                    peers.push(DaemonPeer{
+                        agent_id: pid,
+                        state: "connecting",
+                        direction: "in",
+                        session: sess + "",
+                        persistent: false,
+                        dial_gen: 1,
+                        rtt_ms: -1,
+                        bytes_in: 0,
+                        bytes_out: 0,
+                        active_streams: 0,
+                        connected_at: 0,
+                        last_error: "",
+                        reconnect_attempts: 0,
+                        cmd_ch: empty_wcmd_ch(),
+                        waiters: []chan CoreResp{}
+                    })
+                    resp.num = 1
+                }
+            }
+        } else if req.kind == CORE_PEER_CONNECTED {
+            pid := req.str1 + ""
+            gen := req.num1
+            $found := false
+            for i in 0:peers.len {
+                if peers[i].agent_id == pid && peers[i].dial_gen == gen {
+                    peers[i].state = "connected"
+                    peers[i].direction = req.str2 + ""
+                    peers[i].session = req.str3 + ""
+                    peers[i].rtt_ms = -1
+                    peers[i].bytes_in = 0
+                    peers[i].bytes_out = 0
+                    peers[i].active_streams = 0
+                    peers[i].connected_at = time.now_time().unix()
+                    peers[i].last_error = ""
+                    peers[i].reconnect_attempts = 0
+                    peers[i].cmd_ch = req.worker_ch
+                    wres := CoreResp{ok: true, code: "CONNECTED", err: "", body: peer_to_json(&peers[i]), num: 0, flag: true}
+                    resolve_waiters(&peers[i].waiters, &wres)
+                    peers[i].waiters = []chan CoreResp{}
+                    found = true
+                    <-
+                }
+            }
+            resp.ok = found
+        } else if req.kind == CORE_PEER_STATS {
+            pid := req.str1 + ""
+            gen := req.num1
+            for i in 0:peers.len {
+                if peers[i].agent_id == pid && peers[i].dial_gen == gen {
+                    peers[i].rtt_ms = req.num2
+                    peers[i].bytes_in = req.num3
+                    peers[i].bytes_out = atoi_or_0(&req.str2)
+                    peers[i].active_streams = atoi_or_0(&req.str3)
+                    <-
+                }
+            }
+        } else if req.kind == CORE_PEER_CLOSED {
+            pid := req.str1 + ""
+            rsn := req.str2 + ""
+            gen := req.num1
+            $rm_idx := -1
+            for i in 0:peers.len {
+                if peers[i].agent_id == pid && peers[i].dial_gen == gen {
+                    wres := CoreResp{ok: false, code: "ERR_P2P", err: rsn + "", body: "", num: 0, flag: false}
+                    resolve_waiters(&peers[i].waiters, &wres)
+                    peers[i].waiters = []chan CoreResp{}
+                    if !shutting_down && peers[i].persistent {
+                        peers[i].state = "reconnecting"
+                        peers[i].last_error = rsn + ""
+                        peers[i].reconnect_attempts += 1
+                        peers[i].active_streams = 0
+                        base_ms := p2p_env_ms("FATEXT_P2P_RECONNECT_MS", 1000, 50, 30000)
+                        $shift := peers[i].reconnect_attempts - 1
+                        if shift > 5 { shift = 5 }
+                        $delay := base_ms * (1 << shift)
+                        if delay > 30000 { delay = 30000 }
+                        xu daemon_reconnect_timer(ctx.core_ch, pid + "", gen, delay)
+                    } else {
+                        rm_idx = i
+                    }
+                    <-
+                }
+            }
+            if rm_idx >= 0 {
+                $next_p := []DaemonPeer{}
+                for i in 0:peers.len {
+                    if i != rm_idx { next_p.push(clone_daemon_peer(&peers[i])) }
+                }
+                peers = next_p
+            }
+        } else if req.kind == CORE_RECONNECT_FIRE {
+            pid := req.str1 + ""
+            gen := req.num1
+            if !shutting_down {
+                for i in 0:peers.len {
+                    if peers[i].agent_id == pid && peers[i].persistent && peers[i].state == "reconnecting" && peers[i].dial_gen == gen {
+                        peers[i].state = "connecting"
+                        peers[i].direction = "out"
+                        peers[i].dial_gen += 1
+                        ng := peers[i].dial_gen
+                        xu daemon_outbound_dial_worker(clone_core_ctx(&ctx), pid + "", ng)
+                        <-
+                    }
+                }
+            }
+        } else if req.kind == CORE_HANGUP {
+            pid := req.str1 + ""
+            $rm_idx := -1
+            for i in 0:peers.len {
+                if peers[i].agent_id == pid {
+                    rm_idx = i
+                    peers[i].persistent = false
+                    peers[i].dial_gen += 1
+                    stop_worker_q(peers[i].cmd_ch)
+                    wres := CoreResp{ok: false, code: "ERR_P2P", err: "hung_up", body: "", num: 0, flag: false}
+                    resolve_waiters(&peers[i].waiters, &wres)
+                    <-
+                }
+            }
+            if rm_idx < 0 {
+                resp.ok = false
+                resp.code = "ERR_NOT_FOUND"
+                resp.err = "peer not found: " + pid
+            } else {
+                $next_p := []DaemonPeer{}
+                for i in 0:peers.len {
+                    if i != rm_idx { next_p.push(clone_daemon_peer(&peers[i])) }
+                }
+                peers = next_p
+                resp.body = "{\"ok\":true,\"peer\":" + json.quote(&pid) + ",\"hung_up\":true}"
+            }
+        } else if req.kind == CORE_SEND_MSG {
+            pid := req.str1 + ""
+            $sent := false
+            $sess := ""
+            for i in 0:peers.len {
+                if peers[i].agent_id == pid && peers[i].state == "connected" {
+                    pl := "{\"id\":" + json.quote(&req.str3) + ",\"topic\":" + json.quote(&req.str2) + ",\"text\":" + json.quote(&req.str4) + ",\"ts\":" + strconv.itoa(req.num1) + "}"
+                    wcmd := "MSG:" + pl
+                    select {
+                        peers[i].cmd_ch <- wcmd {
+                            sent = true
+                            sess = peers[i].session + ""
+                        }
+                        else {}
+                    }
+                    <-
+                }
+            }
+            if sent {
+                resp.body = "{\"ok\":true,\"id\":" + json.quote(&req.str3) + ",\"peer\":" + json.quote(&pid) + ",\"topic\":" + json.quote(&req.str2) + ",\"session\":" + json.quote(&sess) + ",\"ts\":" + strconv.itoa(req.num1) + "}"
+            } else {
+                resp.ok = false
+                resp.code = "NOT_CONNECTED"
+                resp.err = "peer is not connected"
+            }
+        } else if req.kind == CORE_INBOUND_MSG {
+            next_msg_seq += 1
+            $mid := req.str3 + ""
+            if mid.len == 0 { mid = "p2p_" + strconv.itoa(next_msg_seq) }
+            m := DaemonInboxMsg{
+                seq: next_msg_seq,
+                id: mid,
+                from_id: req.str1 + "",
+                topic: req.str2 + "",
+                text: req.str4 + "",
+                session: req.str5 + "",
+                ts: req.num1
+            }
+            line := inbox_msg_to_json(&m) + "\n"
+            m_from := m.from_id + ""
+            m_topic := m.topic + ""
+            inbox.push(m)
+            if inbox.len > 500 {
+                $trimmed := []DaemonInboxMsg{}
+                for i in (inbox.len - 500):inbox.len {
+                    trimmed.push(inbox[i])
+                }
+                inbox = trimmed
+            }
+            for i in 0:subs.len {
+                pf := subs[i].peer_filter + ""
+                tf := subs[i].topic_filter + ""
+                if (pf.len == 0 || pf == m_from) && (tf.len == 0 || tf == m_topic) {
+                    select {
+                        subs[i].ch <- (line + "") {}
+                        else {}
+                    }
+                }
+            }
+        } else if req.kind == CORE_RECV_QUERY {
+            pf := req.str1 + ""
+            tf := req.str2 + ""
+            since := req.num1
+            $lim := req.num2
+            if lim <= 0 { lim = 100 }
+            $items := []string{}
+            $last_seq := since
+            for i in 0:inbox.len {
+                m := &inbox[i]
+                if m.seq > since && (pf.len == 0 || pf == m.from_id) && (tf.len == 0 || tf == m.topic) {
+                    items.push(inbox_msg_to_json(m))
+                    last_seq = m.seq
+                    if items.len >= lim { <- }
+                }
+            }
+            resp.body = "{\"ok\":true,\"messages\":[" + strings.join(items, ",") + "],\"next_seq\":" + strconv.itoa(last_seq) + "}"
+        } else if req.kind == CORE_RECV_SUB {
+            pf := req.str1 + ""
+            tf := req.str2 + ""
+            since := req.num1
+            $backlog := ""
+            for i in 0:inbox.len {
+                m := &inbox[i]
+                if m.seq > since && (pf.len == 0 || pf == m.from_id) && (tf.len == 0 || tf == m.topic) {
+                    backlog = backlog + inbox_msg_to_json(m) + "\n"
+                }
+            }
+            subs.push(InboxSub{id: req.str3 + "", peer_filter: pf, topic_filter: tf, ch: req.sub_ch})
+            resp.body = backlog
+        } else if req.kind == CORE_RECV_UNSUB {
+            $next_subs := []InboxSub{}
+            for i in 0:subs.len {
+                if subs[i].id != req.str1 {
+                    next_subs.push(subs[i])
+                }
+            }
+            subs = next_subs
+        } else if req.kind == CORE_FWD_ADD {
+            lport := req.num1
+            $dup := false
+            for i in 0:forwards.len {
+                if forwards[i].local_port == lport { dup = true }
+            }
+            if dup {
+                net_close_q(req.num3)
+                resp.ok = false
+                resp.code = "ERR_CONFLICT"
+                resp.err = "local_port already forwarded"
+            } else {
+                next_fwd_id += 1
+                fid := "fwd_" + strconv.itoa(next_fwd_id)
+                f := ForwardRule{
+                    id: fid,
+                    peer_id: req.str1 + "",
+                    bind: req.str2 + "",
+                    local_port: lport,
+                    remote_port: req.num2,
+                    lfd: req.num3
+                }
+                fjson := fwd_to_json(&f)
+                f_peer := f.peer_id + ""
+                f_rport := f.remote_port
+                f_lfd := f.lfd
+                forwards.push(f)
+                xu daemon_forward_accept_loop(ctx.core_ch, f_peer, f_rport, f_lfd)
+                resp.body = "{\"ok\":true,\"forward\":" + fjson + "}"
+            }
+        } else if req.kind == CORE_FWD_DEL {
+            $next_f := []ForwardRule{}
+            $found := false
+            for i in 0:forwards.len {
+                if (req.str1.len > 0 && forwards[i].id == req.str1) || (req.num1 > 0 && forwards[i].local_port == req.num1) {
+                    net_close_q(forwards[i].lfd)
+                    found = true
+                } else {
+                    next_f.push(forwards[i])
+                }
+            }
+            forwards = next_f
+            if !found {
+                resp.ok = false
+                resp.code = "ERR_NOT_FOUND"
+                resp.err = "forward rule not found"
+            } else {
+                resp.body = "{\"ok\":true,\"removed\":true}"
+            }
+        } else if req.kind == CORE_FWD_LIST {
+            $items := []string{}
+            for i in 0:forwards.len {
+                items.push(fwd_to_json(&forwards[i]))
+            }
+            resp.body = "{\"ok\":true,\"forwards\":[" + strings.join(items, ",") + "]}"
+        } else if req.kind == CORE_FWD_OPEN_TCP {
+            pid := req.str1 + ""
+            rport := req.num1
+            cfd := req.num3
+            $dispatched := false
+            for i in 0:peers.len {
+                if peers[i].agent_id == pid && peers[i].state == "connected" {
+                    wcmd := "TCP:" + strconv.itoa(rport) + ":" + strconv.itoa(cfd)
+                    select {
+                        peers[i].cmd_ch <- wcmd {
+                            dispatched = true
+                        }
+                        else {}
+                    }
+                    <-
+                }
+            }
+            if !dispatched {
+                net_close_q(cfd)
+            }
+        } else if req.kind == CORE_CHECK_EXPOSE {
+            $allowed := false
+            for i in 0:expose.len {
+                if expose[i] == req.num1 {
+                    allowed = true
+                    <-
+                }
+            }
+            resp.ok = allowed
+        } else if req.kind == CORE_EXPOSE_LIST {
+            $items := []string{}
+            for i in 0:expose.len { items.push(strconv.itoa(expose[i])) }
+            resp.body = "{\"ok\":true,\"ports\":[" + strings.join(items, ",") + "]}"
+        } else if req.kind == CORE_EXPOSE_ADD {
+            p := req.num1
+            $has := false
+            for i in 0:expose.len {
+                if expose[i] == p { has = true }
+            }
+            if !has { expose.push(p) }
+            $items := []string{}
+            for i in 0:expose.len { items.push(strconv.itoa(expose[i])) }
+            resp.body = "{\"ok\":true,\"ports\":[" + strings.join(items, ",") + "]}"
+        } else if req.kind == CORE_EXPOSE_DEL {
+            p := req.num1
+            $next_e := []int{}
+            $found := false
+            for i in 0:expose.len {
+                if expose[i] == p { found = true }
+                else { next_e.push(expose[i]) }
+            }
+            expose = next_e
+            if !found {
+                resp.ok = false
+                resp.code = "ERR_NOT_FOUND"
+                resp.err = "port not exposed"
+            } else {
+                $items := []string{}
+                for i in 0:expose.len { items.push(strconv.itoa(expose[i])) }
+                resp.body = "{\"ok\":true,\"ports\":[" + strings.join(items, ",") + "]}"
+            }
+        } else if req.kind == CORE_SHUTDOWN {
+            shutting_down = true
+            sse_connected = false
+            for i in 0:forwards.len {
+                net_close_q(forwards[i].lfd)
+            }
+            forwards = []ForwardRule{}
+            for i in 0:peers.len {
+                peers[i].persistent = false
+                peers[i].dial_gen += 1
+                stop_worker_q(peers[i].cmd_ch)
+                wres := CoreResp{ok: false, code: "ERR_P2P", err: "daemon_shutdown", body: "", num: 0, flag: false}
+                resolve_waiters(&peers[i].waiters, &wres)
+            }
+            for i in 0:pending.len {
+                select {
+                    pending[i].ans_ch <- "__CANCEL__" {}
+                    else {}
+                }
+            }
+            pending = []PendingAnswer{}
+            for i in 0:subs.len {
+                select {
+                    subs[i].ch <- "__EOF__" {}
+                    else {}
+                }
+            }
+            subs = []InboxSub{}
+            net_close_q(ctl_lfd)
+            select {
+                ctx.stop_ch <- 1 {}
+                else {}
+            }
+            resp.body = "{\"ok\":true,\"stopping\":true}"
+        }
+
+        if req.has_reply {
+            send_core_reply(req.reply, &resp)
+        }
+        if shutting_down { <- }
+    }
+}
+
+fn daemon_dispatch_inbound_worker(
+    ctx DaemonCoreCtx,
+    pconn_in net.PacketConn,
+    ciph_in P2PCiphers,
+    sess string,
+    from_id string,
+    cands []net.UDPAddr,
+    rport int,
+    assigned_gen int,
+    is_legacy_fwd bool
+) {
+    if is_legacy_fwd {
+        $pconn := pconn_in
+        $ciph := ciph_in
+        cmd_ch := chan string{cap: 8}
+        $reg := make_core_req(CORE_PEER_CONNECTED)
+        reg.str1 = from_id + ""
+        reg.str2 = "in"
+        reg.str3 = sess + ""
+        reg.num1 = assigned_gen
+        reg.worker_ch = cmd_ch
+        rres := core_call(ctx.core_ch, reg)
+        if rres.ok {
+            opts := CliOpts{json_mode: true, config_path: "", api_override: "", timeout_sec: ctx.timeout_sec, pow_bits_override: 0}
+            _ := p2p_punch_and_session(&opts, $&pconn, $&ciph, sess + "", from_id + "", &cands, false, false, -1, -1, rport)
+        }
+        pconn_close_q($&pconn)
+        $creq := make_core_req(CORE_PEER_CLOSED)
+        creq.str1 = from_id + ""
+        creq.str2 = "legacy_closed"
+        creq.num1 = assigned_gen
+        core_cast(ctx.core_ch, creq)
+        <<
+    }
+    daemon_peer_mux_worker(clone_core_ctx(&ctx), pconn_in, ciph_in, sess + "", from_id + "", cands, assigned_gen, "in")
+}
+
+fn daemon_handle_dm_async(ctx DaemonCoreCtx, ev_data string) {
+    d := json.parse(&ev_data)
+    if !d.ok() || !d.has(d.root(), "from") || !d.has(d.root(), "frame") { << }
+    from_id := json_str_or(&d, d.get(d.root(), "from"), "")
+    frame_json := json_encode_or(&d, d.get(d.root(), "frame"), "")
+
+    creds := get_daemon_creds(ctx.creds_ch)
+    priv := decode_creds_priv(&creds) or (err) { << }
+
+    fk := fetch_agent_key(creds.api_base + "", ctx.timeout_sec, from_id + "")
+    dec := decrypt_dm_frame_with_archive(creds.home + "", creds.agent_id + "", creds.key_version, &priv, from_id + "", &fk.pk, fk.ok, &frame_json)
+    if !dec.ok || !dec.verified { << }
+
+    now0 := time.now_time().unix()
+    if dec.ts <= 0 || (now0 - dec.ts) > 60 || (dec.ts - now0) > 60 { << }
+
+    if dec.msg_type == "p2p_answer" {
+        if dec.nonce.len == 0 || !check_and_record_nonce_in(creds.home + "", "p2p_nonces.jsonl", dec.nonce + "", now0) { << }
+        ad := json.parse(&dec.body_json)
+        if !ad.ok() || !ad.is_dict(ad.root()) { << }
+        sess := json_str_or(&ad, ad.get(ad.root(), "session"), "")
+        if sess.len == 0 { << }
+        $rreq := make_core_req(CORE_RESOLVE_PENDING)
+        rreq.str1 = sess + ""
+        rreq.str2 = dec.body_json + ""
+        core_cast(ctx.core_ch, rreq)
+        <<
+    }
+
+    if dec.msg_type != "p2p_offer" { << }
+    if dec.nonce.len == 0 || !check_and_record_nonce_in(creds.home + "", "p2p_nonces.jsonl", dec.nonce + "", now0) { << }
+
+    odoc := json.parse(&dec.body_json)
+    if !odoc.ok() || !odoc.is_dict(odoc.root()) { << }
+    oroot := odoc.root()
+    sess := json_str_or(&odoc, odoc.get(oroot, "session"), "")
+    if sess.len == 0 { << }
+    exp := json_int_or(&odoc, odoc.get(oroot, "expires_at"), 0)
+    now := time.now_time().unix()
+    if exp > 0 && now > exp { << }
+
+    mode := json_str_or(&odoc, odoc.get(oroot, "mode"), "stdio")
+    proto := json_str_or(&odoc, odoc.get(oroot, "proto"), "")
+    rport := json_int_or(&odoc, odoc.get(oroot, "remote_port"), 0)
+    xpub_b64 := json_str_or(&odoc, odoc.get(oroot, "x25519_pub"), "")
+    cands := extract_candidate_addrs(&odoc, odoc.get(oroot, "candidates"))
+
+    $accept := true
+    $reason := ""
+    $assigned_gen := 0
+    if proto != P2P_PROTO_V4 {
+        accept = false
+        reason = "unsupported_p2p_proto"
+    }
+    if accept && ctx.friends_only && !check_is_friend(creds.api_base + "", ctx.timeout_sec, creds.agent_id + "", &priv, from_id + "") {
+        accept = false
+        reason = "not_friend"
+    }
+    if accept && cands.len == 0 {
+        accept = false
+        reason = "no_candidates"
+    }
+    if accept {
+        $ireq := make_core_req(CORE_INBOUND_OFFER)
+        ireq.str1 = from_id + ""
+        ireq.str2 = sess + ""
+        ireq.str3 = mode + ""
+        ireq.num1 = rport
+        ires := core_call(ctx.core_ch, ireq)
+        if !ires.ok {
+            accept = false
+            reason = ires.code + ""
+        } else {
+            assigned_gen = ires.num
+        }
+    }
+
+    if !accept {
+        ans_rej := "{\"session\":" + json.quote(&sess) + ",\"accept\":false,\"reason\":" + json.quote(&reason) + "}"
+        rej_frame := encrypt_dm_or(creds.agent_id + "", &priv, from_id + "", &fk.pk, fk.key_version, "p2p_answer", ans_rej, "open", now)
+        if rej_frame.len > 0 {
+            _ := api_call(creds.api_base + "", ctx.timeout_sec, creds.agent_id + "", &priv, true, "POST", "/v1/dm/" + from_id, &rej_frame, "")
+        }
+        <<
+    }
+
+    $pconn := net.listen_packet("udp4", "0.0.0.0:0") or (err) {
+        $creq := make_core_req(CORE_PEER_CLOSED)
+        creq.str1 = from_id + ""
+        creq.str2 = err.msg()
+        creq.num1 = assigned_gen
+        core_cast(ctx.core_ch, creq)
+        <<
+    }
+    lport := local_port_of(&pconn)
+    srflx := stun_discover($&pconn, ctx.stun_hp + "")
+    xpriv := ecdh.generate_key(ecdh.x25519()) or (err) {
+        pconn_close_q($&pconn)
+        $creq := make_core_req(CORE_PEER_CLOSED)
+        creq.str1 = from_id + ""
+        creq.str2 = err.msg()
+        creq.num1 = assigned_gen
+        core_cast(ctx.core_ch, creq)
+        <<
+    }
+    my_xpub_b64 := base64.encode_to_string(xpriv.public_key().bytes())
+    peer_xpub_raw := base64.decode_string(xpub_b64 + "") or (err) {
+        pconn_close_q($&pconn)
+        $creq := make_core_req(CORE_PEER_CLOSED)
+        creq.str1 = from_id + ""
+        creq.str2 = "invalid_x25519"
+        creq.num1 = assigned_gen
+        core_cast(ctx.core_ch, creq)
+        <<
+    }
+    peer_xpub := ecdh.new_public_key(ecdh.x25519(), &peer_xpub_raw) or (err) {
+        pconn_close_q($&pconn)
+        $creq := make_core_req(CORE_PEER_CLOSED)
+        creq.str1 = from_id + ""
+        creq.str2 = "invalid_x25519"
+        creq.num1 = assigned_gen
+        core_cast(ctx.core_ch, creq)
+        <<
+    }
+    shared := xpriv.ecdh(&peer_xpub) or (err) {
+        pconn_close_q($&pconn)
+        $creq := make_core_req(CORE_PEER_CLOSED)
+        creq.str1 = from_id + ""
+        creq.str2 = err.msg()
+        creq.num1 = assigned_gen
+        core_cast(ctx.core_ch, creq)
+        <<
+    }
+    k_r2i := p2p_derive_dir_key("r2i", sess + "", from_id + "", creds.agent_id + "", xpub_b64 + "", my_xpub_b64 + "", &shared)
+    k_i2r := p2p_derive_dir_key("i2r", sess + "", from_id + "", creds.agent_id + "", xpub_b64 + "", my_xpub_b64 + "", &shared)
+    $ciph := make_p2p_ciphers(&k_r2i, &k_i2r) or (err) {
+        pconn_close_q($&pconn)
+        $creq := make_core_req(CORE_PEER_CLOSED)
+        creq.str1 = from_id + ""
+        creq.str2 = err.msg()
+        creq.num1 = assigned_gen
+        core_cast(ctx.core_ch, creq)
+        <<
+    }
+
+    cands_json := build_candidates_json(lport, srflx, ctx.include_host)
+    ans_body := "{\"session\":" + json.quote(&sess) + ",\"proto\":" + json.quote(&P2P_PROTO_V4) + ",\"accept\":true,\"candidates\":" + cands_json + ",\"x25519_pub\":" + json.quote(&my_xpub_b64) + "}"
+    ans_frame := encrypt_dm_or(creds.agent_id + "", &priv, from_id + "", &fk.pk, fk.key_version, "p2p_answer", ans_body, "open", now)
+    _ := api_call(creds.api_base + "", ctx.timeout_sec, creds.agent_id + "", &priv, true, "POST", "/v1/dm/" + (from_id + ""), &ans_frame, "")
+
+    daemon_dispatch_inbound_worker(clone_core_ctx(&ctx), pconn, ciph, sess + "", from_id + "", cands, rport, assigned_gen, mode == "forward")
+}
+
+fn daemon_sse_loop(ctx DaemonCoreCtx, opts CliOpts) {
+    $backoff_ms := 500
+    $stopping := false
+    while !stopping {
+        select {
+            _ := <-ctx.stop_ch {
+                stopping = true
+                <-
+            }
+            else {}
+        }
+        if stopping { <- }
+
+        creds := get_daemon_creds(ctx.creds_ch)
+        priv := decode_creds_priv(&creds) or (err) {
+            time.sleep(jitter_ms(backoff_ms) * 1000000)
+            backoff_ms = backoff_ms * 2
+            if backoff_ms > 30000 { backoff_ms = 30000 }
+            ->
+        }
+        $sc := empty_sse_conn()
+        out := sse_connect_into(creds.api_base + "", creds.agent_id + "", &priv, "/v1/stream", $&sc)
+        if !out.ok {
+            $sreq := make_core_req(CORE_SSE_STATE)
+            sreq.flag = false
+            core_cast(ctx.core_ch, sreq)
+            if out.http_status == 401 || out.http_status == 403 {
+                new_cfg := load_config(&opts) or (err) {
+                    time.sleep(jitter_ms(backoff_ms) * 1000000)
+                    backoff_ms = backoff_ms * 2
+                    if backoff_ms > 30000 { backoff_ms = 30000 }
+                    ->
+                }
+                new_pem := read_priv_pem_checked(new_cfg.home + "") or (err) {
+                    time.sleep(jitter_ms(backoff_ms) * 1000000)
+                    backoff_ms = backoff_ms * 2
+                    if backoff_ms > 30000 { backoff_ms = 30000 }
+                    ->
+                }
+                nc := DaemonCreds{agent_id: new_cfg.agent_id + "", api_base: new_cfg.api_base + "", home: new_cfg.home + "", key_version: new_cfg.key_version, priv_pem: new_pem}
+                set_daemon_creds(ctx.creds_ch, &nc)
+                backoff_ms = 500
+                ->
+            }
+            time.sleep(jitter_ms(backoff_ms) * 1000000)
+            backoff_ms = backoff_ms * 2
+            if backoff_ms > 30000 { backoff_ms = 30000 }
+            ->
+        }
+
+        $sreq_ok := make_core_req(CORE_SSE_STATE)
+        sreq_ok.flag = true
+        core_cast(ctx.core_ch, sreq_ok)
+        backoff_ms = 500
+
+        while true {
+            select {
+                _ := <-ctx.stop_ch {
+                    stopping = true
+                    <-
+                }
+                else {}
+            }
+            if stopping { <- }
+            ev := sse_read_event($&sc)
+            if ev.eof { <- }
+            if !ev.ok { -> }
+            if ev.event_type == "system" {
+                sd := json.parse(&ev.data)
+                if sd.ok() && sd.is_dict(sd.root()) {
+                    sk := json_str_or(&sd, sd.get(sd.root(), "kind"), "")
+                    if sk == "disconnected" {
+                        stopping = true
+                        <-
+                    } else if sk == "key_rotated" {
+                        new_cfg := load_config(&opts) or (err) { <- }
+                        new_pem := read_priv_pem_checked(new_cfg.home + "") or (err) { <- }
+                        nc := DaemonCreds{agent_id: new_cfg.agent_id + "", api_base: new_cfg.api_base + "", home: new_cfg.home + "", key_version: new_cfg.key_version, priv_pem: new_pem}
+                        set_daemon_creds(ctx.creds_ch, &nc)
+                        <-
+                    }
+                }
+                ->
+            }
+            if ev.event_type == "dm" {
+                xu daemon_handle_dm_async(clone_core_ctx(&ctx), ev.data + "")
+            }
+        }
+        sse_close($&sc)
+        $sreq_dn := make_core_req(CORE_SSE_STATE)
+        sreq_dn.flag = false
+        core_cast(ctx.core_ch, sreq_dn)
+        if !stopping {
+            time.sleep(jitter_ms(backoff_ms) * 1000000)
+            backoff_ms = backoff_ms * 2
+            if backoff_ms > 30000 { backoff_ms = 30000 }
+        }
+    }
+}
+
+fn ctl_write_json(fd int, status int, status_text string, body &string) {
+    hdr := "HTTP/1.1 " + strconv.itoa(status) + " " + status_text +
+        "\r\nContent-Type: application/json\r\nContent-Length: " + strconv.itoa(body.len) +
+        "\r\nConnection: close\r\n\r\n"
+    _ := net.conn_write(fd, &(hdr + (body + ""))) or (err) { << }
+}
+
+fn ctl_err_json(code string, msg string) string {
+    << "{\"ok\":false,\"error\":{\"code\":" + json.quote(&code) + ",\"message\":" + json.quote(&msg) + "}}"
+}
+
+fn ctl_is_loopback_host(h &string) bool {
+    if h.len == 0 { << true }
+    low := strings.to_lower(h)
+    if low == "127.0.0.1" || strings.has_prefix(&low, "127.0.0.1:") { << true }
+    if low == "localhost" || strings.has_prefix(&low, "localhost:") { << true }
+    << false
+}
+
+fn ctl_http_read_req(fd int) CtlHttpReq {
+    $buf := ""
+    $hdr_end := -1
+    while buf.len < 16384 {
+        chunk := net.conn_read(fd, 4096) or (err) { <- }
+        if chunk.len == 0 { <- }
+        buf = buf + chunk
+        hdr_end = strings.index_of(&buf, "\r\n\r\n")
+        if hdr_end >= 0 { <- }
+    }
+    if hdr_end < 0 {
+        << CtlHttpReq{ok: false, method: "", path: "", query: "", host: "", auth: "", body: "", err_code: "ERR_BAD_REQUEST", err_msg: "malformed http headers", http_status: 400}
+    }
+    hdr_block := buf[0:hdr_end] + ""
+    $body_buf := buf[(hdr_end + 4):buf.len] + ""
+    lines := strings.split(&hdr_block, "\r\n")
+    if lines.len == 0 || lines.len > 64 {
+        << CtlHttpReq{ok: false, method: "", path: "", query: "", host: "", auth: "", body: "", err_code: "ERR_BAD_REQUEST", err_msg: "invalid request line", http_status: 400}
+    }
+    req_parts := strings.split(&lines[0], " ")
+    if req_parts.len < 2 {
+        << CtlHttpReq{ok: false, method: "", path: "", query: "", host: "", auth: "", body: "", err_code: "ERR_BAD_REQUEST", err_msg: "invalid request line", http_status: 400}
+    }
+    method := strings.to_upper(&req_parts[0])
+    target := req_parts[1] + ""
+    $path := target + ""
+    $query := ""
+    qidx := strings.index_of(&target, "?")
+    if qidx >= 0 {
+        path = target[0:qidx] + ""
+        query = target[(qidx + 1):target.len] + ""
+    }
+
+    $host := ""
+    $auth := ""
+    $clen := 0
+    for i in 1:lines.len {
+        ln := lines[i] + ""
+        cpos := strings.index_of(&ln, ":")
+        if cpos <= 0 { -> }
+        k := strings.to_lower(&strings.trim_space(&ln[0:cpos]))
+        v := strings.trim_space(&ln[(cpos + 1):ln.len])
+        if k == "host" { host = v }
+        else if k == "authorization" { auth = v }
+        else if k == "content-length" {
+            clen = strconv.atoi(&v) or (err) { << CtlHttpReq{ok: false, method: "", path: "", query: "", host: "", auth: "", body: "", err_code: "ERR_BAD_REQUEST", err_msg: "bad content-length", http_status: 400} }
+        }
+    }
+    if clen < 0 || clen > 1048576 {
+        << CtlHttpReq{ok: false, method: "", path: "", query: "", host: "", auth: "", body: "", err_code: "ERR_PAYLOAD_TOO_LARGE", err_msg: "body too large", http_status: 413}
+    }
+    while body_buf.len < clen {
+        chunk := net.conn_read(fd, 4096) or (err) { <- }
+        if chunk.len == 0 { <- }
+        body_buf = body_buf + chunk
+    }
+    if body_buf.len > clen {
+        body_buf = body_buf[0:clen] + ""
+    }
+    << CtlHttpReq{ok: true, method: method, path: path, query: query, host: host, auth: auth, body: body_buf, err_code: "", err_msg: "", http_status: 200}
+}
+
+fn ctl_query_param(query &string, key string) string {
+    if query.len == 0 { << "" }
+    parts := strings.split(query, "&")
+    for i in 0:parts.len {
+        eq := strings.index_of(&parts[i], "=")
+        if eq > 0 {
+            k := parts[i][0:eq] + ""
+            if k == key {
+                << parts[i][(eq + 1):parts[i].len] + ""
+            }
+        }
+    }
+    << ""
+}
+
+fn gen_sid_or(def string) string {
+    << generate_session_id() or (err) { << def }
+}
+
+fn conn_deadline_q(c $&net.Conn, ns int) {
+    _ := c.set_deadline(ns) or (err) { << }
+}
+
+fn conn_close_q(c $&net.Conn) {
+    _ := c.close() or (err) { << }
+}
+
+fn read_daemon_state_or(home string) DaemonStateFile {
+    << read_daemon_state(home + "") or (err) {
+        << DaemonStateFile{pid: 0, agent_id: "", addr: "", token: "", proto: "", started_at: 0, api_base: "", log_file: ""}
+    }
+}
+
+fn signal_notify_q(ch chan int, sig int) {
+    _ := signal.notify(ch, sig) or (err) { << }
+}
+
+fn ctl_wait_dial(ctx &DaemonCoreCtx, peer_id string, persist bool, wait bool, timeout_ms int) CoreResp {
+    wait_ch := chan CoreResp{cap: 1}
+    $dreq := make_core_req(CORE_DIAL)
+    dreq.str1 = peer_id + ""
+    dreq.flag = persist
+    dreq.flag2 = wait
+    dreq.wait_ch = wait_ch
+    imm := core_call(ctx.core_ch, dreq)
+    if !imm.ok || imm.code == "CONNECTED" || !wait {
+        << imm
+    }
+    to_ch := chan int{cap: 1}
+    $tms := timeout_ms
+    if tms <= 0 { tms = 15000 }
+    xu daemon_timeout_pulse(to_ch, tms)
+    select {
+        w := <-wait_ch {
+            << w
+        }
+        _ := <-to_ch {
+            << CoreResp{ok: false, code: "ERR_P2P", err: "dial timeout waiting for connection", body: "", num: 0, flag: false}
+        }
+    }
+    << CoreResp{ok: false, code: "ERR_P2P", err: "dial failed", body: "", num: 0, flag: false}
+}
+
+fn daemon_ctl_conn(fd int, ctx DaemonCoreCtx, token string) {
+    _ := os.set_sock_timeout(fd, 5000000000) or (err) { << }
+    req := ctl_http_read_req(fd)
+    _ := os.set_sock_timeout(fd, 0) or (err) { << }
+    if !req.ok {
+        ctl_write_json(fd, req.http_status, "Bad Request", &ctl_err_json(req.err_code + "", req.err_msg + ""))
+        net_close_q(fd)
+        <<
+    }
+    if !ctl_is_loopback_host(&req.host) {
+        ctl_write_json(fd, 403, "Forbidden", &ctl_err_json("ERR_FORBIDDEN", "non-loopback Host header rejected"))
+        net_close_q(fd)
+        <<
+    }
+    $btok := ""
+    if strings.has_prefix(&req.auth, "Bearer ") {
+        btok = req.auth[7:req.auth.len] + ""
+    }
+    if !const_time_eq(&btok, &token) {
+        ctl_write_json(fd, 401, "Unauthorized", &ctl_err_json("ERR_AUTH", "invalid or missing bearer token"))
+        net_close_q(fd)
+        <<
+    }
+
+    if req.method == "GET" && req.path == "/v1/status" {
+        r := core_call(ctx.core_ch, make_core_req(CORE_STATUS))
+        ctl_write_json(fd, 200, "OK", &r.body)
+    } else if req.method == "GET" && req.path == "/v1/peers" {
+        r := core_call(ctx.core_ch, make_core_req(CORE_PEERS))
+        ctl_write_json(fd, 200, "OK", &r.body)
+    } else if req.method == "POST" && req.path == "/v1/dial" {
+        d := json.parse(&req.body)
+        if !d.ok() || !d.is_dict(d.root()) {
+            ctl_write_json(fd, 400, "Bad Request", &ctl_err_json("ERR_USAGE", "invalid JSON body"))
+            net_close_q(fd)
+            <<
+        }
+        rt := d.root()
+        peer_id := json_has_str(&d, rt, "peer", "")
+        if !is_valid_agent_id(peer_id + "") {
+            ctl_write_json(fd, 400, "Bad Request", &ctl_err_json("ERR_USAGE", "invalid peer agent_id"))
+            net_close_q(fd)
+            <<
+        }
+        persist := json_has_bool(&d, rt, "persist", false)
+        wait := json_has_bool(&d, rt, "wait", true)
+        tms := json_has_int(&d, rt, "timeout_ms", 15000)
+        res := ctl_wait_dial(&ctx, peer_id + "", persist, wait, tms)
+        if !res.ok {
+            ctl_write_json(fd, 502, "Bad Gateway", &ctl_err_json(res.code + "", res.err + ""))
+        } else {
+            out := "{\"ok\":true,\"peer\":" + res.body + "}"
+            ctl_write_json(fd, 200, "OK", &out)
+        }
+    } else if req.method == "POST" && req.path == "/v1/hangup" {
+        d := json.parse(&req.body)
+        if !d.ok() || !d.is_dict(d.root()) {
+            ctl_write_json(fd, 400, "Bad Request", &ctl_err_json("ERR_USAGE", "invalid JSON body"))
+            net_close_q(fd)
+            <<
+        }
+        peer_id := json_has_str(&d, d.root(), "peer", "")
+        if !is_valid_agent_id(peer_id + "") {
+            ctl_write_json(fd, 400, "Bad Request", &ctl_err_json("ERR_USAGE", "invalid peer agent_id"))
+            net_close_q(fd)
+            <<
+        }
+        $hreq := make_core_req(CORE_HANGUP)
+        hreq.str1 = peer_id + ""
+        res := core_call(ctx.core_ch, hreq)
+        if !res.ok {
+            ctl_write_json(fd, 404, "Not Found", &ctl_err_json(res.code + "", res.err + ""))
+        } else {
+            ctl_write_json(fd, 200, "OK", &res.body)
+        }
+    } else if req.method == "POST" && req.path == "/v1/send" {
+        d := json.parse(&req.body)
+        if !d.ok() || !d.is_dict(d.root()) {
+            ctl_write_json(fd, 400, "Bad Request", &ctl_err_json("ERR_USAGE", "invalid JSON body"))
+            net_close_q(fd)
+            <<
+        }
+        rt := d.root()
+        peer_id := json_has_str(&d, rt, "peer", "")
+        if !is_valid_agent_id(peer_id + "") {
+            ctl_write_json(fd, 400, "Bad Request", &ctl_err_json("ERR_USAGE", "invalid peer agent_id"))
+            net_close_q(fd)
+            <<
+        }
+        text := json_has_str(&d, rt, "text", "")
+        topic := json_has_str(&d, rt, "topic", "")
+        auto_dial := json_has_bool(&d, rt, "auto_dial", true)
+        tms := json_has_int(&d, rt, "timeout_ms", 15000)
+        mid := gen_sid_or("m_0")
+        ts := time.now_time().unix()
+
+        $sreq := make_core_req(CORE_SEND_MSG)
+        sreq.str1 = peer_id + ""
+        sreq.str2 = topic + ""
+        sreq.str3 = mid + ""
+        sreq.str4 = text + ""
+        sreq.num1 = ts
+        $sres := core_call(ctx.core_ch, sreq)
+        if !sres.ok && sres.code == "NOT_CONNECTED" && auto_dial {
+            dres := ctl_wait_dial(&ctx, peer_id + "", false, true, tms)
+            if !dres.ok {
+                ctl_write_json(fd, 502, "Bad Gateway", &ctl_err_json(dres.code + "", dres.err + ""))
+                net_close_q(fd)
+                <<
+            }
+            $sreq2 := make_core_req(CORE_SEND_MSG)
+            sreq2.str1 = peer_id + ""
+            sreq2.str2 = topic + ""
+            sreq2.str3 = mid + ""
+            sreq2.str4 = text + ""
+            sreq2.num1 = ts
+            sres = core_call(ctx.core_ch, sreq2)
+        }
+        if !sres.ok {
+            ctl_write_json(fd, 502, "Bad Gateway", &ctl_err_json(sres.code + "", sres.err + ""))
+        } else {
+            ctl_write_json(fd, 200, "OK", &sres.body)
+        }
+    } else if req.method == "GET" && req.path == "/v1/recv" {
+        pf := ctl_query_param(&req.query, "peer")
+        tf := ctl_query_param(&req.query, "topic")
+        since_s := ctl_query_param(&req.query, "since")
+        lim_s := ctl_query_param(&req.query, "limit")
+        follow_s := ctl_query_param(&req.query, "follow")
+        since := atoi_or_0(&since_s)
+        lim := atoi_or_0(&lim_s)
+        if follow_s == "1" || follow_s == "true" {
+            sid := gen_sid_or("sub_" + strconv.itoa(time.now()))
+            sub_ch := chan string{cap: 128}
+            $subreq := make_core_req(CORE_RECV_SUB)
+            subreq.str1 = pf + ""
+            subreq.str2 = tf + ""
+            subreq.str3 = sid + ""
+            subreq.num1 = since
+            subreq.sub_ch = sub_ch
+            sres := core_call(ctx.core_ch, subreq)
+            hdr := "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+            _ := net.conn_write(fd, &(hdr + sres.body)) or (err) {
+                $ureq := make_core_req(CORE_RECV_UNSUB)
+                ureq.str1 = sid + ""
+                core_cast(ctx.core_ch, ureq)
+                net_close_q(fd)
+                <<
+            }
+            while true {
+                ln := <-sub_ch
+                if ln == "__EOF__" { <- }
+                _ := net.conn_write(fd, &ln) or (err) { <- }
+            }
+            $ureq := make_core_req(CORE_RECV_UNSUB)
+            ureq.str1 = sid + ""
+            core_cast(ctx.core_ch, ureq)
+            net_close_q(fd)
+            <<
+        } else {
+            $qreq := make_core_req(CORE_RECV_QUERY)
+            qreq.str1 = pf + ""
+            qreq.str2 = tf + ""
+            qreq.num1 = since
+            qreq.num2 = lim
+            qres := core_call(ctx.core_ch, qreq)
+            ctl_write_json(fd, 200, "OK", &qres.body)
+        }
+    } else if req.method == "GET" && req.path == "/v1/forwards" {
+        r := core_call(ctx.core_ch, make_core_req(CORE_FWD_LIST))
+        ctl_write_json(fd, 200, "OK", &r.body)
+    } else if req.method == "POST" && req.path == "/v1/forwards" {
+        d := json.parse(&req.body)
+        if !d.ok() || !d.is_dict(d.root()) {
+            ctl_write_json(fd, 400, "Bad Request", &ctl_err_json("ERR_USAGE", "invalid JSON body"))
+            net_close_q(fd)
+            <<
+        }
+        rt := d.root()
+        peer_id := json_has_str(&d, rt, "peer", "")
+        bind_ip := json_has_str(&d, rt, "bind", "127.0.0.1")
+        lport := json_has_int(&d, rt, "local_port", 0)
+        rport := json_has_int(&d, rt, "remote_port", 0)
+        persist := json_has_bool(&d, rt, "persist", true)
+        wait := json_has_bool(&d, rt, "wait", true)
+        tms := json_has_int(&d, rt, "timeout_ms", 15000)
+        if !is_valid_agent_id(peer_id + "") || lport <= 0 || lport > 65535 || rport <= 0 || rport > 65535 {
+            ctl_write_json(fd, 400, "Bad Request", &ctl_err_json("ERR_USAGE", "invalid peer or ports"))
+            net_close_q(fd)
+            <<
+        }
+        lfd := net.listen(bind_ip + ":" + strconv.itoa(lport)) or (err) {
+            ctl_write_json(fd, 409, "Conflict", &ctl_err_json("ERR_CONFLICT", err.msg()))
+            net_close_q(fd)
+            <<
+        }
+        $freq := make_core_req(CORE_FWD_ADD)
+        freq.str1 = peer_id + ""
+        freq.str2 = bind_ip + ""
+        freq.num1 = lport
+        freq.num2 = rport
+        freq.num3 = lfd
+        fres := core_call(ctx.core_ch, freq)
+        if !fres.ok {
+            ctl_write_json(fd, 409, "Conflict", &ctl_err_json(fres.code + "", fres.err + ""))
+            net_close_q(fd)
+            <<
+        }
+        if persist {
+            dres := ctl_wait_dial(&ctx, peer_id + "", true, wait, tms)
+            if !dres.ok && wait {
+                // Keep rule registered (persistent) or return error? Report dial failure clearly.
+                ctl_write_json(fd, 502, "Bad Gateway", &ctl_err_json(dres.code + "", dres.err + ""))
+                net_close_q(fd)
+                <<
+            }
+        }
+        ctl_write_json(fd, 200, "OK", &fres.body)
+    } else if req.method == "DELETE" && req.path == "/v1/forwards" {
+        d := json.parse(&req.body)
+        $fid := ""
+        $lp := 0
+        if d.ok() && d.is_dict(d.root()) {
+            fid = json_has_str(&d, d.root(), "id", "")
+            lp = json_has_int(&d, d.root(), "local_port", 0)
+        }
+        $dreq := make_core_req(CORE_FWD_DEL)
+        dreq.str1 = fid + ""
+        dreq.num1 = lp
+        dres := core_call(ctx.core_ch, dreq)
+        if !dres.ok {
+            ctl_write_json(fd, 404, "Not Found", &ctl_err_json(dres.code + "", dres.err + ""))
+        } else {
+            ctl_write_json(fd, 200, "OK", &dres.body)
+        }
+    } else if req.method == "GET" && req.path == "/v1/expose" {
+        r := core_call(ctx.core_ch, make_core_req(CORE_EXPOSE_LIST))
+        ctl_write_json(fd, 200, "OK", &r.body)
+    } else if (req.method == "POST" || req.method == "DELETE") && req.path == "/v1/expose" {
+        d := json.parse(&req.body)
+        $p := 0
+        if d.ok() && d.is_dict(d.root()) { p = json_has_int(&d, d.root(), "port", 0) }
+        if p <= 0 || p > 65535 {
+            ctl_write_json(fd, 400, "Bad Request", &ctl_err_json("ERR_USAGE", "invalid port"))
+            net_close_q(fd)
+            <<
+        }
+        $kind := CORE_EXPOSE_ADD
+        if req.method == "DELETE" { kind = CORE_EXPOSE_DEL }
+        $ereq := make_core_req(kind)
+        ereq.num1 = p
+        eres := core_call(ctx.core_ch, ereq)
+        if !eres.ok {
+            ctl_write_json(fd, 404, "Not Found", &ctl_err_json(eres.code + "", eres.err + ""))
+        } else {
+            ctl_write_json(fd, 200, "OK", &eres.body)
+        }
+    } else if req.method == "POST" && req.path == "/v1/shutdown" {
+        r := core_call(ctx.core_ch, make_core_req(CORE_SHUTDOWN))
+        ctl_write_json(fd, 200, "OK", &r.body)
+    } else {
+        ctl_write_json(fd, 404, "Not Found", &ctl_err_json("ERR_NOT_FOUND", "unknown endpoint: " + req.path))
+    }
+    net_close_q(fd)
+}
+
+fn daemon_ctl_accept_loop(lfd int, ctx DaemonCoreCtx, token string) {
+    while true {
+        cfd := net.accept(lfd) or (err) { <- }
+        xu daemon_ctl_conn(cfd, clone_core_ctx(&ctx), token + "")
+    }
+}
+
+fn daemon_signal_watcher(sig_ch chan int, core_ch chan CoreReq) {
+    _ := <-sig_ch
+    _ := core_call(core_ch, make_core_req(CORE_SHUTDOWN))
+}
+
+fn ctl_client_req(opts &CliOpts, method string, path_q string, body &string) CtlClientResp {
+    home := resolve_home(opts)
+    st := read_daemon_state(home + "") or (err) {
+        << CtlClientResp{ok: false, not_running: true, http_status: 0, body: "", err_code: "ERR_P2P", err_msg: "p2p daemon is not running; start it with: fatext p2p daemon start"}
+    }
+    conn := net.dial_timeout("tcp4", st.addr + "", 3000000000) or (err) {
+        << CtlClientResp{ok: false, not_running: true, http_status: 0, body: "", err_code: "ERR_P2P", err_msg: "p2p daemon is not reachable (" + st.addr + "); start it with: fatext p2p daemon start"}
+    }
+    $c := conn
+    conn_deadline_q($&c, time.now() + (opts.timeout_sec * 1000000000))
+    req := method + " " + path_q + " HTTP/1.1\r\n" +
+        "Host: 127.0.0.1\r\n" +
+        "Authorization: Bearer " + st.token + "\r\n" +
+        "Content-Type: application/json\r\n" +
+        "Content-Length: " + strconv.itoa(body.len) + "\r\n" +
+        "Connection: close\r\n\r\n" + (body + "")
+    _ := c.write(&req) or (err) {
+        conn_close_q($&c)
+        << CtlClientResp{ok: false, not_running: false, http_status: 0, body: "", err_code: "ERR_NETWORK", err_msg: err.msg()}
+    }
+    $raw := ""
+    while raw.len < 4194304 {
+        chunk := c.read(8192) or (err) { <- }
+        if chunk.len == 0 { <- }
+        raw = raw + chunk
+    }
+    conn_close_q($&c)
+    sep := strings.index_of(&raw, "\r\n\r\n")
+    if sep < 0 {
+        << CtlClientResp{ok: false, not_running: false, http_status: 0, body: "", err_code: "ERR_P2P", err_msg: "invalid daemon HTTP response"}
+    }
+    hdr := raw[0:sep] + ""
+    rbody := raw[(sep + 4):raw.len] + ""
+    nl := strings.index_of(&hdr, "\r\n")
+    $sline := hdr + ""
+    if nl >= 0 { sline = hdr[0:nl] + "" }
+    sp := strings.split(&sline, " ")
+    $status := 0
+    if sp.len >= 2 { status = atoi_or_0(&sp[1]) }
+    if status >= 200 && status < 300 {
+        << CtlClientResp{ok: true, not_running: false, http_status: status, body: rbody, err_code: "", err_msg: ""}
+    }
+    $ecode := "ERR_P2P"
+    $emsg := "daemon error HTTP " + strconv.itoa(status)
+    ed := json.parse(&rbody)
+    if ed.ok() && ed.is_dict(ed.root()) && ed.has(ed.root(), "error") {
+        en := ed.get(ed.root(), "error")
+        ecode = json_has_str(&ed, en, "code", ecode + "")
+        emsg = json_has_str(&ed, en, "message", emsg + "")
+    }
+    << CtlClientResp{ok: false, not_running: false, http_status: status, body: rbody, err_code: ecode, err_msg: emsg}
+}
+
+fn ctl_client_stream_recv(opts &CliOpts, path_q string) int {
+    home := resolve_home(opts)
+    st := read_daemon_state(home + "") or (err) {
+        << emit_err(opts, "ERR_P2P", 0, "p2p daemon is not running; start it with: fatext p2p daemon start", 0, EXIT_P2P)
+    }
+    conn := net.dial_timeout("tcp4", st.addr + "", 3000000000) or (err) {
+        << emit_err(opts, "ERR_P2P", 0, "p2p daemon is not reachable (" + st.addr + ")", 0, EXIT_P2P)
+    }
+    $c := conn
+    req := "GET " + path_q + " HTTP/1.1\r\n" +
+        "Host: 127.0.0.1\r\n" +
+        "Authorization: Bearer " + st.token + "\r\n" +
+        "Connection: close\r\n\r\n"
+    _ := c.write(&req) or (err) {
+        conn_close_q($&c)
+        << emit_err(opts, "ERR_NETWORK", 0, err.msg(), 0, EXIT_NET)
+    }
+    $buf := ""
+    $hdr_done := false
+    while true {
+        chunk := c.read(4096) or (err) { <- }
+        if chunk.len == 0 { <- }
+        buf = buf + chunk
+        if !hdr_done {
+            sep := strings.index_of(&buf, "\r\n\r\n")
+            if sep < 0 { -> }
+            hdr_done = true
+            buf = buf[(sep + 4):buf.len] + ""
+        }
+        while true {
+            nl := strings.index_of(&buf, "\n")
+            if nl < 0 { <- }
+            ln := buf[0:nl] + ""
+            buf = buf[(nl + 1):buf.len] + ""
+            if ln.len > 0 {
+                emit_stdout_line(ln)
+            }
+        }
+    }
+    conn_close_q($&c)
+    << EXIT_OK
+}
+
+fn parse_ports_csv(csv &string, out $&[]int) string {
+    parts := strings.split(csv, ",")
+    for j in 0:parts.len {
+        tok := strings.trim_space(&parts[j])
+        if tok.len == 0 { -> }
+        p := strconv.atoi(&tok) or (err) { << "invalid --expose port: " + tok }
+        if p <= 0 || p > 65535 { << "invalid --expose port: " + tok }
+        out.push(p)
+    }
+    << ""
+}
+
+fn parse_peers_csv(csv &string, out $&[]string) string {
+    parts := strings.split(csv, ",")
+    for j in 0:parts.len {
+        tok := strings.trim_space(&parts[j])
+        if tok.len == 0 { -> }
+        if !is_valid_agent_id(tok + "") { << "invalid --peer agent_id: " + tok }
+        out.push(tok)
+    }
+    << ""
+}
+
+fn cmd_p2p_daemon_run(opts &CliOpts, args []string) int {
+    norm1 := merge_repeatable_flag(&args, "expose")
+    norm2 := merge_repeatable_flag(&norm1, "peer")
+    $fs := flag.new_set("p2p daemon run")
+    fs.define_bool("allow-friends-only", true, "only accept P2P connections from friends")
+    fs.define_bool("allow-anyone", false, "accept P2P connections from non-friends")
+    fs.define_bool("no-host-candidates", false, "omit LAN and loopback host candidates")
+    fs.define_int("max-peers", 32, "maximum concurrent peers")
+    fs.define_string("expose", "", "comma-separated local TCP ports to expose")
+    fs.define_string("peer", "", "comma-separated persistent peer agent IDs to auto-connect")
+    fs.define_string("stun", "stun.cloudflare.com:3478,stun.l.google.com:19302", "comma-separated STUN servers or none")
+    fs.define_string("ctl-addr", "127.0.0.1:0", "local control plane listen address")
+    pr := parse_flags(opts, $&fs, norm2, false, "usage: fatext p2p daemon run [--allow-friends-only|--allow-anyone] [--expose PORTS] [--peer ID]... [--max-peers N] [--stun SPEC] [--no-host-candidates] [--ctl-addr HOST:PORT]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    if fs.is_set("allow-friends-only") && fs.is_set("allow-anyone") {
+        << emit_err(opts, "ERR_USAGE", 0, "--allow-friends-only and --allow-anyone are mutually exclusive", 0, EXIT_USAGE)
+    }
+    $friends_only := true
+    if fs.is_set("allow-anyone") { friends_only = !fs.get_bool("allow-anyone") }
+    else if fs.is_set("allow-friends-only") { friends_only = fs.get_bool("allow-friends-only") }
+    max_peers := fs.get_int("max-peers")
+    if max_peers <= 0 {
+        << emit_err(opts, "ERR_USAGE", 0, "--max-peers must be > 0", 0, EXIT_USAGE)
+    }
+    $expose_ports := []int{}
+    if fs.is_set("expose") {
+        e_err := parse_ports_csv(&fs.get_string("expose"), $&expose_ports)
+        if e_err.len > 0 { << emit_err(opts, "ERR_USAGE", 0, e_err, 0, EXIT_USAGE) }
+    }
+    $init_peers := []string{}
+    if fs.is_set("peer") {
+        p_err := parse_peers_csv(&fs.get_string("peer"), $&init_peers)
+        if p_err.len > 0 { << emit_err(opts, "ERR_USAGE", 0, p_err, 0, EXIT_USAGE) }
+    }
+
+    cfg := load_config(opts) or (err) {
+        << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+    }
+    priv_pem := read_priv_pem_checked(cfg.home + "") or (err) {
+        << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+    }
+
+    existing := ctl_client_req(opts, "GET", "/v1/status", &"")
+    if existing.ok {
+        << emit_err(opts, "ERR_CONFLICT", 409, "p2p daemon is already running", 0, EXIT_CONFLICT)
+    }
+
+    ctl_addr_arg := fs.get_string("ctl-addr")
+    ctl_lfd := net.listen(ctl_addr_arg + "") or (err) {
+        << emit_err(opts, "ERR_P2P", 0, "failed to bind control socket: " + err.msg(), 0, EXIT_P2P)
+    }
+    $real_ctl_addr := net.socket_local_addr(ctl_lfd)
+    if real_ctl_addr.len == 0 { real_ctl_addr = ctl_addr_arg + "" }
+
+    tok_bytes := rand.read(32) or (err) {
+        net_close_q(ctl_lfd)
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+    token := hex.encode_to_string(tok_bytes)
+    started_at := time.now_time().unix()
+    st := DaemonStateFile{
+        pid: os.getpid(),
+        agent_id: cfg.agent_id + "",
+        addr: real_ctl_addr + "",
+        token: token + "",
+        proto: P2P_PROTO_V4,
+        started_at: started_at,
+        api_base: cfg.api_base + "",
+        log_file: daemon_log_path(cfg.home + "")
+    }
+    write_daemon_state(cfg.home + "", &st) or (err) {
+        net_close_q(ctl_lfd)
+        << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+    }
+
+    creds_ch := chan CredsReq{cap: 16}
+    init_creds := DaemonCreds{
+        agent_id: cfg.agent_id + "",
+        api_base: cfg.api_base + "",
+        home: cfg.home + "",
+        key_version: cfg.key_version,
+        priv_pem: priv_pem + ""
+    }
+    xu daemon_creds_loop(init_creds, creds_ch)
+    core_ch := chan CoreReq{cap: 128}
+    stop_ch := chan int{cap: 4}
+    ctx := DaemonCoreCtx{
+        self_id: cfg.agent_id + "",
+        api_base: cfg.api_base + "",
+        timeout_sec: opts.timeout_sec,
+        friends_only: friends_only,
+        max_peers: max_peers,
+        stun_hp: fs.get_string("stun"),
+        include_host: !fs.get_bool("no-host-candidates"),
+        started_at: started_at,
+        ctl_addr: real_ctl_addr + "",
+        core_ch: core_ch,
+        creds_ch: creds_ch,
+        stop_ch: stop_ch
+    }
+
+    sig_ch := chan int{cap: 4}
+    signal_notify_q(sig_ch, signal.SIGINT)
+    signal_notify_q(sig_ch, signal.SIGTERM)
+    xu daemon_signal_watcher(sig_ch, core_ch)
+    xu daemon_ctl_accept_loop(ctl_lfd, clone_core_ctx(&ctx), token + "")
+    xu daemon_sse_loop(clone_core_ctx(&ctx), clone_cli_opts(opts))
+
+    p2p_log(opts, "daemon_listening", "", cfg.agent_id + "", "\"ctl_addr\":" + json.quote(&real_ctl_addr) + ",\"proto\":" + json.quote(&P2P_PROTO_V4))
+    daemon_core_loop(clone_core_ctx(&ctx), expose_ports, init_peers, ctl_lfd)
+    net_close_q(ctl_lfd)
+    time.sleep(60000000)
+    remove_daemon_state_if_token(cfg.home + "", token + "")
+    unsafe {
+        _ := libc_exit(i32(0))
+    }
+    << EXIT_OK
+}
+
+fn resolve_self_exe() string {
+    argv := os.argv()
+    $raw := "fatext"
+    if argv.len > 0 && argv[0].len > 0 { raw = argv[0] + "" }
+    $has_sep := false
+    for i in 0:raw.len {
+        if os.is_path_separator(raw[i]) {
+            has_sep = true
+            <-
+        }
+    }
+    if has_sep {
+        if raw[0] == 47 || (raw.len >= 2 && (raw[1] & 255) == 58) {
+            << raw
+        }
+        wd := os.getwd() or (err) { << raw }
+        << wd + "/" + raw
+    }
+    << exec.look_path(raw + "") or (err) { << raw + "" }
+}
+
+fn cmd_p2p_daemon_start(opts &CliOpts, args []string) int {
+    norm1 := merge_repeatable_flag(&args, "expose")
+    norm2 := merge_repeatable_flag(&norm1, "peer")
+    $fs := flag.new_set("p2p daemon start")
+    fs.define_bool("allow-friends-only", true, "only accept P2P connections from friends")
+    fs.define_bool("allow-anyone", false, "accept P2P connections from non-friends")
+    fs.define_bool("no-host-candidates", false, "omit LAN and loopback host candidates")
+    fs.define_int("max-peers", 32, "maximum concurrent peers")
+    fs.define_string("expose", "", "comma-separated local TCP ports to expose")
+    fs.define_string("peer", "", "comma-separated persistent peer agent IDs to auto-connect")
+    fs.define_string("stun", "stun.cloudflare.com:3478,stun.l.google.com:19302", "comma-separated STUN servers or none")
+    fs.define_string("ctl-addr", "127.0.0.1:0", "local control plane listen address")
+    pr := parse_flags(opts, $&fs, norm2, false, "usage: fatext p2p daemon start [--allow-friends-only|--allow-anyone] [--expose PORTS] [--peer ID]... [--max-peers N] [--stun SPEC] [--no-host-candidates] [--ctl-addr HOST:PORT]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    if fs.is_set("allow-friends-only") && fs.is_set("allow-anyone") {
+        << emit_err(opts, "ERR_USAGE", 0, "--allow-friends-only and --allow-anyone are mutually exclusive", 0, EXIT_USAGE)
+    }
+
+    cfg := load_config(opts) or (err) {
+        << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+    }
+    _ := load_private_key_checked(cfg.home + "") or (err) {
+        << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+    }
+
+    existing := ctl_client_req(opts, "GET", "/v1/status", &"")
+    if existing.ok {
+        << emit_err(opts, "ERR_CONFLICT", 409, "p2p daemon is already running", 0, EXIT_CONFLICT)
+    }
+    $prev_tok := ""
+    prev_st := read_daemon_state_or(cfg.home + "")
+    prev_tok = prev_st.token + ""
+
+    ensure_dir_mode(cfg.home + "", 448) or (err) {
+        << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+    }
+    log_path := daemon_log_path(cfg.home + "")
+    exe := resolve_self_exe()
+
+    $cargs := []string{}
+    if opts.config_path.len > 0 {
+        cargs.push("--config")
+        cargs.push(opts.config_path + "")
+    }
+    if opts.api_override.len > 0 {
+        cargs.push("--api")
+        cargs.push(opts.api_override + "")
+    }
+    if opts.timeout_sec != 30 {
+        cargs.push("--timeout")
+        cargs.push(strconv.itoa(opts.timeout_sec))
+    }
+    cargs.push("--json")
+    cargs.push("p2p")
+    cargs.push("daemon")
+    cargs.push("run")
+    for i in 0:args.len {
+        cargs.push(args[i] + "")
+    }
+
+    if xu_target_os() == 2 {
+        $ps_args := []string{}
+        for i in 0:cargs.len {
+            esc := strings.replace_all(&cargs[i], "'", "''")
+            ps_args.push("'" + esc + "'")
+        }
+        exe_esc := strings.replace_all(&exe, "'", "''")
+        log_esc := strings.replace_all(&log_path, "'", "''")
+        ps_cmd := "Start-Process -FilePath '" + exe_esc + "' -ArgumentList @(" + strings.join(ps_args, ",") + ") -WindowStyle Hidden -RedirectStandardOutput '" + log_esc + "' -RedirectStandardError '" + log_esc + "'"
+        cmd := exec.command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd)
+        cmd.run() or (err) {
+            << emit_err(opts, "ERR_P2P", 0, "failed to launch background daemon: " + err.msg(), 0, EXIT_P2P)
+        }
+    } else {
+        dlr := string_from_byte(36)
+        sh_cmd := "log=\"" + dlr + "1\"; shift; nohup \"" + dlr + "@\" >> \"" + dlr + "log\" 2>&1 </dev/null &"
+        $cmd := exec.command("/bin/sh", "-c", sh_cmd, "sh", log_path + "", exe + "")
+        for i in 0:cargs.len {
+            cmd.args.push(cargs[i] + "")
+        }
+        cmd.run() or (err) {
+            << emit_err(opts, "ERR_P2P", 0, "failed to launch background daemon: " + err.msg(), 0, EXIT_P2P)
+        }
+    }
+
+    deadline := time.now() + 10000000000
+    while time.now() < deadline {
+        cur_st := read_daemon_state(cfg.home + "") or (err) {
+            time.sleep(50000000)
+            ->
+        }
+        if cur_st.token.len > 0 && cur_st.token != prev_tok {
+            sr := ctl_client_req(opts, "GET", "/v1/status", &"")
+            if sr.ok {
+                if opts.json_mode {
+                    emit_stdout_line(sr.body)
+                } else {
+                    println("p2p daemon started pid=" + strconv.itoa(cur_st.pid) + " addr=" + cur_st.addr + " log=" + cur_st.log_file)
+                }
+                << EXIT_OK
+            }
+        }
+        time.sleep(50000000)
+    }
+    << emit_err(opts, "ERR_P2P", 0, "timed out waiting for p2p daemon startup; check " + log_path, 0, EXIT_P2P)
+}
+
+fn cmd_p2p_daemon_stop(opts &CliOpts, args []string) int {
+    $fs := flag.new_set("p2p daemon stop")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext p2p daemon stop")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    r := ctl_client_req(opts, "POST", "/v1/shutdown", &"{}")
+    if !r.ok {
+        << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, EXIT_P2P)
+    }
+    home := resolve_home(opts)
+    deadline := time.now() + 3000000000
+    while time.now() < deadline {
+        _ := read_daemon_state(home + "") or (err) { <- }
+        time.sleep(50000000)
+    }
+    if opts.json_mode {
+        emit_stdout_line(r.body)
+    } else {
+        println("p2p daemon stopped")
+    }
+    << EXIT_OK
+}
+
+pub fn cmd_p2p_status(opts &CliOpts, args []string) int {
+    $fs := flag.new_set("p2p status")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext p2p status")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    r := ctl_client_req(opts, "GET", "/v1/status", &"")
+    if !r.ok {
+        << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, EXIT_P2P)
+    }
+    if opts.json_mode {
+        emit_stdout_line(r.body)
+    } else {
+        d := json.parse(&r.body)
+        rt := d.root()
+        println("agent=" + json_has_str(&d, rt, "agent_id", "") +
+            " pid=" + strconv.itoa(json_has_int(&d, rt, "pid", 0)) +
+            " addr=" + json_has_str(&d, rt, "addr", "") +
+            " peers=" + strconv.itoa(json_has_int(&d, rt, "peers_connected", 0)) + "/" + strconv.itoa(json_has_int(&d, rt, "peers_total", 0)))
+    }
+    << EXIT_OK
+}
+
+pub fn cmd_p2p_daemon(opts &CliOpts, args []string) int {
+    if args.len == 0 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p daemon <run|start|stop|status> ...", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    rest := slice_args(&args, 1)
+    if sub == "--help" || sub == "-h" {
+        println("usage: fatext p2p daemon <run|start|stop|status> [flags]")
+        << EXIT_OK
+    }
+    if sub == "run" { << cmd_p2p_daemon_run(opts, rest) }
+    if sub == "start" { << cmd_p2p_daemon_start(opts, rest) }
+    if sub == "stop" { << cmd_p2p_daemon_stop(opts, rest) }
+    if sub == "status" { << cmd_p2p_status(opts, rest) }
+    << emit_err(opts, "ERR_USAGE", 0, "unknown p2p daemon subcommand: " + sub, 0, EXIT_USAGE)
+}
+
+pub fn cmd_p2p_peers(opts &CliOpts, args []string) int {
+    $fs := flag.new_set("p2p peers")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext p2p peers")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    r := ctl_client_req(opts, "GET", "/v1/peers", &"")
+    if !r.ok {
+        << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, EXIT_P2P)
+    }
+    if opts.json_mode {
+        emit_stdout_line(r.body)
+    } else {
+        d := json.parse(&r.body)
+        arr := d.get(d.root(), "peers")
+        if d.is_list(arr) {
+            for i in 0:d.count(arr) {
+                el := d.at(arr, i)
+                println(json_has_str(&d, el, "agent_id", "") + " state=" + json_has_str(&d, el, "state", "") +
+                    " dir=" + json_has_str(&d, el, "direction", "") +
+                    " rtt_ms=" + strconv.itoa(json_has_int(&d, el, "rtt_ms", -1)))
+            }
+        }
+    }
+    << EXIT_OK
+}
+
+pub fn cmd_p2p_dial(opts &CliOpts, args []string) int {
+    $fs := flag.new_set("p2p dial")
+    fs.define_bool("persist", false, "keep peer connected with automatic reconnect")
+    fs.define_bool("no-wait", false, "return immediately without waiting for handshake")
+    fs.define_int("timeout-ms", 15000, "wait timeout in milliseconds")
+    pr := parse_flags(opts, $&fs, args, true, "usage: fatext p2p dial <agent_id> [--persist] [--no-wait] [--timeout-ms N]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+    pos := fs.args()
+    if pos.len != 1 || !is_valid_agent_id(pos[0] + "") {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p dial <agent_id> [--persist] [--no-wait] [--timeout-ms N]", 0, EXIT_USAGE)
+    }
+    $ps := "false"
+    if fs.get_bool("persist") { ps = "true" }
+    $ws := "true"
+    if fs.get_bool("no-wait") { ws = "false" }
+    body := "{\"peer\":" + json.quote(&pos[0]) + ",\"persist\":" + ps + ",\"wait\":" + ws + ",\"timeout_ms\":" + strconv.itoa(fs.get_int("timeout-ms")) + "}"
+    r := ctl_client_req(opts, "POST", "/v1/dial", &body)
+    if !r.ok {
+        << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, EXIT_P2P)
+    }
+    if opts.json_mode {
+        emit_stdout_line(r.body)
+    } else {
+        println("connected " + pos[0])
+    }
+    << EXIT_OK
+}
+
+pub fn cmd_p2p_hangup(opts &CliOpts, args []string) int {
+    $fs := flag.new_set("p2p hangup")
+    pr := parse_flags(opts, $&fs, args, true, "usage: fatext p2p hangup <agent_id>")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+    pos := fs.args()
+    if pos.len != 1 || !is_valid_agent_id(pos[0] + "") {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p hangup <agent_id>", 0, EXIT_USAGE)
+    }
+    body := "{\"peer\":" + json.quote(&pos[0]) + "}"
+    r := ctl_client_req(opts, "POST", "/v1/hangup", &body)
+    if !r.ok {
+        $rc := EXIT_P2P
+        if r.http_status == 404 { rc = EXIT_NOT_FOUND }
+        << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, rc)
+    }
+    if opts.json_mode { emit_stdout_line(r.body) }
+    else { println("hung up " + pos[0]) }
+    << EXIT_OK
+}
+
+pub fn cmd_p2p_send(opts &CliOpts, args []string) int {
+    $fs := flag.new_set("p2p send")
+    fs.define_string("topic", "", "optional message topic")
+    fs.define_bool("no-auto-dial", false, "do not auto-dial if peer is not connected")
+    fs.define_int("timeout-ms", 15000, "auto-dial timeout in milliseconds")
+    pr := parse_flags(opts, $&fs, args, true, "usage: fatext p2p send <agent_id> <text|-> [--topic <topic>] [--no-auto-dial] [--timeout-ms N]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+    pos := fs.args()
+    if pos.len != 2 || !is_valid_agent_id(pos[0] + "") {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p send <agent_id> <text|-> [--topic <topic>] [--no-auto-dial]", 0, EXIT_USAGE)
+    }
+    txt := read_text_arg_or_stdin(pos[1] + "")
+    topic := fs.get_string("topic")
+    $ad := "true"
+    if fs.get_bool("no-auto-dial") { ad = "false" }
+    body := "{\"peer\":" + json.quote(&pos[0]) + ",\"topic\":" + json.quote(&topic) + ",\"text\":" + json.quote(&txt) + ",\"auto_dial\":" + ad + ",\"timeout_ms\":" + strconv.itoa(fs.get_int("timeout-ms")) + "}"
+    r := ctl_client_req(opts, "POST", "/v1/send", &body)
+    if !r.ok {
+        << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, EXIT_P2P)
+    }
+    if opts.json_mode { emit_stdout_line(r.body) }
+    else { println("sent to " + pos[0]) }
+    << EXIT_OK
+}
+
+pub fn cmd_p2p_recv(opts &CliOpts, args []string) int {
+    $fs := flag.new_set("p2p recv")
+    fs.define_string("peer", "", "filter by sender agent_id")
+    fs.define_string("topic", "", "filter by topic")
+    fs.define_int("since", 0, "return messages with seq > since")
+    fs.define_int("limit", 100, "maximum messages to return")
+    fs.define_bool("follow", false, "stream incoming messages as JSONL")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext p2p recv [--peer <id>] [--topic <t>] [--since N] [--limit N] [--follow]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    $qp := []string{}
+    if fs.is_set("peer") {
+        p := fs.get_string("peer")
+        qp.push("peer=" + url_encode(&p))
+    }
+    if fs.is_set("topic") {
+        t := fs.get_string("topic")
+        qp.push("topic=" + url_encode(&t))
+    }
+    if fs.is_set("since") {
+        qp.push("since=" + strconv.itoa(fs.get_int("since")))
+    }
+    if fs.is_set("limit") {
+        qp.push("limit=" + strconv.itoa(fs.get_int("limit")))
+    }
+    follow := fs.get_bool("follow")
+    if follow {
+        qp.push("follow=1")
+    }
+    $path := "/v1/recv"
+    if qp.len > 0 {
+        path = path + "?" + join_ref(&qp, "&")
+    }
+    if follow {
+        << ctl_client_stream_recv(opts, path)
+    }
+    r := ctl_client_req(opts, "GET", path, &"")
+    if !r.ok {
+        << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, EXIT_P2P)
+    }
+    if opts.json_mode {
+        emit_stdout_line(r.body)
+    } else {
+        d := json.parse(&r.body)
+        arr := d.get(d.root(), "messages")
+        if d.is_list(arr) {
+            for i in 0:d.count(arr) {
+                el := d.at(arr, i)
+                println("[" + strconv.itoa(json_has_int(&d, el, "seq", 0)) + "] " +
+                    json_has_str(&d, el, "from", "") + " (" + json_has_str(&d, el, "topic", "") + "): " +
+                    json_has_str(&d, el, "text", ""))
+            }
+        }
+    }
+    << EXIT_OK
+}
+
+pub fn cmd_p2p_forward(opts &CliOpts, args []string) int {
+    if args.len == 0 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p forward <add|rm|list> ...", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    rest := slice_args(&args, 1)
+    if sub == "--help" || sub == "-h" {
+        println("usage: fatext p2p forward <add <agent_id> <L:R> [--bind 127.0.0.1] [--no-persist] [--no-wait] | rm <id|local_port> | list>")
+        << EXIT_OK
+    }
+    if sub == "list" {
+        $fs := flag.new_set("p2p forward list")
+        pr := parse_flags(opts, $&fs, rest, false, "usage: fatext p2p forward list")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        r := ctl_client_req(opts, "GET", "/v1/forwards", &"")
+        if !r.ok { << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, EXIT_P2P) }
+        emit_stdout_line(r.body)
+        << EXIT_OK
+    }
+    if sub == "add" {
+        $fs := flag.new_set("p2p forward add")
+        fs.define_string("bind", "127.0.0.1", "local bind IP")
+        fs.define_bool("no-persist", false, "do not mark peer persistent")
+        fs.define_bool("no-wait", false, "do not wait for peer handshake")
+        fs.define_int("timeout-ms", 15000, "handshake timeout in milliseconds")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext p2p forward add <agent_id> <local_port>:<remote_port> [--bind 127.0.0.1] [--no-persist] [--no-wait]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 2 || !is_valid_agent_id(pos[0] + "") {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p forward add <agent_id> <local_port>:<remote_port>", 0, EXIT_USAGE)
+        }
+        ps := strings.split(&pos[1], ":")
+        if ps.len != 2 {
+            << emit_err(opts, "ERR_USAGE", 0, "forward spec must be <local_port>:<remote_port>", 0, EXIT_USAGE)
+        }
+        lp := strconv.atoi(&ps[0]) or (err) { << emit_err(opts, "ERR_USAGE", 0, "invalid local_port", 0, EXIT_USAGE) }
+        rp := strconv.atoi(&ps[1]) or (err) { << emit_err(opts, "ERR_USAGE", 0, "invalid remote_port", 0, EXIT_USAGE) }
+        if lp <= 0 || lp > 65535 || rp <= 0 || rp > 65535 {
+            << emit_err(opts, "ERR_USAGE", 0, "ports must be 1..65535", 0, EXIT_USAGE)
+        }
+        $per := "true"
+        if fs.get_bool("no-persist") { per = "false" }
+        $wt := "true"
+        if fs.get_bool("no-wait") { wt = "false" }
+        bind_ip := fs.get_string("bind")
+        body := "{\"peer\":" + json.quote(&pos[0]) + ",\"bind\":" + json.quote(&bind_ip) +
+            ",\"local_port\":" + strconv.itoa(lp) + ",\"remote_port\":" + strconv.itoa(rp) +
+            ",\"persist\":" + per + ",\"wait\":" + wt + ",\"timeout_ms\":" + strconv.itoa(fs.get_int("timeout-ms")) + "}"
+        r := ctl_client_req(opts, "POST", "/v1/forwards", &body)
+        if !r.ok {
+            $rc := EXIT_P2P
+            if r.http_status == 409 { rc = EXIT_CONFLICT }
+            << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, rc)
+        }
+        if opts.json_mode { emit_stdout_line(r.body) }
+        else { println("forwarding " + bind_ip + ":" + strconv.itoa(lp) + " -> " + pos[0] + ":" + strconv.itoa(rp)) }
+        << EXIT_OK
+    }
+    if sub == "rm" {
+        $fs := flag.new_set("p2p forward rm")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext p2p forward rm <id|local_port>")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p forward rm <id|local_port>", 0, EXIT_USAGE)
+        }
+        lp := atoi_or_0(&pos[0])
+        $body := ""
+        if lp > 0 { body = "{\"local_port\":" + strconv.itoa(lp) + "}" }
+        else { body = "{\"id\":" + json.quote(&pos[0]) + "}" }
+        r := ctl_client_req(opts, "DELETE", "/v1/forwards", &body)
+        if !r.ok {
+            $rc := EXIT_P2P
+            if r.http_status == 404 { rc = EXIT_NOT_FOUND }
+            << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, rc)
+        }
+        emit_stdout_line(r.body)
+        << EXIT_OK
+    }
+    << emit_err(opts, "ERR_USAGE", 0, "unknown p2p forward subcommand: " + sub, 0, EXIT_USAGE)
+}
+
+pub fn cmd_p2p_expose(opts &CliOpts, args []string) int {
+    if args.len == 0 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p expose <add|rm|list> ...", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    rest := slice_args(&args, 1)
+    if sub == "--help" || sub == "-h" {
+        println("usage: fatext p2p expose <add <port> | rm <port> | list>")
+        << EXIT_OK
+    }
+    if sub == "list" {
+        r := ctl_client_req(opts, "GET", "/v1/expose", &"")
+        if !r.ok { << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, EXIT_P2P) }
+        emit_stdout_line(r.body)
+        << EXIT_OK
+    }
+    if sub == "add" || sub == "rm" {
+        $fs := flag.new_set("p2p expose " + sub)
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext p2p expose " + sub + " <port>")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext p2p expose " + sub + " <port>", 0, EXIT_USAGE) }
+        p := strconv.atoi(&pos[0]) or (err) { << emit_err(opts, "ERR_USAGE", 0, "invalid port", 0, EXIT_USAGE) }
+        if p <= 0 || p > 65535 { << emit_err(opts, "ERR_USAGE", 0, "invalid port", 0, EXIT_USAGE) }
+        $method := "POST"
+        if sub == "rm" { method = "DELETE" }
+        body := "{\"port\":" + strconv.itoa(p) + "}"
+        r := ctl_client_req(opts, method, "/v1/expose", &body)
+        if !r.ok {
+            $rc := EXIT_P2P
+            if r.http_status == 404 { rc = EXIT_NOT_FOUND }
+            << emit_err(opts, r.err_code + "", r.http_status, r.err_msg + "", 0, rc)
+        }
+        emit_stdout_line(r.body)
+        << EXIT_OK
+    }
+    << emit_err(opts, "ERR_USAGE", 0, "unknown p2p expose subcommand: " + sub, 0, EXIT_USAGE)
+}

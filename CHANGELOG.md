@@ -2,6 +2,17 @@
 
 All notable changes to `fatext-cli` will be documented in this file.
 
+## [1.0.2] - 2026-11-27
+
+### Security
+- Pin the official `ftx_fatextoffice` SPKI public key fingerprint (`SHA256:NWAw8jK8DjgH48oD/JuX9O0E438pCC+rpEdGisgMBFk=`) by default in `fatext update` (for `https://fatext.com` / `https://www.fatext.com`) and `scripts/install.sh`, eliminating blind TOFU key substitution while preserving `FATEXT_OFFICIAL_KEY_FP` override for self-hosted instances.
+- Harden P2P authenticated NAT address migration by ignoring non-initial `PUNCH` packets from alternate/virtual interfaces (filtering `198.18.0.0/15` CGNAT/benchmark candidates) and validating peer session binding on migrated packets.
+
+### Fixed & Improved
+- Improve P2P direct tunnel reliability: adaptive Karn SRTT/RTO exponential retransmission (`100ms`–`2000ms`, up to 12 retries), strict `seq == expected_seq` ordering, bidirectional `PING`/`PONG` keepalives with dead-peer zombie reaping, post-punch `--expose` upstream dial, non-blocking `--forward` pre-accept with `1 MiB` server-first banner buffering, half-close (`SHUT_WR`) long-response delivery, multi-STUN failover, and `--no-host-candidates`.
+- Add 12-case P2P integration test suite (`scripts/test_p2p.py`) covering direct loopback, packet loss/reordering, half-close streaming, `--expose`/`--forward` server-first protocols, bidirectional NAT migration, zombie reaping, `--star --bus` multi-spoke fan-out, and spoofed/replayed/tampered packet rejection.
+- Align installation guides in `README.md` and `scripts/install.sh` with manual pinned-fingerprint + RSA-PSS + SHA-256 verification (removing `curl | bash` recommendation).
+
 ## [1.0.1] - 2026-11-27
 
 ### Security

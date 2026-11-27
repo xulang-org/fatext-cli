@@ -18,7 +18,7 @@
 const UPDATE_MAX_BYTES = 134217728
 const UPDATE_MAX_UNPACKED_BYTES = 268435456
 const UPDATE_MAX_ENTRIES = 1000
-const OFFICIAL_KEY_PIN_FP = ""
+const OFFICIAL_KEY_PIN_FP = "SHA256:NWAw8jK8DjgH48oD/JuX9O0E438pCC+rpEdGisgMBFk="
 const TERM_BAR_CELLS = 24
 const TERM_SIZE_WIDTH = 11
 const TERM_PERCENT_WIDTH = 5
@@ -427,6 +427,15 @@ fn matches_official_key_pin(actual_fp &string, pins_csv &string) bool {
     << false
 }
 
+fn is_official_fatext_api(api_base &string) bool {
+    $b := strings.trim_space(api_base)
+    while b.len > 0 && (b[b.len - 1] & 255) == 47 {
+        b = b[0:(b.len - 1)] + ""
+    }
+    b = strings.to_lower(&b)
+    << b == "https://fatext.com" || b == "https://www.fatext.com"
+}
+
 fn is_loopback_http_url(u &string) bool {
     if !strings.has_prefix(u, "http://") { << false }
     rest := u[7:u.len] + ""
@@ -467,7 +476,7 @@ fn verify_and_download_archive(
         >> errors.new("failed to verify active official ftx_fatextoffice public key: " + fk.err_msg)
     }
     $expected_fp := strings.trim_space(&os.getenv("FATEXT_OFFICIAL_KEY_FP"))
-    if expected_fp.len == 0 {
+    if expected_fp.len == 0 && OFFICIAL_KEY_PIN_FP.len > 0 && is_official_fatext_api(api_base) {
         expected_fp = OFFICIAL_KEY_PIN_FP
     }
     if expected_fp.len > 0 {

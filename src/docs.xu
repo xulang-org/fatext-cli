@@ -365,6 +365,18 @@ fn doc_status_print(opts &CliOpts, raw &string) {
             println("  " + k + ": v" + strconv.itoa(ver) + " " + vis + " " + ls + " bytes=" + strconv.itoa(cb) + " signer=" + sb + ":" + sid)
         }
     }
+    if doc.has(rt, "human") && !doc.is_null(doc.get(rt, "human")) {
+        hn := doc.get(rt, "human")
+        ver := json_int_or(&doc, doc.get(hn, "version"), 0)
+        vis := json_str_or(&doc, doc.get(hn, "visibility"), "")
+        lck := json_bool_or(&doc, doc.get(hn, "locked"), false)
+        cb := json_int_or(&doc, doc.get(hn, "content_bytes"), 0)
+        sb := json_str_or(&doc, doc.get(hn, "signed_by"), "")
+        sid := json_str_or(&doc, doc.get(hn, "signer_id"), "")
+        $ls := "unlocked"
+        if lck { ls = "locked" }
+        println("  human: v" + strconv.itoa(ver) + " " + vis + " " + ls + " bytes=" + strconv.itoa(cb) + " signer=" + sb + ":" + sid)
+    }
 }
 
 pub fn cmd_doc(opts &CliOpts, kind string, args []string) int {
@@ -695,4 +707,442 @@ pub fn cmd_ctl_doc(opts &CliOpts, kind string, args []string) int {
     }
 
     << emit_err(opts, "ERR_USAGE", 0, "unknown ctl " + kind + " subcommand: " + sub, 0, EXIT_USAGE)
+}
+
+fn is_email_local_char(c int) bool {
+    if c >= 97 && c <= 122 { << true }
+    if c >= 48 && c <= 57 { << true }
+    << c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 ||
+        c == 42 || c == 43 || c == 45 || c == 46 || c == 47 || c == 61 ||
+        c == 63 || c == 94 || c == 95 || c == 96 || c == 123 || c == 124 ||
+        c == 125 || c == 126
+}
+
+fn is_email_domain_char(c int) bool {
+    << (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45
+}
+
+pub fn normalize_email_addr(raw &string) string {
+    if raw.len == 0 || raw.len > 320 { << "" }
+    if strings.contains(raw, "\r") || strings.contains(raw, "\n") || strings.contains(raw, ",") || strings.contains(raw, "*") {
+        << ""
+    }
+    for i in 0:raw.len {
+        c := raw[i] & 255
+        if c < 32 || c == 127 { << "" }
+    }
+    trimmed := strings.trim_space(raw)
+    if trimmed.len == 0 { << "" }
+
+    $addr := trimmed + ""
+    lt := strings.index_of(&trimmed, "<")
+    gt := strings.index_of(&trimmed, ">")
+    if lt >= 0 || gt >= 0 {
+        if lt < 0 || gt <= lt { << "" }
+        rest_after_lt := trimmed[(lt + 1):trimmed.len]
+        if strings.index_of(&rest_after_lt, "<") >= 0 { << "" }
+        rest_after_gt := trimmed[(gt + 1):trimmed.len]
+        if strings.index_of(&rest_after_gt, ">") >= 0 { << "" }
+        if strings.trim_space(&rest_after_gt).len > 0 { << "" }
+        addr = trimmed[(lt + 1):gt]
+    }
+    norm := strings.to_lower(&strings.trim_space(&addr))
+    if norm.len < 3 || norm.len > 254 { << "" }
+    at := strings.index_of(&norm, "@")
+    if at <= 0 || at >= norm.len - 1 { << "" }
+    local := norm[0:at]
+    domain := norm[(at + 1):norm.len]
+    if strings.contains(&domain, "@") { << "" }
+    if local.len == 0 || local.len > 64 { << "" }
+    if (local[0] & 255) == 46 || (local[local.len - 1] & 255) == 46 { << "" }
+    if strings.contains(&local, "..") { << "" }
+    for i in 0:local.len {
+        if !is_email_local_char(local[i] & 255) { << "" }
+    }
+    if domain.len < 3 || domain.len > 253 { << "" }
+    if !strings.contains(&domain, ".") || strings.has_prefix(&domain, ".") || strings.has_suffix(&domain, ".") {
+        << ""
+    }
+    labels := strings.split(&domain, ".")
+    if labels.len < 2 { << "" }
+    for li in 0:labels.len {
+        lb := labels[li] + ""
+        if lb.len == 0 || lb.len > 63 { << "" }
+        if (lb[0] & 255) == 45 || (lb[lb.len - 1] & 255) == 45 { << "" }
+        for ci in 0:lb.len {
+            if !is_email_domain_char(lb[ci] & 255) { << "" }
+        }
+    }
+    tld := labels[labels.len - 1] + ""
+    $has_alpha := false
+    for ci in 0:tld.len {
+        c := tld[ci] & 255
+        if c >= 97 && c <= 122 { has_alpha = true }
+    }
+    if !has_alpha { << "" }
+    << norm
+}
+
+pub fn email_list_contains(list &[]string, addr &string) bool {
+    for i in 0:list.len {
+        if list[i] == *addr { << true }
+    }
+    << false
+}
+
+pub struct HumanMailConfig {
+    pub ok bool
+    pub command_enabled bool
+    pub emails []string
+    pub controller_id string
+    pub version int
+}
+
+fn empty_human_mail_config() HumanMailConfig {
+    << HumanMailConfig{ok: false, command_enabled: false, emails: []string{}, controller_id: "", version: 0}
+}
+
+fn parse_human_config_plaintext(pt &string) HumanMailConfig {
+    doc := json.parse(pt)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << empty_human_mail_config() }
+    rt := doc.root()
+    ver := json_has_int(&doc, rt, "v", 0)
+    if ver != 1 { << empty_human_mail_config() }
+    if !doc.has(rt, "emails") || !doc.is_list(doc.get(rt, "emails")) {
+        << empty_human_mail_config()
+    }
+    arr := doc.get(rt, "emails")
+    cnt := doc.count(arr)
+    if cnt < 1 || cnt > 10 { << empty_human_mail_config() }
+    $emails := []string{}
+    for i in 0:cnt {
+        el := doc.at(arr, i)
+        if !doc.is_string(el) { << empty_human_mail_config() }
+        raw_e := json_str_or(&doc, el, "")
+        ne := normalize_email_addr(&raw_e)
+        if ne.len == 0 { << empty_human_mail_config() }
+        if !email_list_contains(&emails, &ne) {
+            emails.push(ne)
+        }
+    }
+    if emails.len == 0 { << empty_human_mail_config() }
+    enabled := json_has_bool(&doc, rt, "command_enabled", true)
+    << HumanMailConfig{ok: true, command_enabled: enabled, emails: emails, controller_id: "", version: 0}
+}
+
+pub fn fetch_verified_human_config(opts &CliOpts, cfg &Config, priv &rsa.PrivateKey) HumanMailConfig {
+    empty := ""
+    r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", priv, true, "GET", "/v1/agents/docs/human", &empty, "")
+    if !r.ok { << empty_human_mail_config() }
+    dv := cli_verify_doc_and_extract(
+        opts, cfg.api_base + "", cfg.agent_id + "", "human",
+        "agent", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, priv, &r.body
+    )
+    if !dv.ok || dv.visibility != "private" || !dv.locked || dv.signed_by != "controller" || dv.format != "json" {
+        << empty_human_mail_config()
+    }
+    $parsed := parse_human_config_plaintext(&dv.content)
+    if !parsed.ok { << empty_human_mail_config() }
+    parsed.controller_id = dv.signer_id + ""
+    parsed.version = dv.version
+    << parsed
+}
+
+fn human_config_json_body(emails &[]string, command_enabled bool) string {
+    $q := []string{}
+    for i in 0:emails.len {
+        s := emails[i] + ""
+        q.push(json.quote(&s))
+    }
+    $ce := "false"
+    if command_enabled { ce = "true" }
+    << "{\"v\":1,\"emails\":[" + join_ref(&q, ",") + "],\"command_enabled\":" + ce + "}"
+}
+
+fn human_out_json(aid string, hcfg &HumanMailConfig) string {
+    $q := []string{}
+    for i in 0:hcfg.emails.len {
+        s := hcfg.emails[i] + ""
+        q.push(json.quote(&s))
+    }
+    $ce := "false"
+    if hcfg.command_enabled { ce = "true" }
+    << "{\"ok\":true,\"agent_id\":" + json.quote(&aid) +
+        ",\"controller_id\":" + json.quote(&hcfg.controller_id) +
+        ",\"version\":" + strconv.itoa(hcfg.version) +
+        ",\"command_enabled\":" + ce +
+        ",\"emails\":[" + join_ref(&q, ",") + "]" +
+        ",\"verified\":true}"
+}
+
+fn parse_human_emails_csv(raw &string) []string {
+    parts := strings.split(raw, ",")
+    $out := []string{}
+    for i in 0:parts.len {
+        item := strings.trim_space(&parts[i])
+        if item.len == 0 { << []string{} }
+        ne := normalize_email_addr(&item)
+        if ne.len == 0 { << []string{} }
+        if !email_list_contains(&out, &ne) {
+            out.push(ne)
+        }
+    }
+    if out.len == 0 || out.len > 10 { << []string{} }
+    << out
+}
+
+fn push_human_config_one(opts &CliOpts, cfg &Config, priv &rsa.PrivateKey, aid string, content &string) ApiResp {
+    empty := ""
+    cur_r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", priv, true, "GET", "/v1/ctl/agents/" + aid + "/docs/human", &empty, "")
+    $next_ver := 1
+    if cur_r.ok {
+        cdoc := json.parse(&cur_r.body)
+        if cdoc.ok() && cdoc.has(cdoc.root(), "version") {
+            next_ver = json_int_or(&cdoc, cdoc.get(cdoc.root(), "version"), 0) + 1
+        }
+    } else if cur_r.status != 404 {
+        << cur_r
+    }
+    built := build_signed_doc_put_body(
+        cfg.api_base + "", opts.timeout_sec, aid + "", "human",
+        next_ver, "private", true, "json", content, priv, cfg.agent_id + "", cfg.key_version
+    )
+    if !built.ok { << built }
+    << api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", priv, true, "PUT", "/v1/ctl/agents/" + aid + "/docs/human", &built.body, "")
+}
+
+struct ManagedAgentsRes {
+    ok bool
+    ids []string
+    resp ApiResp
+}
+
+fn collect_active_managed_ids(opts &CliOpts, cfg &Config, priv &rsa.PrivateKey) ManagedAgentsRes {
+    empty := ""
+    r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", priv, true, "GET", "/v1/ctl/agents", &empty, "")
+    if !r.ok { << ManagedAgentsRes{ok: false, ids: []string{}, resp: r} }
+    ldoc := json.parse(&r.body)
+    $ids := []string{}
+    if ldoc.ok() && ldoc.has(ldoc.root(), "agents") && ldoc.is_list(ldoc.get(ldoc.root(), "agents")) {
+        arr := ldoc.get(ldoc.root(), "agents")
+        for i in 0:ldoc.count(arr) {
+            el := ldoc.at(arr, i)
+            if !ldoc.is_dict(el) { -> }
+            aid_s := json_str_or(&ldoc, ldoc.get(el, "agent_id"), "")
+            ast_s := json_str_or(&ldoc, ldoc.get(el, "agent_status"), "")
+            ost_s := json_str_or(&ldoc, ldoc.get(el, "ownership_status"), "")
+            if is_valid_agent_id(aid_s + "") && ast_s == "active" && ost_s != "revoked" {
+                ids.push(aid_s)
+            }
+        }
+    }
+    << ManagedAgentsRes{ok: true, ids: ids, resp: r}
+}
+
+pub fn cmd_ctl_human(opts &CliOpts, args []string) int {
+    if args.len < 1 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl human <set|get|pull|rm> ...", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    rest := slice_args(&args, 1)
+
+    if sub == "set" {
+        $fs := flag.new_set("ctl human set")
+        fs.define_bool("all", false, "apply to all active managed agents")
+        fs.define_bool("disabled", false, "store allowlist with command_enabled=false")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext ctl human set <agent_id|--all> <email>[,email2...] [--disabled]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        all_mode := fs.get_bool("all")
+        cmd_enabled := !fs.get_bool("disabled")
+        pos := fs.args()
+
+        $target_aid := ""
+        $emails_raw := ""
+        if all_mode {
+            if pos.len != 1 {
+                << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl human set --all <email>[,email2...] [--disabled]", 0, EXIT_USAGE)
+            }
+            emails_raw = pos[0] + ""
+        } else {
+            if pos.len != 2 {
+                << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl human set <agent_id> <email>[,email2...] [--disabled]", 0, EXIT_USAGE)
+            }
+            target_aid = pos[0] + ""
+            if !is_valid_agent_id(target_aid + "") {
+                << emit_err(opts, "ERR_USAGE", 0, "invalid agent_id: " + target_aid, 0, EXIT_USAGE)
+            }
+            emails_raw = pos[1] + ""
+        }
+        emails := parse_human_emails_csv(&emails_raw)
+        if emails.len == 0 {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid human email list (1..10 comma-separated emails required)", 0, EXIT_USAGE)
+        }
+        content := human_config_json_body(&emails, cmd_enabled)
+
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+
+        if !all_mode {
+            r := push_human_config_one(opts, &cfg, &priv, target_aid + "", &content)
+            if !r.ok { << handle_api_fail(opts, &r) }
+            if opts.json_mode {
+                println(r.body)
+            } else {
+                println("saved encrypted locked human config for " + target_aid)
+            }
+            << EXIT_OK
+        }
+
+        mres := collect_active_managed_ids(opts, &cfg, &priv)
+        if !mres.ok { << handle_api_fail(opts, &mres.resp) }
+        $updated := []string{}
+        for i in 0:mres.ids.len {
+            aid := mres.ids[i] + ""
+            pr1 := push_human_config_one(opts, &cfg, &priv, aid + "", &content)
+            if !pr1.ok { << handle_api_fail(opts, &pr1) }
+            updated.push(json.quote(&aid))
+        }
+        if opts.json_mode {
+            println("{\"ok\":true,\"updated\":[" + join_ref(&updated, ",") + "]}")
+        } else {
+            println("saved encrypted locked human config for " + strconv.itoa(mres.ids.len) + " agent(s)")
+        }
+        << EXIT_OK
+    }
+
+    if sub == "get" || sub == "pull" {
+        $fs := flag.new_set("ctl human " + sub)
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext ctl human " + sub + " <agent_id>")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl human " + sub + " <agent_id>", 0, EXIT_USAGE)
+        }
+        aid := pos[0] + ""
+        if !is_valid_agent_id(aid + "") {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid agent_id: " + aid, 0, EXIT_USAGE)
+        }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        empty := ""
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/agents/" + aid + "/docs/human", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        dv := cli_verify_doc_and_extract(opts, cfg.api_base + "", aid + "", "human", "controller", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &r.body)
+        if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
+        if dv.visibility != "private" || !dv.locked || dv.signed_by != "controller" || dv.format != "json" {
+            << emit_err(opts, "ERR_CRYPTO", 0, "human config failed integrity policy check", 0, EXIT_CRYPTO)
+        }
+        $hcfg := parse_human_config_plaintext(&dv.content)
+        if !hcfg.ok { << emit_err(opts, "ERR_CRYPTO", 0, "invalid human config JSON payload", 0, EXIT_CRYPTO) }
+        hcfg.controller_id = dv.signer_id + ""
+        hcfg.version = dv.version
+        if opts.json_mode {
+            println(human_out_json(aid + "", &hcfg))
+        } else {
+            $ce_s := "false"
+            if hcfg.command_enabled { ce_s = "true" }
+            println("agent_id=" + aid + " v" + strconv.itoa(hcfg.version) + " command_enabled=" + ce_s + " emails=" + join_ref(&hcfg.emails, ","))
+        }
+        << EXIT_OK
+    }
+
+    if sub == "rm" || sub == "delete" {
+        $fs := flag.new_set("ctl human " + sub)
+        fs.define_bool("all", false, "remove from all active managed agents")
+        pr := parse_flags(opts, $&fs, rest, true, "usage: fatext ctl human rm <agent_id|--all>")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        all_mode := fs.get_bool("all")
+        pos := fs.args()
+
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        empty := ""
+
+        if !all_mode {
+            if pos.len != 1 {
+                << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl human rm <agent_id|--all>", 0, EXIT_USAGE)
+            }
+            aid := pos[0] + ""
+            if !is_valid_agent_id(aid + "") {
+                << emit_err(opts, "ERR_USAGE", 0, "invalid agent_id: " + aid, 0, EXIT_USAGE)
+            }
+            r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/ctl/agents/" + aid + "/docs/human", &empty, "")
+            if !r.ok { << handle_api_fail(opts, &r) }
+            if opts.json_mode { println(r.body) } else { println("deleted human config for " + aid) }
+            << EXIT_OK
+        }
+
+        if pos.len != 0 {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl human rm --all", 0, EXIT_USAGE)
+        }
+        mres := collect_active_managed_ids(opts, &cfg, &priv)
+        if !mres.ok { << handle_api_fail(opts, &mres.resp) }
+        $deleted := []string{}
+        for i in 0:mres.ids.len {
+            aid := mres.ids[i] + ""
+            dr := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/ctl/agents/" + aid + "/docs/human", &empty, "")
+            if dr.ok {
+                deleted.push(json.quote(&aid))
+            } else if dr.status != 404 {
+                << handle_api_fail(opts, &dr)
+            }
+        }
+        if opts.json_mode {
+            println("{\"ok\":true,\"deleted\":[" + join_ref(&deleted, ",") + "]}")
+        } else {
+            println("deleted human config for " + strconv.itoa(deleted.len) + " agent(s)")
+        }
+        << EXIT_OK
+    }
+
+    << emit_err(opts, "ERR_USAGE", 0, "unknown ctl human subcommand: " + sub, 0, EXIT_USAGE)
+}
+
+pub fn cmd_human(opts &CliOpts, args []string) int {
+    if args.len < 1 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext human <get|pull|status>", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    if sub == "-h" || sub == "--help" {
+        println("usage: fatext human <get|pull|status>")
+        << EXIT_OK
+    }
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    empty := ""
+
+    if sub == "status" {
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/agents/docs", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        doc_status_print(opts, &r.body)
+        << EXIT_OK
+    }
+    if sub == "get" || sub == "pull" {
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/agents/docs/human", &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        dv := cli_verify_doc_and_extract(
+            opts, cfg.api_base + "", cfg.agent_id + "", "human",
+            "agent", cfg.agent_id + "", cfg.home + "", cfg.key_version, true, &priv, &r.body
+        )
+        if !dv.ok { << emit_err(opts, dv.err_code + "", 0, dv.err + "", 0, dv.exit_code) }
+        if dv.visibility != "private" || !dv.locked || dv.signed_by != "controller" || dv.format != "json" {
+            << emit_err(opts, "ERR_CRYPTO", 0, "human config failed integrity policy check", 0, EXIT_CRYPTO)
+        }
+        $hcfg := parse_human_config_plaintext(&dv.content)
+        if !hcfg.ok { << emit_err(opts, "ERR_CRYPTO", 0, "invalid human config JSON payload", 0, EXIT_CRYPTO) }
+        hcfg.controller_id = dv.signer_id + ""
+        hcfg.version = dv.version
+        if opts.json_mode {
+            println(human_out_json(cfg.agent_id + "", &hcfg))
+        } else {
+            $ce_s := "false"
+            if hcfg.command_enabled { ce_s = "true" }
+            println("agent_id=" + cfg.agent_id + " controller_id=" + hcfg.controller_id + " v" + strconv.itoa(hcfg.version) + " command_enabled=" + ce_s + " emails=" + join_ref(&hcfg.emails, ","))
+        }
+        << EXIT_OK
+    }
+    << emit_err(opts, "ERR_USAGE", 0, "unknown human subcommand: " + sub, 0, EXIT_USAGE)
 }

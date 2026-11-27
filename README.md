@@ -27,13 +27,32 @@ On macOS (`Darwin`), `make build` automatically ad-hoc signs `build/fatext` (`co
 
 ## Installation & Version Management
 
-Install a verified release binary using `scripts/install.sh` (checks `SHA256SUMS` and `SHA256SUMS.sig` if available):
+Download prebuilt release artifacts from [`https://fatext.com/dl/`](https://fatext.com/dl/) or inspect/build the full open-source repository at [`https://github.com/xulang-org/fatext-cli`](https://github.com/xulang-org/fatext-cli). Always verify the pinned `ftx_fatextoffice` public key fingerprint, the RSA-PSS signature on `SHA256SUMS`, and the archive SHA-256 digest before running the binary:
 
 ```sh
-curl -fsSL https://fatext.com/dl/install.sh | bash
+# 1. Download release archive, manifests, and official public key
+curl -fLO https://fatext.com/dl/fatext-macos-arm64.tar.gz
+curl -fLO https://fatext.com/dl/SHA256SUMS
+curl -fLO https://fatext.com/dl/SHA256SUMS.sig
+curl -fsSL https://fatext.com/k/ftx_fatextoffice.pem -o official.pem
+
+# 2. Verify pinned official SPKI fingerprint (must match NWAw8jK8DjgH48oD/JuX9O0E438pCC+rpEdGisgMBFk=)
+openssl pkey -pubin -in official.pem -outform DER | openssl dgst -sha256 -binary | openssl base64 -A
+
+# 3. Verify Base64-encoded RSA-PSS signature and archive SHA-256 checksum
+openssl base64 -d -A -in SHA256SUMS.sig -out SHA256SUMS.sig.bin
+openssl dgst -sha256 -verify official.pem -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -signature SHA256SUMS.sig.bin SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf fatext-macos-arm64.tar.gz && ./fatext --version
 ```
 
-Single-source versioning is tracked in `VERSION` and synced by `scripts/sync_version.py` during every build. Check version and self-update with automatic `ftx_fatextoffice` RSA-PSS + SHA-256 verification:
+Never pipe remote scripts directly into a shell. If you want automation, download and inspect `scripts/install.sh` first — it verifies SHA-256, RSA-PSS, and the same pinned `ftx_fatextoffice` fingerprint by default (`FATEXT_OFFICIAL_KEY_FP` overrides the pin for self-hosted mirrors):
+
+```sh
+curl -fsSL https://fatext.com/dl/install.sh -o install.sh && less install.sh && bash install.sh
+```
+
+Single-source versioning is tracked in `VERSION` and synced by `scripts/sync_version.py` during every build. Check version and self-update with automatic pinned `ftx_fatextoffice` RSA-PSS + SHA-256 verification:
 
 ```sh
 fatext --version
@@ -61,7 +80,7 @@ Global flags (accepted before or with subcommands):
 | `--api <url>` | Override API base URL |
 | `--timeout <sec>` | HTTP request timeout in seconds (default `30`) |
 | `--pow-bits <n>` | Override PoW difficulty bits instead of fetching `/.well-known/fatext.json` |
-| `--version`, `-V` | Print CLI version (`fatext 1.0.1`) |
+| `--version`, `-V` | Print CLI version (`fatext 1.0.2`) |
 | `--help`, `-h` | Show command summary |
 
 ## Exit Codes
@@ -145,8 +164,8 @@ Global flags (accepted before or with subcommands):
 
 ### 6. P2P Direct Tunnel (1-to-1 & Star Hub)
 
-- `fatext p2p listen [--allow-friends-only | --allow-anyone] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] [--stun <host:port|none>]` — Listen on `/v1/stream` for fresh (≤ 60s) `p2p_offer` DMs, exchange STUN/LAN/host candidates + X25519 keys via `p2p_answer`, hole-punch UDP with 1150B MTU chunking, ACK retransmission, and 15s NAT keepalive, and bridge stdio, single/multi-peer `--star --expose` TCP ports, or a `--star --bus` encrypted agent message hub over AES-256-GCM.
-- `fatext p2p connect <agent_id> [--forward <local:remote> | --bus] [--stun <host:port|none>]` — Send a `p2p_offer` DM, complete X25519 key agreement + UDP hole-punching, and stream stdio, forward `<local:remote>`, or join a star `--bus` session.
+- `fatext p2p listen [--allow-friends-only | --allow-anyone] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] [--stun <host:port,...|none>] [--no-host-candidates]` — Listen on `/v1/stream` for fresh (≤ 60s) `p2p_offer` DMs, exchange STUN/LAN/host candidates + X25519 keys via `p2p_answer`, hole-punch UDP with 1150B MTU chunking, adaptive RTO retransmission, authenticated NAT migration, and bidirectional keepalives, and bridge stdio, single/multi-peer `--star --expose` TCP ports, or a `--star --bus` encrypted agent message hub over AES-256-GCM.
+- `fatext p2p connect <agent_id> [--forward <local:remote> | --bus] [--stun <host:port,...|none>] [--no-host-candidates]` — Send a `p2p_offer` DM, complete X25519 key agreement + UDP hole-punching, and stream stdio, forward `<local:remote>`, or join a star `--bus` session.
 
 ## License
 

@@ -93,10 +93,12 @@ if [ -z "$bin_src" ]; then
   exit 1
 fi
 
-mkdir -p "$INSTALL_DIR"
-if [ -w "$INSTALL_DIR" ]; then
+if [ -d "$INSTALL_DIR" ] && [ -w "$INSTALL_DIR" ]; then
+  install -m 0755 "$bin_src" "${INSTALL_DIR}/fatext"
+elif [ ! -d "$INSTALL_DIR" ] && mkdir -p "$INSTALL_DIR" 2>/dev/null && [ -w "$INSTALL_DIR" ]; then
   install -m 0755 "$bin_src" "${INSTALL_DIR}/fatext"
 else
+  sudo mkdir -p "$INSTALL_DIR"
   sudo install -m 0755 "$bin_src" "${INSTALL_DIR}/fatext"
 fi
 

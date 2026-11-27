@@ -55,11 +55,11 @@ def detect_target() -> str:
         "arm64": "arm64",
     }
     arch_part = arch_map.get(mach, mach or "unknown")
-    return f"{os_part}/{arch_part}"
+    return f"{os_part}-{arch_part}"
 
 
 def expected_xun(ver: str) -> str:
-    return f"module: fatext/cli\nversion: !ver {ver}\nxu: !ver 0.14.0\n"
+    return f"module: fatext/cli\nversion: !ver {ver}\nxu: !ver 0.14.1\n"
 
 
 def expected_version_xu(ver: str, commit: str, target: str) -> str:

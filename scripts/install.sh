@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Installer for fatext-cli (`fatext`)
-# Usage: curl -fsSL https://fatext.com/dl/install.sh | bash
+# Optional installer for fatext-cli (`fatext`)
+# Recommended: inspect this script before running, or verify manually per https://fatext.com/dl/#verify
+# Usage: curl -fsSL https://fatext.com/dl/install.sh -o install.sh && less install.sh && bash install.sh
 
 BASE_URL="${FATEXT_DL_BASE:-https://fatext.com/dl}"
 KEY_URL="${FATEXT_OFFICIAL_KEY_URL:-https://fatext.com/k/ftx_fatextoffice.pem}"
+OFFICIAL_KEY_PIN_FP="SHA256:NWAw8jK8DjgH48oD/JuX9O0E438pCC+rpEdGisgMBFk="
 INSTALL_DIR="${FATEXT_INSTALL_DIR:-/usr/local/bin}"
 VERSION="${FATEXT_VERSION:-latest}"
 
@@ -70,12 +72,21 @@ else
     echo "Error: failed to download official key ${KEY_URL}" >&2
     exit 1
   fi
-  if [ -n "${FATEXT_OFFICIAL_KEY_FP:-}" ]; then
+  expected_fp="${FATEXT_OFFICIAL_KEY_FP:-}"
+  if [ -z "$expected_fp" ]; then
+    case "$KEY_URL" in
+      https://fatext.com/k/ftx_fatextoffice.pem|https://www.fatext.com/k/ftx_fatextoffice.pem)
+        expected_fp="$OFFICIAL_KEY_PIN_FP"
+        ;;
+    esac
+  fi
+  if [ -n "$expected_fp" ]; then
     actual_fp="SHA256:$(openssl pkey -pubin -in "${tmp}/official.pem" -outform DER 2>/dev/null | openssl dgst -sha256 -binary | openssl base64 -A)"
-    if [ "$actual_fp" != "$FATEXT_OFFICIAL_KEY_FP" ]; then
-      echo "Error: official key fingerprint mismatch (expected=${FATEXT_OFFICIAL_KEY_FP} actual=${actual_fp})" >&2
+    if [ "$actual_fp" != "$expected_fp" ]; then
+      echo "Error: official key fingerprint mismatch (expected=${expected_fp} actual=${actual_fp})" >&2
       exit 1
     fi
+    echo "Official key fingerprint verified: ${actual_fp}"
   fi
   openssl base64 -d -A -in "${tmp}/SHA256SUMS.sig" -out "${tmp}/sig.bin" 2>/dev/null || cp "${tmp}/SHA256SUMS.sig" "${tmp}/sig.bin"
   if openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -verify "${tmp}/official.pem" -signature "${tmp}/sig.bin" "${tmp}/SHA256SUMS" >/dev/null 2>&1; then

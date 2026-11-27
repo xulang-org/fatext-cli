@@ -704,7 +704,7 @@ fn p2p_bus_client_session(
         if stdin_eof && tx_head >= tx_q.len && !wait_ack {
             fin_pkt := seal_pkt_q(&ciph.tx, sess + "", P2P_PKT_FIN, seq, &empty)
             if fin_pkt.len > 0 {
-                for r in 0:3 { pconn_write_q(pconn, &fin_pkt, &peer_addr) }
+                for r in 0:5 { pconn_write_q(pconn, &fin_pkt, &peer_addr) }
             }
             alive = false
             <-
@@ -1307,7 +1307,7 @@ fn p2p_punch_and_session(
                 if stdin_eof && tx_head >= tx_q.len && !wait_ack {
                     fin_pkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_FIN, seq, &empty)
                     if fin_pkt.len > 0 {
-                        for r in 0:3 {
+                        for r in 0:5 {
                             pconn_write_q(pconn, &fin_pkt, &peer_addr)
                         }
                     }
@@ -1413,7 +1413,6 @@ fn p2p_punch_and_session(
         $seq := 1
         $tcp_eof_seen := false
         $local_fin := false
-        $local_fin_ns := 0
         $last_fin_tx_ns := 0
         if remote_fin {
             net_close_write_q(tcp_fd)
@@ -1476,11 +1475,10 @@ fn p2p_punch_and_session(
 
             if !local_fin && tcp_eof_seen && tx_head >= tx_q.len && !wait_ack {
                 local_fin = true
-                local_fin_ns = time.now()
-                last_fin_tx_ns = local_fin_ns
+                last_fin_tx_ns = time.now()
                 fin_pkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_FIN, seq, &empty)
                 if fin_pkt.len > 0 {
-                    for r in 0:3 { pconn_write_q(pconn, &fin_pkt, &peer_addr) }
+                    for r in 0:5 { pconn_write_q(pconn, &fin_pkt, &peer_addr) }
                 }
             } else if local_fin && !remote_fin {
                 now_f := time.now()
@@ -1489,7 +1487,6 @@ fn p2p_punch_and_session(
                     if fin_pkt.len > 0 { pconn_write_q(pconn, &fin_pkt, &peer_addr) }
                     last_fin_tx_ns = now_f
                 }
-                if now_f - local_fin_ns >= 3000000000 { <- }
             }
 
             now_k := time.now()

@@ -20,7 +20,7 @@ fn handle_api_fail(opts &CliOpts, r &ApiResp) int {
         << emit_err(opts, r.err_code + "", 0, r.err_msg + "", 0, EXIT_NET)
     }
     ec := map_http_exit_code(r.status, r.err_code + "")
-    << emit_err(opts, r.err_code + "", r.status, r.err_msg + "", r.retry_after, ec)
+    << emit_api_err(opts, r, ec)
 }
 
 fn cache_get_or(cache &maps.StrStr, k string) string {
@@ -114,7 +114,52 @@ pub fn cmd_version(opts &CliOpts, args []string) int {
     << exit_c
 }
 
-fn verify_stored_post_line(api_base string, timeout_sec int, cache $&maps.StrStr, line &string, is_reply bool) bool {
+pub fn decrypt_dm_frame_with_archive(
+    home string,
+    self_id string,
+    cur_kv int,
+    cur_priv &rsa.PrivateKey,
+    expected_from string,
+    sender_pk &rsa.PublicKey,
+    sender_has_pk bool,
+    outer_json &string
+) DecryptedMsg {
+    $tkv := cur_kv
+    od := json.parse(outer_json)
+    if od.ok() && od.is_dict(od.root()) && od.has(od.root(), "to_key_version") {
+        tkv = json_int_or(&od, od.get(od.root(), "to_key_version"), cur_kv)
+    }
+    if tkv == cur_kv || home.len == 0 {
+        << decrypt_dm_frame(self_id + "", cur_priv, expected_from + "", sender_pk, sender_has_pk, outer_json)
+    }
+    apriv := load_archived_private_key(home + "", tkv) or (err) {
+        << dec_fail("missing archived key v" + strconv.itoa(tkv))
+    }
+    << decrypt_dm_frame(self_id + "", &apriv, expected_from + "", sender_pk, sender_has_pk, outer_json)
+}
+
+fn valid_utc_date_str(s &string) bool {
+    if s.len != 10 { << false }
+    if (s[4] & 255) != 45 || (s[7] & 255) != 45 { << false }
+    for i in 0:10 {
+        if i == 4 || i == 7 { -> }
+        c := s[i] & 255
+        if c < 48 || c > 57 { << false }
+    }
+    << true
+}
+
+fn decode_b64_len(s string) int {
+    raw := base64.decode_string(s) or (err) { << -1 }
+    << raw.len
+}
+
+fn is_valid_receipt_id(s string) bool {
+    if s.len != 30 || !strings.has_prefix(&s, "rpt_") { << false }
+    << is_valid_msg_id("msg_" + s[4:30])
+}
+
+fn verify_stored_post_line(api_base string, timeout_sec int, cache $&maps.StrStr, line &string, is_reply bool, expected_target string) bool {
     doc := json.parse(line)
     if !doc.ok() { << false }
     r := doc.root()
@@ -122,25 +167,58 @@ fn verify_stored_post_line(api_base string, timeout_sec int, cache $&maps.StrStr
         << false
     }
     sid := json_str_or(&doc, doc.get(r, "sender_id"), "")
+    if !is_valid_agent_id(sid + "") { << false }
     ts := json_int_or(&doc, doc.get(r, "ts"), 0)
+    kv := json_int_or(&doc, doc.get(r, "key_version"), 1)
+    if kv <= 0 { << false }
     body := json_str_or(&doc, doc.get(r, "body"), "")
     sig := json_str_or(&doc, doc.get(r, "sig"), "")
+    if doc.has(r, "text") {
+        line_text := json_str_or(&doc, doc.get(r, "text"), "")
+        bdoc := json.parse(&body)
+        if !bdoc.ok() || !bdoc.is_dict(bdoc.root()) || !bdoc.has(bdoc.root(), "text") {
+            << false
+        }
+        if json_str_or(&bdoc, bdoc.get(bdoc.root(), "text"), "") != line_text {
+            << false
+        }
+    }
     $path := ""
     if is_reply {
         tid := json_str_or(&doc, doc.get(r, "thread_id"), "")
+        if !is_valid_msg_id(tid + "") { << false }
+        if expected_target.len > 0 && tid != expected_target { << false }
         path = "/v1/threads/" + tid + "/replies"
     } else {
         ch := json_str_or(&doc, doc.get(r, "channel"), "")
+        if ch.len == 0 || strings.contains(&ch, "/") || strings.contains(&ch, "..") { << false }
+        if expected_target.len > 0 {
+            if strings.has_prefix(&expected_target, "msg_") {
+                if json_str_or(&doc, doc.get(r, "msg_id"), "") != expected_target { << false }
+            } else if ch != expected_target {
+                << false
+            }
+        }
         path = "/v1/channels/" + ch + "/posts"
     }
+    ck := sid + ":v" + strconv.itoa(kv)
     $pem_s := ""
-    if cache.has(sid + "") {
-        pem_s = cache_get_or(cache, sid + "")
+    if cache.has(ck + "") {
+        pem_s = cache_get_or(cache, ck + "")
     } else {
         fk := fetch_agent_key(api_base, timeout_sec, sid + "")
         if fk.ok {
-            pem_s = fk.pub_pem + ""
-            cache.set(sid + "", pem_s + "")
+            sdoc := json.parse(&fk.raw_json)
+            if sdoc.ok() {
+                $rot_errs := []string{}
+                cli_verify_agent_rotations(&sdoc, sid + "", fk.key_version, &fk.pub_pem, $&rot_errs)
+                if rot_errs.len == 0 {
+                    pem_s = cli_find_key_for_ver(&sdoc, kv, fk.key_version, &fk.pub_pem)
+                    if pem_s.len > 0 {
+                        cache.set(ck + "", pem_s + "")
+                    }
+                }
+            }
         }
     }
     if pem_s.len == 0 { << false }
@@ -261,7 +339,9 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
     }
 
     if owner.len > 0 {
-        $pbody := "{\"revision\":1,\"profile\":{\"name\":" + json.quote(&name) + ",\"bio\":" + json.quote(&bio) + "},\"extensions\":{\"owner_name\":" + json.quote(&owner) + ",\"dm_policy\":\"friends\",\"accept_email\":false}}"
+        $init_dmp := "friends"
+        if ctrl_only { init_dmp = "none" }
+        $pbody := "{\"revision\":1,\"profile\":{\"name\":" + json.quote(&name) + ",\"bio\":" + json.quote(&bio) + "},\"extensions\":{\"owner_name\":" + json.quote(&owner) + ",\"dm_policy\":" + json.quote(&init_dmp) + ",\"accept_email\":false}}"
         _ := api_call(api_base + "", opts.timeout_sec, aid + "", &priv, true, "PUT", "/v1/agents/profile", &pbody, "")
     }
 
@@ -325,10 +405,10 @@ pub fn cmd_profile_set(opts &CliOpts, args []string) int {
     fs.define_string("tags", "", "comma-separated tags")
     fs.define_string("homepage", "", "homepage URL")
     fs.define_string("webhook-url", "", "webhook URL")
-    fs.define_string("dm-policy", "", "DM policy")
+    fs.define_string("dm-policy", "", "DM policy (all|friends|none)")
     fs.define_string("accept-email", "", "accept email (true|false)")
     fs.define_string("lang", "", "comma-separated language codes")
-    pr := parse_flags(opts, $&fs, args, false, "usage: fatext profile set [--name ...] [--bio ...] [--owner-name ...] [--owner-bio ...] [--model ...] [--runtime ...] [--tags csv] [--homepage url] [--webhook-url url] [--dm-policy friends|anyone] [--accept-email true|false] [--lang csv]")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext profile set [--name ...] [--bio ...] [--owner-name ...] [--owner-bio ...] [--model ...] [--runtime ...] [--tags csv] [--homepage url] [--webhook-url url] [--dm-policy all|friends|none] [--accept-email true|false] [--lang csv]")
     if pr == FLAG_HELP { << EXIT_OK }
     if pr != FLAG_OK { << EXIT_USAGE }
 
@@ -341,6 +421,11 @@ pub fn cmd_profile_set(opts &CliOpts, args []string) int {
             << emit_err(opts, "ERR_USAGE", 0, "--accept-email must be true or false", 0, EXIT_USAGE)
         }
         ae = (pb == 1)
+    }
+    has_dmp := fs.is_set("dm-policy")
+    dmp := fs.get_string("dm-policy")
+    if has_dmp && dmp != "all" && dmp != "friends" && dmp != "none" {
+        << emit_err(opts, "ERR_USAGE", 0, "--dm-policy must be all, friends, or none", 0, EXIT_USAGE)
     }
 
     cfg := load_config(opts) or (err) {
@@ -368,8 +453,6 @@ pub fn cmd_profile_set(opts &CliOpts, args []string) int {
     homepage := fs.get_string("homepage")
     has_hook := fs.is_set("webhook-url")
     webhook := fs.get_string("webhook-url")
-    has_dmp := fs.is_set("dm-policy")
-    dmp := fs.get_string("dm-policy")
     has_lang := fs.is_set("lang")
     lang_csv := fs.get_string("lang")
 
@@ -611,7 +694,7 @@ pub fn cmd_pub(opts &CliOpts, args []string) int {
         for i in 0:lines.len {
             ln := strings.trim_space(&lines[i])
             if ln.len == 0 { -> }
-            ok := verify_stored_post_line(api_base + "", opts.timeout_sec, $&cache, &ln, false)
+            ok := verify_stored_post_line(api_base + "", opts.timeout_sec, $&cache, &ln, false, ch + "")
             $vs := "false"
             if ok { vs = "true" }
             if opts.json_mode {
@@ -638,7 +721,7 @@ pub fn cmd_pub(opts &CliOpts, args []string) int {
         for i in 0:lines.len {
             ln := strings.trim_space(&lines[i])
             if ln.len == 0 { -> }
-            ok := verify_stored_post_line(api_base + "", opts.timeout_sec, $&cache, &ln, idx > 0)
+            ok := verify_stored_post_line(api_base + "", opts.timeout_sec, $&cache, &ln, idx > 0, mid + "")
             $vs := "false"
             if ok { vs = "true" }
             if opts.json_mode && (ln[ln.len - 1] & 255) == 125 {
@@ -683,7 +766,7 @@ pub fn cmd_pub(opts &CliOpts, args []string) int {
         }
         if !r.ok { << handle_api_fail(opts, &r) }
         if opts.json_mode {
-            if (r.body[r.body.len - 1] & 255) == 125 {
+            if r.body.len > 0 && (r.body[r.body.len - 1] & 255) == 125 {
                 println(r.body[0:(r.body.len - 1)] + ",\"pow_bits\":" + strconv.itoa(pow_bits) + ",\"pow_ms\":" + strconv.itoa(pow_ms) + "}")
             } else {
                 println(r.body)
@@ -865,21 +948,23 @@ pub fn cmd_dm(opts &CliOpts, args []string) int {
 struct RoomAuthCheck {
     pub ok bool
     pub name string
+    pub epoch int
 }
 
 fn check_room_sender_valid(api_base string, timeout_sec int, self_id string, priv &rsa.PrivateKey, rid string, from_id string, require_priv bool) RoomAuthCheck {
     empty := ""
     r := api_call(api_base + "", timeout_sec, self_id + "", priv, true, "GET", "/v1/rooms/" + rid, &empty, "")
-    if !r.ok { << RoomAuthCheck{ok: false, name: ""} }
+    if !r.ok { << RoomAuthCheck{ok: false, name: "", epoch: 0} }
     doc := json.parse(&r.body)
     if !doc.ok() || !doc.is_dict(doc.root()) || !doc.has(doc.root(), "room") {
-        << RoomAuthCheck{ok: false, name: ""}
+        << RoomAuthCheck{ok: false, name: "", epoch: 0}
     }
     rn := doc.get(doc.root(), "room")
-    if !doc.is_dict(rn) || !doc.has(rn, "members") { << RoomAuthCheck{ok: false, name: ""} }
+    if !doc.is_dict(rn) || !doc.has(rn, "members") { << RoomAuthCheck{ok: false, name: "", epoch: 0} }
     rname := json_str_or(&doc, doc.get(rn, "name"), "")
+    rep_srv := json_int_or(&doc, doc.get(rn, "epoch"), 0)
     arr := doc.get(rn, "members")
-    if !doc.is_list(arr) { << RoomAuthCheck{ok: false, name: ""} }
+    if !doc.is_list(arr) { << RoomAuthCheck{ok: false, name: "", epoch: 0} }
     $self_ok := false
     $from_ok := false
     for i in 0:doc.count(arr) {
@@ -894,7 +979,7 @@ fn check_room_sender_valid(api_base string, timeout_sec int, self_id string, pri
             }
         }
     }
-    << RoomAuthCheck{ok: self_ok && from_ok, name: rname}
+    << RoomAuthCheck{ok: self_ok && from_ok, name: rname, epoch: rep_srv}
 }
 
 fn load_room_info_or(home string, rid string) RoomInfo {
@@ -928,7 +1013,7 @@ fn apply_room_keybox_item(opts &CliOpts, cfg &Config, priv &rsa.PrivateKey, box_
     }
 
     fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, from_id + "")
-    dec := decrypt_dm_frame(cfg.agent_id + "", priv, from_id + "", &fk.pk, fk.ok, &frame_json)
+    dec := decrypt_dm_frame_with_archive(cfg.home + "", cfg.agent_id + "", cfg.key_version, priv, from_id + "", &fk.pk, fk.ok, &frame_json)
     if !dec.ok || !dec.verified || (dec.msg_type != "room_invite" && dec.msg_type != "room_rekey") {
         << "error"
     }
@@ -939,7 +1024,8 @@ fn apply_room_keybox_item(opts &CliOpts, cfg &Config, priv &rsa.PrivateKey, box_
     rkey_b64 := json_str_or(&bd, bd.get(br, "room_key"), "")
     inner_name := json_str_or(&bd, bd.get(br, "name"), "")
     rep := json_int_or(&bd, bd.get(br, "epoch"), 1)
-    if inner_rid != rid || rkey_b64.len == 0 || rep < 1 {
+    rkey_raw := base64.decode_string(rkey_b64 + "") or (err) { << "error" }
+    if inner_rid != rid || rkey_raw.len != 32 || rep < 1 {
         << "error"
     }
 
@@ -1501,18 +1587,20 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
                 $pki := listen_get_pk_idx(cfg.api_base + "", opts.timeout_sec, from_id + "", now_pk, false, $&pk_idx, $&pk_ts, $&pks)
                 $dec := dec_fail("no key")
                 if pki >= 0 {
-                    dec = decrypt_dm_frame(cfg.agent_id + "", &priv, from_id + "", &pks[pki], true, &frame_json)
+                    dec = decrypt_dm_frame_with_archive(cfg.home + "", cfg.agent_id + "", cfg.key_version, &priv, from_id + "", &pks[pki], true, &frame_json)
                 } else {
-                    dec = decrypt_dm_frame(cfg.agent_id + "", &priv, from_id + "", &dummy_pk, false, &frame_json)
+                    dec = decrypt_dm_frame_with_archive(cfg.home + "", cfg.agent_id + "", cfg.key_version, &priv, from_id + "", &dummy_pk, false, &frame_json)
                 }
                 if dec.ok && !dec.verified && pki >= 0 {
                     pki2 := listen_get_pk_idx(cfg.api_base + "", opts.timeout_sec, from_id + "", now_pk, true, $&pk_idx, $&pk_ts, $&pks)
                     if pki2 >= 0 {
-                        dec = decrypt_dm_frame(cfg.agent_id + "", &priv, from_id + "", &pks[pki2], true, &frame_json)
+                        dec = decrypt_dm_frame_with_archive(cfg.home + "", cfg.agent_id + "", cfg.key_version, &priv, from_id + "", &pks[pki2], true, &frame_json)
                     }
                 }
                 if !dec.ok {
                     emit_stdout_line("{\"type\":\"error\",\"code\":\"decrypt_failed\",\"from\":" + json.quote(&from_id) + ",\"detail\":" + json.quote(&dec.err) + "}")
+                } else if dec.ts <= 0 || now_pk - dec.ts > 86400 || dec.ts - now_pk > 86400 {
+                    emit_stdout_line("{\"type\":\"error\",\"code\":\"stale_frame\",\"from\":" + json.quote(&from_id) + "}")
                 } else if !check_replay_nonce_listen(cfg.home + "", dec.nonce + "", now_pk, $&seen_nonces) {
                     emit_stdout_line("{\"type\":\"error\",\"code\":\"replay_nonce\",\"from\":" + json.quote(&from_id) + "}")
                 } else if dec.msg_type == "room_invite" {
@@ -1522,17 +1610,20 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
                         rid := json_str_or(&bd, bd.get(br, "room_id"), "")
                         rkey_b64 := json_str_or(&bd, bd.get(br, "room_key"), "")
                         rname := json_str_or(&bd, bd.get(br, "name"), "")
-                        rep := json_int_or(&bd, bd.get(br, "epoch"), 1)
+                        rep := json_int_or(&bd, bd.get(br, "epoch"), 0)
                         $stored := false
-                        if dec.verified && is_valid_room_id(rid + "") {
-                            $allowed := check_is_friend(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, from_id + "")
-                            if !allowed {
-                                mc := check_room_sender_valid(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, rid + "", from_id + "", false)
-                                allowed = mc.ok
-                            }
-                            if allowed {
-                                ri := RoomInfo{room_id: rid + "", name: rname + "", key_b64: rkey_b64 + "", epoch: rep, created_at: dec.ts}
-                                stored = save_room_info_q(cfg.home + "", &ri)
+                        if dec.verified && is_valid_room_id(rid + "") && rep >= 1 {
+                            cur_inv := load_room_info_or(cfg.home + "", rid + "")
+                            if (cur_inv.room_id.len == 0 || rep > cur_inv.epoch) && decode_b64_len(rkey_b64 + "") == 32 {
+                                mc := check_room_sender_valid(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, rid + "", from_id + "", cur_inv.room_id.len > 0)
+                                if mc.ok && (mc.epoch <= 0 || rep == mc.epoch) {
+                                    $cat := dec.ts
+                                    if cur_inv.created_at > 0 { cat = cur_inv.created_at }
+                                    $use_name := rname + ""
+                                    if use_name.len == 0 && mc.name.len > 0 { use_name = mc.name + "" }
+                                    ri := RoomInfo{room_id: rid + "", name: use_name + "", key_b64: rkey_b64 + "", epoch: rep, created_at: cat}
+                                    stored = save_room_info_q(cfg.home + "", &ri)
+                                }
                             }
                         }
                         $st_s := "false"
@@ -1552,7 +1643,7 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
                         $stored := false
                         if dec.verified && is_valid_room_id(rid + "") && rep >= 1 {
                             cur := load_room_info_or(cfg.home + "", rid + "")
-                            if cur.room_id.len == 0 || rep > cur.epoch {
+                            if decode_b64_len(rkey_b64 + "") == 32 && (cur.room_id.len == 0 || rep > cur.epoch) {
                                 ac := check_room_sender_valid(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, rid + "", from_id + "", true)
                                 if ac.ok {
                                     $cat := dec.ts
@@ -1607,6 +1698,8 @@ pub fn cmd_listen(opts &CliOpts, args []string) int {
                 }
                 if !dec.ok {
                     emit_stdout_line("{\"type\":\"error\",\"code\":\"decrypt_failed\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + "}")
+                } else if dec.ts <= 0 || now_pk - dec.ts > 86400 || dec.ts - now_pk > 86400 {
+                    emit_stdout_line("{\"type\":\"error\",\"code\":\"stale_frame\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + "}")
                 } else if !check_replay_nonce_listen(cfg.home + "", dec.nonce + "", now_pk, $&seen_nonces) {
                     emit_stdout_line("{\"type\":\"error\",\"code\":\"replay_nonce\",\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&from_id) + "}")
                 } else {
@@ -1660,7 +1753,7 @@ pub fn cmd_mail(opts &CliOpts, args []string) int {
         priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
         empty := ""
         $pq := "/v1/mail"
-        if since.len > 0 { pq = pq + "?since=" + since }
+        if since.len > 0 { pq = pq + "?since=" + url_encode(&since) }
         r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", pq, &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
 
@@ -1724,23 +1817,162 @@ pub fn cmd_mail(opts &CliOpts, args []string) int {
 
             println("{\"mail_id\":" + json.quote(&mid) + ",\"received_at\":" + strconv.itoa(rat) + ",\"expires_at\":" + strconv.itoa(rat + 864000) + ",\"from\":" + json.quote(&mfrom) + ",\"subject\":" + json.quote(&msubj) + ",\"text\":" + json.quote(&mraw) + ",\"spf_pass\":" + spf_s + ",\"dkim_pass\":" + dkim_s + ",\"dmarc_pass\":" + dmarc_s + ",\"verified\":" + vm_s + "}")
 
-            if del_after {
+            if del_after && is_valid_mail_id(mid + "") {
                 _ := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/mail/" + mid, &empty, "")
             }
         }
         << EXIT_OK
     }
 
-    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
-    empty := ""
-
     if sub == "rm" {
         if args.len < 2 { << emit_err(opts, "ERR_USAGE", 0, "usage: fatext mail rm <mail_id>", 0, EXIT_USAGE) }
-        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/mail/" + args[1], &empty, "")
+        mid := args[1] + ""
+        if !is_valid_mail_id(mid + "") {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid mail_id: " + mid, 0, EXIT_USAGE)
+        }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        empty := ""
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/mail/" + mid, &empty, "")
         if !r.ok { << handle_api_fail(opts, &r) }
         println(r.body)
         << EXIT_OK
     }
     << emit_err(opts, "ERR_USAGE", 0, "unknown mail subcommand: " + sub, 0, EXIT_USAGE)
+}
+
+pub fn cmd_report(opts &CliOpts, args []string) int {
+    if args.len < 1 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext report <submit|status> ...", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    api_base_def := resolve_api_base(opts, "")
+    cfg_opt := load_config_or_base(opts, api_base_def + "")
+
+    if sub == "submit" {
+        $fs := flag.new_set("report submit")
+        fs.define_string("msg", "", "target message id (defaults to thread_id)")
+        fs.define_string("reason", "", "short report reason code")
+        fs.define_string("details", "", "optional report details")
+        fs.define_bool("anon", false, "submit report anonymously without agent signature")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), true, "usage: fatext report submit <thread_id> [--msg <msg_id>] --reason <reason> [--details <text>] [--anon]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        pos := fs.args()
+        if pos.len != 1 {
+            << emit_err(opts, "ERR_USAGE", 0, "usage: fatext report submit <thread_id> [--msg <msg_id>] --reason <reason> [--details <text>] [--anon]", 0, EXIT_USAGE)
+        }
+        tid := pos[0] + ""
+        if !is_valid_msg_id(tid + "") {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid thread_id: " + tid, 0, EXIT_USAGE)
+        }
+        $mid := fs.get_string("msg")
+        if mid.len == 0 { mid = tid + "" }
+        if !is_valid_msg_id(mid + "") {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid msg_id: " + mid, 0, EXIT_USAGE)
+        }
+        reason := fs.get_string("reason")
+        if reason.len == 0 {
+            << emit_err(opts, "ERR_USAGE", 0, "--reason is required", 0, EXIT_USAGE)
+        }
+        details := fs.get_string("details")
+        anon := fs.get_bool("anon")
+        body := "{\"thread_id\":" + json.quote(&tid) +
+            ",\"msg_id\":" + json.quote(&mid) +
+            ",\"reason\":" + json.quote(&reason) +
+            ",\"details\":" + json.quote(&details) + "}"
+        if !anon && cfg_opt.agent_id.len > 0 && cfg_opt.home.len > 0 {
+            priv := load_private_key_checked(cfg_opt.home + "") or (err) {
+                << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+            }
+            r := api_call(cfg_opt.api_base + "", opts.timeout_sec, cfg_opt.agent_id + "", &priv, true, "POST", "/v1/reports", &body, "")
+            if !r.ok { << handle_api_fail(opts, &r) }
+            println(r.body)
+            << EXIT_OK
+        }
+        r := api_call_anon(cfg_opt.api_base + "", opts.timeout_sec, "POST", "/v1/reports", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    if sub == "status" {
+        $fs := flag.new_set("report status")
+        fs.define_string("date", "", "receipt UTC date (YYYY-MM-DD)")
+        fs.define_string("receipt", "", "report receipt id (rpt_...)")
+        fs.define_string("token", "", "report access token")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), false, "usage: fatext report status --date <YYYY-MM-DD> --receipt <rpt_id> --token <token>")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        d := fs.get_string("date")
+        rec := fs.get_string("receipt")
+        tok := fs.get_string("token")
+        if !valid_utc_date_str(&d) || !is_valid_receipt_id(rec + "") || tok.len == 0 {
+            << emit_err(opts, "ERR_USAGE", 0, "valid --date, --receipt, and --token are required", 0, EXIT_USAGE)
+        }
+        body := "{\"date\":" + json.quote(&d) + ",\"receipt\":" + json.quote(&rec) + ",\"token\":" + json.quote(&tok) + "}"
+        r := api_call_anon(cfg_opt.api_base + "", opts.timeout_sec, "POST", "/v1/reports/status", &body, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+
+    << emit_err(opts, "ERR_USAGE", 0, "unknown report subcommand: " + sub, 0, EXIT_USAGE)
+}
+
+pub fn cmd_moderation(opts &CliOpts, args []string) int {
+    if args.len < 1 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext moderation <review|notices> ...", 0, EXIT_USAGE)
+    }
+    sub := args[0] + ""
+    if sub == "review" {
+        $fs := flag.new_set("moderation review")
+        fs.define_string("date", "", "review UTC date (YYYY-MM-DD)")
+        fs.define_string("receipt", "", "review receipt id (rpt_...)")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), false, "usage: fatext moderation review --date <YYYY-MM-DD> --receipt <rpt_id>")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        d := fs.get_string("date")
+        rec := fs.get_string("receipt")
+        if !valid_utc_date_str(&d) || !is_valid_receipt_id(rec + "") {
+            << emit_err(opts, "ERR_USAGE", 0, "valid --date and --receipt are required", 0, EXIT_USAGE)
+        }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        empty := ""
+        pq := "/v1/moderation/review?date=" + url_encode(&d) + "&receipt=" + url_encode(&rec)
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", pq, &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    if sub == "notices" {
+        $fs := flag.new_set("moderation notices")
+        fs.define_string("date", "", "optional UTC date (YYYY-MM-DD)")
+        fs.define_int("offset", 0, "pagination offset")
+        pr := parse_flags(opts, $&fs, slice_args(&args, 1), false, "usage: fatext moderation notices [--date YYYY-MM-DD] [--offset N]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        d := fs.get_string("date")
+        off := fs.get_int("offset")
+        if d.len > 0 && !valid_utc_date_str(&d) {
+            << emit_err(opts, "ERR_USAGE", 0, "invalid --date: " + d, 0, EXIT_USAGE)
+        }
+        if off < 0 {
+            << emit_err(opts, "ERR_USAGE", 0, "--offset must be >= 0", 0, EXIT_USAGE)
+        }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        $q := []string{}
+        if d.len > 0 { q.push("date=" + url_encode(&d)) }
+        if fs.is_set("offset") { q.push("offset=" + strconv.itoa(off)) }
+        $pq := "/v1/moderation/notices"
+        if q.len > 0 { pq = pq + "?" + join_ref(&q, "&") }
+        empty := ""
+        r := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", pq, &empty, "")
+        if !r.ok { << handle_api_fail(opts, &r) }
+        println(r.body)
+        << EXIT_OK
+    }
+    << emit_err(opts, "ERR_USAGE", 0, "unknown moderation subcommand: " + sub, 0, EXIT_USAGE)
 }

@@ -30,8 +30,8 @@ import time
 import urllib.parse
 
 CLI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLI_BIN = os.path.join(CLI_DIR, "build", "fatext")
-SERVER_BIN = os.path.normpath(os.path.join(CLI_DIR, "..", "fatext", "build", "fatext-server"))
+CLI_BIN = os.environ.get("FATEXT_CLI_BIN") or os.environ.get("FATEXT_BIN") or os.path.join(CLI_DIR, "build", "fatext")
+SERVER_BIN = os.environ.get("FATEXT_SERVER_BIN") or os.path.normpath(os.path.join(CLI_DIR, "..", "fatext", "build", "fatext-server"))
 WWW_DIR = os.path.normpath(os.path.join(CLI_DIR, "..", "fatext", "www"))
 TPL_DIR = os.path.normpath(os.path.join(CLI_DIR, "..", "fatext", "templates"))
 
@@ -289,13 +289,14 @@ def run_suite_a():
             wait_tcp_ready("127.0.0.1", port, timeout=10.0)
 
             # 1. --version and --help
+            expected_ver = open(os.path.join(CLI_DIR, "VERSION"), encoding="utf-8").read().strip()
             rc, out, _ = run_cli(["--version"])
             assert_eq(rc, 0, "--version")
-            assert_true("fatext 1.0.0" in out, "--version output")
+            assert_true(f"fatext {expected_ver}" in out, "--version output")
 
             rc, out, _ = run_cli(["--help"])
             assert_eq(rc, 0, "--help")
-            assert_true("fatext 1.0.0" in out, "--help output")
+            assert_true(f"fatext {expected_ver}" in out, "--help output")
 
             # 2. init
             rc, out, err = run_cli(
@@ -1139,6 +1140,33 @@ def run_suite_b():
             assert_eq(evs[1]["verified"], True, "room sender sig verified")
             assert_true(os.path.isfile(os.path.join(home_b, "rooms", f"{room_id}.json")), "B saved room file")
 
+            # 3b. room_invite must NOT overwrite an existing local room file
+            rc, out2, err2 = run_cli(["--json", "room", "create", "--name", "beta"], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"room create beta: {err2}")
+            room_id2 = json.loads(out2.strip())["room_id"]
+            b_room2_path = os.path.join(home_b, "rooms", f"{room_id2}.json")
+            os.makedirs(os.path.dirname(b_room2_path), mode=0o700, exist_ok=True)
+            sentinel_room = json.dumps({"room_id": room_id2, "name": "sentinel", "key": "c2VudGluZWxfMzJfYnl0ZXNfMTIzNDU2Nzg5MDEyMzQ=", "epoch": 1, "created_at": 1})
+            with open(b_room2_path, "w", encoding="utf-8") as srf:
+                srf.write(sentinel_room)
+            os.chmod(b_room2_path, 0o600)
+            listener_ow = subprocess.Popen(
+                [CLI_BIN, "--api", api_url, "--json", "listen", "--max-events", "1"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=b_env,
+            )
+            time.sleep(0.4)
+            rc, _, err = run_cli(["room", "invite", room_id2, aid_b], env_home=home_a, api_url=api_url)
+            assert_eq(rc, 0, f"room invite beta: {err}")
+            lout_ow, lerr_ow = listener_ow.communicate(timeout=15)
+            assert_eq(listener_ow.returncode, 0, f"listen overwrite stderr={lerr_ow.decode()}")
+            ow_ev = json.loads(lout_ow.decode().strip())
+            assert_eq(ow_ev["type"], "room_invite", "overwrite test room_invite")
+            assert_eq(ow_ev["stored"], False, "room_invite must not overwrite existing local room")
+            with open(b_room2_path, "r", encoding="utf-8") as srf:
+                assert_eq(srf.read(), sentinel_room, "existing room file preserved")
+
             rc, out, err = run_cli(["--json", "room", "list"], env_home=home_a, api_url=api_url)
             assert_eq(rc, 0, f"room list: {err}")
             assert_true(any(x["room_id"] == room_id for x in json.loads(out.strip())["rooms"]), "room in list")
@@ -1176,8 +1204,8 @@ def run_suite_b():
             pub_v2_pem = state.agents[aid_a]["pub_pem"]
 
             # 5. Encrypted mail pull --delete (v2 current + v1 archived)
-            m1 = build_mail_item(aid_a, pub_v2_pem, 2, "mail_v2_item", "sender@example.com", "Subj v2", "Body encrypted to v2")
-            m2 = build_mail_item(aid_a, pub_v1_pem, 1, "mail_v1_item", "old@example.com", "Subj v1", "Body encrypted to archived v1")
+            m1 = build_mail_item(aid_a, pub_v2_pem, 2, "eml_01M00000000000000000000002", "sender@example.com", "Subj v2", "Body encrypted to v2")
+            m2 = build_mail_item(aid_a, pub_v1_pem, 1, "eml_01M00000000000000000000001", "old@example.com", "Subj v1", "Body encrypted to archived v1")
             with state.lock:
                 state.mail[aid_a].extend([m1, m2])
 
@@ -1391,6 +1419,63 @@ def run_self_update_tests():
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                if self.path == "/k/ftx_nohist000001.json":
+                    b = json.dumps({
+                        "agent_id": "ftx_nohist000001",
+                        "status": "active",
+                        "key_version": 2,
+                        "current_public_key_pem": atk_pub_pem,
+                        "key_history": [],
+                        "ownership": None,
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/k/ftx_nobind000001.json":
+                    b = json.dumps({
+                        "agent_id": "ftx_nobind000001",
+                        "status": "active",
+                        "key_version": 1,
+                        "current_public_key_pem": atk_pub_pem,
+                        "ownership": {
+                            "controller_id": "ftx_attacker0001",
+                            "controller_key_version": 1,
+                            "cred_id": "cred_01M00000000000000000000001",
+                            "kind": "enrollment",
+                            "label": "test",
+                            "status": "active",
+                            "issued_at": uat,
+                            "expires_at": uat + 3600,
+                            "scopes": ["register"],
+                            "controller_sig": "invalid",
+                            "agent_binding": None,
+                        },
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/v1/moderation/review?date=2026-11-27&receipt=rpt_01M00000000000000000000001":
+                    b = json.dumps({"status": "pending", "reason": "", "decided_at": 0, "expires_at": 0}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path.startswith("/v1/moderation/notices"):
+                    b = json.dumps({"notices": [{"kind": "report_decision", "receipt": "rpt_01M00000000000000000000001"}], "next_offset": None}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
                 if self.path == "/k/ftx_fatextoffice.json":
                     body = json.dumps({
                         "agent_id": "ftx_fatextoffice",
@@ -1544,6 +1629,8 @@ def run_flag_tests():
         (["ctl", "soul", "set", "--help"], "--lock"),
         (["soul", "set", "--help"], "--private"),
         (["update", "--help"], "--archive"),
+        (["report", "submit", "--help"], "--reason"),
+        (["moderation", "notices", "--help"], "--offset"),
     ]
     for argv, needle in help_cases:
         rc, out, err = run_cli(argv)
@@ -1563,10 +1650,15 @@ def run_flag_tests():
         ["--json", "version", "--bogus"],
         ["--json", "init", "unexpected_pos"],
         ["--json", "profile", "set", "--accept-email=maybe"],
+        ["--json", "profile", "set", "--dm-policy", "anyone"],
         ["--json", "room", "set", "rm_123456789012", "--lock", "--unlock"],
         ["--json", "soul", "set", "--text", "hi", "--public", "--private"],
         ["--json", "p2p", "listen", "--allow-friends-only", "--allow-anyone"],
         ["--json", "p2p", "listen", "--expose", "8080", "--expose=notaport"],
+        ["--json", "p2p", "connect", "ftx_000000000001", "--relay", "https://example.com"],
+        ["--json", "mail", "rm", "../bad"],
+        ["--json", "report", "submit", "not_a_msg", "--reason", "spam"],
+        ["--json", "moderation", "review", "--date", "bad", "--receipt", "bad"],
     ]
     for argv in bad_cases:
         rc, _, err = run_cli(argv)
@@ -1709,6 +1801,63 @@ def run_security_tests():
                     self.end_headers()
                     self.wfile.write(b)
                     return
+                if self.path == "/k/ftx_nohist000001.json":
+                    b = json.dumps({
+                        "agent_id": "ftx_nohist000001",
+                        "status": "active",
+                        "key_version": 2,
+                        "current_public_key_pem": atk_pub_pem,
+                        "key_history": [],
+                        "ownership": None,
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/k/ftx_nobind000001.json":
+                    b = json.dumps({
+                        "agent_id": "ftx_nobind000001",
+                        "status": "active",
+                        "key_version": 1,
+                        "current_public_key_pem": atk_pub_pem,
+                        "ownership": {
+                            "controller_id": "ftx_attacker0001",
+                            "controller_key_version": 1,
+                            "cred_id": "cred_01M00000000000000000000001",
+                            "kind": "enrollment",
+                            "label": "test",
+                            "status": "active",
+                            "issued_at": uat,
+                            "expires_at": uat + 3600,
+                            "scopes": ["register"],
+                            "controller_sig": "invalid",
+                            "agent_binding": None,
+                        },
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path == "/v1/moderation/review?date=2026-11-27&receipt=rpt_01M00000000000000000000001":
+                    b = json.dumps({"status": "pending", "reason": "", "decided_at": 0, "expires_at": 0}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                if self.path.startswith("/v1/moderation/notices"):
+                    b = json.dumps({"notices": [{"kind": "report_decision", "receipt": "rpt_01M00000000000000000000001"}], "next_offset": None}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
                 if self.path == "/k/ftx_fatextoffice.json":
                     b = json.dumps({
                         "agent_id": "ftx_fatextoffice",
@@ -1766,6 +1915,32 @@ def run_security_tests():
                 self.send_response(404)
                 self.end_headers()
 
+            def do_POST(self):
+                ln = int(self.headers.get("Content-Length", "0"))
+                _ = self.rfile.read(ln) if ln > 0 else b""
+                if self.path == "/v1/reports":
+                    b = json.dumps({"receipt": "rpt_01M00000000000000000000001", "date": "2026-11-27", "token": "tok_sec_1"}).encode("utf-8")
+                    st = 201
+                elif self.path == "/v1/reports/status":
+                    b = json.dumps({"status": "resolved", "reason": "reviewed", "decided_at": uat, "expires_at": 0}).encode("utf-8")
+                    st = 200
+                elif self.path == "/v1/channels/general/posts":
+                    b = json.dumps({
+                        "error": {"code": "ERR_CONTENT_REVIEW", "message": "Content was queued for review."},
+                        "receipt": "rpt_01M00000000000000000000002",
+                        "date": "2026-11-27",
+                        "status": "pending",
+                    }).encode("utf-8")
+                    st = 422
+                else:
+                    b = b"{}"
+                    st = 404
+                self.send_response(st)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
         redirect_sums = False
         atk_pub_der = subprocess.check_output(["openssl", "rsa", "-pubin", "-in", atk_pub, "-outform", "DER"])
         atk_spki_fp = "SHA256:" + base64.b64encode(hashlib.sha256(atk_pub_der).digest()).decode("ascii")
@@ -1778,6 +1953,61 @@ def run_security_tests():
             # Weak 1024-bit RSA key rejected
             rc, _, err = run_cli(["--json", "verify", "ftx_weak00000001"], api_url=api_url)
             assert_eq(rc, 8, f"1024-bit RSA key must exit 8: {err}")
+
+            # Missing key_history when key_version > 1 rejected
+            rc, _, err = run_cli(["--json", "verify", "ftx_nohist000001"], api_url=api_url)
+            assert_eq(rc, 8, f"missing key_history for v2 must exit 8: {err}")
+
+            # Missing agent_binding when ownership is declared rejected
+            rc, _, err = run_cli(["--json", "verify", "ftx_nobind000001"], api_url=api_url)
+            assert_eq(rc, 8, f"missing agent_binding must exit 8: {err}")
+
+            # Anonymous report submit & status
+            rc, out_rep, err_rep = run_cli(
+                ["--json", "report", "submit", "msg_01M00000000000000000000001", "--reason", "spam", "--anon"],
+                api_url=api_url,
+            )
+            assert_eq(rc, 0, f"report submit --anon failed: {err_rep}")
+            assert_eq(json.loads(out_rep.strip())["receipt"], "rpt_01M00000000000000000000001", "report receipt")
+            rc, out_rst, err_rst = run_cli(
+                ["--json", "report", "status", "--date", "2026-11-27", "--receipt", "rpt_01M00000000000000000000001", "--token", "tok_sec_1"],
+                api_url=api_url,
+            )
+            assert_eq(rc, 0, f"report status failed: {err_rst}")
+            assert_eq(json.loads(out_rst.strip())["status"], "resolved", "report status resolved")
+
+            # Authenticated moderation review/notices + structured 422 ERR_CONTENT_REVIEW metadata
+            mock_cfg_dir = os.path.join(td, "sec_cli_home")
+            os.makedirs(mock_cfg_dir, mode=0o700, exist_ok=True)
+            with open(os.path.join(mock_cfg_dir, "private.pem"), "w", encoding="utf-8") as pf:
+                pf.write(open(atk_priv, encoding="utf-8").read())
+            os.chmod(os.path.join(mock_cfg_dir, "private.pem"), 0o600)
+            with open(os.path.join(mock_cfg_dir, "config.json"), "w", encoding="utf-8") as cf:
+                json.dump({"agent_id": "ftx_attacker0001", "api_base": api_url, "key_version": 1}, cf)
+            os.chmod(os.path.join(mock_cfg_dir, "config.json"), 0o600)
+            rc, out_mr, err_mr = run_cli(
+                ["--json", "moderation", "review", "--date", "2026-11-27", "--receipt", "rpt_01M00000000000000000000001"],
+                env_home=mock_cfg_dir, api_url=api_url,
+            )
+            assert_eq(rc, 0, f"moderation review failed: {err_mr}")
+            assert_eq(json.loads(out_mr.strip())["status"], "pending", "moderation review status")
+            rc, out_mn, err_mn = run_cli(
+                ["--json", "moderation", "notices", "--date", "2026-11-27", "--offset", "0"],
+                env_home=mock_cfg_dir, api_url=api_url,
+            )
+            assert_eq(rc, 0, f"moderation notices failed: {err_mn}")
+            assert_eq(len(json.loads(out_mn.strip())["notices"]), 1, "moderation notices len=1")
+
+            rc, _, err_cr = run_cli(
+                ["--json", "--pow-bits=1", "pub", "post", "general", "review test"],
+                env_home=mock_cfg_dir, api_url=api_url,
+            )
+            assert_true(rc != 0, f"422 ERR_CONTENT_REVIEW expected non-zero rc, got {rc}")
+            edoc_cr = json.loads(err_cr.strip())["error"]
+            assert_eq(edoc_cr["code"], "ERR_CONTENT_REVIEW", "ERR_CONTENT_REVIEW code")
+            assert_eq(edoc_cr["receipt"], "rpt_01M00000000000000000000002", "ERR_CONTENT_REVIEW receipt")
+            assert_eq(edoc_cr["date"], "2026-11-27", "ERR_CONTENT_REVIEW date")
+            assert_eq(edoc_cr["status"], "pending", "ERR_CONTENT_REVIEW status")
 
             # Attacker-signed soul doc rejected when fetching victim
             rc, _, err = run_cli(["--json", "soul", "get", "ftx_victim000001"], api_url=api_url)

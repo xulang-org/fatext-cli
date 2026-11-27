@@ -2,6 +2,7 @@
 
 #errors
 #os
+#path/filepath
 #crypto/rsa
 #encoding/json
 #encoding/base64
@@ -104,7 +105,7 @@ fn remove_quiet(path string) {
 
 pub fn ensure_dir_mode(dir string, mode int) int {
     os.mkdir_all(dir + "") or >>
-    if os.getenv("OS") != "Windows_NT" {
+    if xu_target_os() != 2 {
         os.chmod(dir + "", mode) or >>
     }
     << 0
@@ -114,7 +115,7 @@ pub fn write_atomic_mode(path string, data &string, mode int) int {
     tmp := path + ".tmp." + strconv.itoa(os.getpid()) + "." + strconv.itoa(time.now())
     empty := ""
     os.write(tmp + "", empty) or >>
-    if os.getenv("OS") != "Windows_NT" {
+    if xu_target_os() != 2 {
         os.chmod(tmp + "", mode) or (err) {
             remove_quiet(tmp + "")
             >> err
@@ -124,7 +125,21 @@ pub fn write_atomic_mode(path string, data &string, mode int) int {
         remove_quiet(tmp + "")
         >> err
     }
-    os.rename(tmp + "", path) or (err) {
+    os.rename(tmp + "", path + "") or (err) {
+        if xu_target_os() == 2 {
+            bak := path + ".old." + strconv.itoa(os.getpid()) + "." + strconv.itoa(time.now())
+            os.rename(path + "", bak + "") or (e_bak) {
+                remove_quiet(tmp + "")
+                >> err
+            }
+            os.rename(tmp + "", path + "") or (e_new) {
+                _ := os.rename(bak + "", path + "") or (e_rest) { << 0 }
+                remove_quiet(tmp + "")
+                >> e_new
+            }
+            remove_quiet(bak + "")
+            << 0
+        }
         remove_quiet(tmp + "")
         >> err
     }
@@ -152,6 +167,55 @@ pub fn emit_err(opts &CliOpts, code string, http_status int, msg string, retry_a
     << exit_code
 }
 
+pub fn emit_api_err(opts &CliOpts, r &ApiResp, exit_code int) int {
+    if r.net_err {
+        << emit_err(opts, r.err_code + "", 0, r.err_msg + "", 0, EXIT_NET)
+    }
+    code := r.err_code + ""
+    msg := r.err_msg + ""
+    if opts.json_mode {
+        $s := "{\"ok\":false,\"error\":{\"code\":" + json.quote(&code)
+        if r.status > 0 {
+            s = s + ",\"http\":" + strconv.itoa(r.status)
+        }
+        s = s + ",\"message\":" + json.quote(&msg)
+        if r.retry_after > 0 {
+            s = s + ",\"retry_after\":" + strconv.itoa(r.retry_after)
+        }
+        if r.reset_at > 0 {
+            s = s + ",\"reset_at\":" + strconv.itoa(r.reset_at)
+        }
+        if r.receipt.len > 0 {
+            s = s + ",\"receipt\":" + json.quote(&r.receipt)
+        }
+        if r.review_date.len > 0 {
+            s = s + ",\"date\":" + json.quote(&r.review_date)
+        }
+        if r.review_status.len > 0 {
+            s = s + ",\"status\":" + json.quote(&r.review_status)
+        }
+        s = s + "}}"
+        eprintln(s)
+    } else {
+        eprintln("error [" + code + "]: " + msg)
+        if r.retry_after > 0 {
+            eprintln("retry_after=" + strconv.itoa(r.retry_after))
+        }
+        if r.reset_at > 0 {
+            eprintln("reset_at=" + strconv.itoa(r.reset_at))
+        }
+        if r.review_date.len > 0 && r.receipt.len > 0 {
+            eprintln("receipt=" + r.review_date + "/" + r.receipt)
+        } else if r.receipt.len > 0 {
+            eprintln("receipt=" + r.receipt)
+        }
+        if r.review_status.len > 0 {
+            eprintln("status=" + r.review_status)
+        }
+    }
+    << exit_code
+}
+
 pub fn map_http_exit_code(status int, code string) int {
     if status == 429 { << EXIT_RATE_LIMIT }
     if status == 401 { << EXIT_AUTH }
@@ -167,12 +231,7 @@ pub fn map_http_exit_code(status int, code string) int {
 }
 
 fn dirname_of(p string) string {
-    $last := -1
-    for i in 0:p.len {
-        if (p[i] & 255) == 47 { last = i }
-    }
-    if last <= 0 { << "." }
-    << p[0:last]
+    << filepath.dir(p)
 }
 
 pub fn resolve_home(opts &CliOpts) string {
@@ -249,7 +308,7 @@ pub fn save_config(cfg_path string, cfg &Config) int {
 
 pub fn check_private_key_perms(path string) int {
     info := os.stat(path) or >>
-    if os.getenv("OS") == "Windows_NT" {
+    if xu_target_os() == 2 {
         << 0
     }
     if (info.mode & 63) != 0 {
@@ -309,6 +368,7 @@ pub fn load_room_info(home string, room_id string) RoomInfo {
         >> errors.new("invalid room_id")
     }
     rpath := home + "/rooms/" + room_id + ".json"
+    check_private_key_perms(rpath + "") or >>
     raw := os.read(rpath) or >>
     doc := json.parse(&raw)
     if !doc.ok() { >> errors.new("invalid room file") }
@@ -417,6 +477,16 @@ pub fn is_valid_room_id(s string) bool {
     for i in 5:31 {
         c := s[i] & 255
         ok := (c >= 97 && c <= 122) || (c >= 50 && c <= 55)
+        if !ok { << false }
+    }
+    << true
+}
+
+pub fn is_valid_mail_id(s string) bool {
+    if s.len != 30 || !strings.has_prefix(&s, "eml_") { << false }
+    for i in 4:30 {
+        c := s[i] & 255
+        ok := (c >= 48 && c <= 57) || (c >= 65 && c <= 90 && c != 73 && c != 76 && c != 79 && c != 85)
         if !ok { << false }
     }
     << true

@@ -529,6 +529,9 @@ class UdpNatSim:
         tamper_inject: bool = False,
         migrate_after_packets: int = 0,
         migrate_target_index: int = 0,
+        replay_spoof_after: int = 0,
+        replay_target_index: int = 1,
+        drop_real_after_replay: bool = False,
     ):
         self.nat_mode = nat_mode
         self.stun_attr_mode = stun_attr_mode
@@ -543,6 +546,9 @@ class UdpNatSim:
         self.tamper_inject = tamper_inject
         self.migrate_after_packets = migrate_after_packets
         self.migrate_target_index = migrate_target_index
+        self.replay_spoof_after = replay_spoof_after
+        self.replay_target_index = replay_target_index
+        self.drop_real_after_replay = drop_real_after_replay
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -563,19 +569,35 @@ class UdpNatSim:
         self._tx_counts = {}     # src_real -> count of forwarded packets
         self._drop_remaining = drop_first_packets
         self._migrated_real = set()
+        self._captured_pkts = []
+        self._replay_started = False
+        self._blackhole = False
+        self._atk_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._atk_sock.bind(("127.0.0.1", 0))
+        self._atk_rx_count = 0
         self._threads = []
-        self.stats = {"stun_reqs": 0, "tx": 0, "dropped": 0, "tampered": 0, "migrated": 0}
+        self.stats = {
+            "stun_reqs": 0, "tx": 0, "dropped": 0, "tampered": 0,
+            "migrated": 0, "replayed_sent": 0, "atk_replies": 0,
+        }
 
     def start(self):
         t = threading.Thread(target=self._stun_loop, daemon=True)
         t.start()
         self._threads.append(t)
+        ta = threading.Thread(target=self._atk_rx_loop, daemon=True)
+        ta.start()
+        self._threads.append(ta)
         return self
 
     def stop(self):
         self._stop.set()
         try:
             self._stun_sock.close()
+        except OSError:
+            pass
+        try:
+            self._atk_sock.close()
         except OSError:
             pass
         with self._lock:
@@ -586,6 +608,35 @@ class UdpNatSim:
                 s.close()
             except OSError:
                 pass
+
+    def _atk_rx_loop(self):
+        while not self._stop.is_set():
+            try:
+                data, _ = self._atk_sock.recvfrom(65535)
+            except OSError:
+                break
+            if data:
+                with self._lock:
+                    self.stats["atk_replies"] += 1
+
+    def _spawn_replay_storm(self, target_real, pkts):
+        def _run():
+            # Wait past in-flight NAT delay so captured packets are genuine historical replays.
+            time.sleep(max(0.06, (self.delay_ms + self.jitter_ms) / 1000.0 + 0.03))
+            for _ in range(150):
+                if self._stop.is_set():
+                    break
+                for p in pkts:
+                    try:
+                        self._atk_sock.sendto(p, target_real)
+                        with self._lock:
+                            self.stats["replayed_sent"] += 1
+                    except OSError:
+                        pass
+                time.sleep(0.02)
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        self._threads.append(t)
 
     def _build_stun_resp(self, txid: bytes, src_ip: str, ext_port: int) -> bytes:
         ip_b = socket.inet_aton(src_ip)
@@ -743,11 +794,37 @@ class UdpNatSim:
                     self.stats["dropped"] += 1
                     return
 
+                # Capture packets for replay spoof test
+                replay_batch = None
+                replay_target = None
+                if (
+                    self.replay_spoof_after > 0
+                    and len(self._real_order) > self.replay_target_index
+                    and src_real == self._real_order[self.replay_target_index]
+                ):
+                    self._captured_pkts.append(data)
+                    if (not self._replay_started) and len(self._captured_pkts) >= self.replay_spoof_after:
+                        self._replay_started = True
+                        replay_target = dst_real
+                        if self.drop_real_after_replay:
+                            self._blackhole = True
+                            replay_batch = list(self._captured_pkts[:-1])
+                        else:
+                            replay_batch = list(self._captured_pkts)
+                if self._blackhole:
+                    if replay_batch:
+                        self._spawn_replay_storm(replay_target, replay_batch)
+                    self.stats["dropped"] += 1
+                    return
+
                 out_sock = self._sock_by_ext.get(src_ext)
 
             if out_sock is None:
                 return
             self.stats["tx"] += 1
+
+        if replay_batch:
+            self._spawn_replay_storm(replay_target, replay_batch)
 
         base_d = max(0.0, (self.delay_ms + self._rng.uniform(-self.jitter_ms, self.jitter_ms)) / 1000.0)
         if self.reorder_rate > 0.0 and self._rng.random() < self.reorder_rate:
@@ -1480,6 +1557,18 @@ def t12_signaling_security_and_key_rotation(ctx):
         rx.close()
         rx = None
 
+        # Offer without proto="fatext-p2p-v3" must be rejected as unsupported_p2p_proto
+        rx_proto = LineProc(["--json", "p2p", "listen", "--allow-anyone", "--stdio", "--stun", "none"], home=ctx["hb"], api_url=ctx["api"], binary_stdout=True)
+        rx_proto.wait_err_state("listening")
+        if ctx.get("relay_state") is not None:
+            old_offer = {"session": "s_old_proto", "candidates": [{"t": "host", "a": "127.0.0.1:1"}], "x25519_pub": base64.b64encode(os.urandom(32)).decode(), "mode": "stdio", "remote_port": 0, "expires_at": now + 60}
+            fr_old = json.loads(build_dm_frame(ctx["aid"], a_priv, ctx["bid"], b_pub, b_kv, "p2p_offer", old_offer, now, nonce="nonce-old-proto").decode())
+            ctx["relay_state"].push_sse(ctx["bid"], "dm", {"from": ctx["aid"], "frame": fr_old})
+            time.sleep(0.4)
+            assert_true(rx_proto.proc.poll() is None, "t12 listener stayed alive after old proto offer")
+        rx_proto.close()
+        rx_proto = None
+
         # Rotate key on A, then verify --allow-anyone with stranger and post-rotation friend P2P
         rc_rot, _, err_rot = run_cli(["--json", "key", "rotate"], home=ctx["ha"], api_url=ctx["api"])
         assert_eq(rc_rot, 0, f"t12 key rotate err={err_rot}")
@@ -1505,6 +1594,80 @@ def t12_signaling_security_and_key_rotation(ctx):
         stop_echo.set()
 
 
+def t13_replay_migration_and_zombie_spoof(ctx):
+    # Subtest A: Replay captured DATA/PING packets from spoofed attacker socket mid-transfer;
+    # peer B must NOT migrate peer_addr, must send ZERO packets to attacker socket, and transfer succeeds.
+    sim = UdpNatSim(
+        nat_mode="cone",
+        delay_ms=15,
+        replay_spoof_after=6,
+        replay_target_index=1,
+        drop_real_after_replay=False,
+    ).start()
+    stun_arg = f"127.0.0.1:{sim.stun_port}"
+    payload = os.urandom(32768)
+    rx = tx = None
+    try:
+        rx = LineProc(
+            ["--json", "p2p", "listen", "--stdio", "--stun", stun_arg] + _cand_args(ctx["no_host"]),
+            home=ctx["hb"], api_url=ctx["api"], binary_stdout=True,
+        )
+        rx.wait_err_state("listening")
+        tx = LineProc(
+            ["--json", "p2p", "connect", ctx["bid"], "--stun", stun_arg] + _cand_args(ctx["no_host"]),
+            home=ctx["ha"], api_url=ctx["api"],
+        )
+        tx.wait_err_state("connected", timeout=12.0)
+        tx.send_stdin(payload)
+        tx.close_stdin()
+        assert_eq(tx.proc.wait(timeout=20), 0, f"t13a tx exit stderr={tx.err_dump()}")
+        assert_eq(rx.proc.wait(timeout=20), 0, f"t13a rx exit stderr={rx.err_dump()}")
+        rx._out_done.wait(timeout=2.0)
+        assert_true(sim.stats["replayed_sent"] >= 10, f"t13a replay storm ran: {sim.stats}")
+        assert_eq(sim.stats["atk_replies"], 0, f"t13a zero packets reflected to replay attacker: {sim.stats}")
+        assert_eq(hashlib.sha256(bytes(rx.out_bytes)).hexdigest(), hashlib.sha256(payload).hexdigest(), "t13a SHA-256")
+    finally:
+        if tx:
+            tx.close()
+        if rx:
+            rx.close()
+        sim.stop()
+
+    # Subtest B: Real peer goes dead while attacker keeps replaying captured packets;
+    # receiver must NOT refresh last_rx_ns on replays and must exit after idle timeout.
+    sim2 = UdpNatSim(
+        nat_mode="cone",
+        replay_spoof_after=4,
+        replay_target_index=1,
+        drop_real_after_replay=True,
+    ).start()
+    stun_arg2 = f"127.0.0.1:{sim2.stun_port}"
+    rx2 = tx2 = None
+    try:
+        env2 = {"FATEXT_P2P_IDLE_TIMEOUT_MS": "900", "FATEXT_P2P_PING_MS": "200"}
+        rx2 = LineProc(
+            ["--json", "p2p", "listen", "--stdio", "--stun", stun_arg2] + _cand_args(ctx["no_host"]),
+            home=ctx["hb"], api_url=ctx["api"], binary_stdout=True, extra_env=env2,
+        )
+        rx2.wait_err_state("listening")
+        tx2 = LineProc(
+            ["--json", "p2p", "connect", ctx["bid"], "--stun", stun_arg2] + _cand_args(ctx["no_host"]),
+            home=ctx["ha"], api_url=ctx["api"], extra_env=env2,
+        )
+        tx2.wait_err_state("connected", timeout=12.0)
+        tx2.send_stdin(b"BEFORE_BLACKHOLE\n")
+        rx2_rc = rx2.proc.wait(timeout=8)
+        assert_eq(rx2_rc, 0, f"t13b rx2 idle reap rc={rx2_rc}")
+        assert_true(sim2.stats["replayed_sent"] >= 10, f"t13b replay storm ran: {sim2.stats}")
+        assert_eq(sim2.stats["atk_replies"], 0, f"t13b zero packets reflected on zombie spoof: {sim2.stats}")
+    finally:
+        if tx2:
+            tx2.close()
+        if rx2:
+            rx2.close()
+        sim2.stop()
+
+
 TESTS = [
     ("T01_stun_discovery_and_failover", t01_stun_discovery_and_failover),
     ("T02_port_restricted_nat_and_noise", t02_port_restricted_nat_and_noise),
@@ -1518,6 +1681,7 @@ TESTS = [
     ("T10_star_bus_loss_large_msg_and_ack_drop", t10_star_bus_loss_large_msg_and_ack_drop),
     ("T11_star_max_peers_and_zombie_reap", t11_star_max_peers_and_zombie_reap),
     ("T12_signaling_security_and_key_rotation", t12_signaling_security_and_key_rotation),
+    ("T13_replay_migration_and_zombie_spoof", t13_replay_migration_and_zombie_spoof),
 ]
 
 

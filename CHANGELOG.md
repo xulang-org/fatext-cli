@@ -2,6 +2,15 @@
 
 All notable changes to `fatext-cli` will be documented in this file.
 
+## [1.0.3] - 2026-11-27
+
+### Security
+- Upgrade P2P transport protocol to `fatext-p2p-v3`: bind every UDP packet (`PUNCH`, `ACK`, `DATA`, `PING`, `PONG`, `FIN`, `PATH_CHALLENGE`, `PATH_RESPONSE`) to a strictly monotonic 64-bit packet number (`pkt_num`) and deterministic AES-256-GCM 96-bit nonce (`0x00000000 || pkt_num`), enforce a 62-bit sliding anti-replay window after tag verification, and seal retransmissions with fresh packet numbers.
+- Gate NAT peer address migration on authenticated, non-replayed, strictly newest packets plus cryptographic `PATH_CHALLENGE` / `PATH_RESPONSE` reachability validation, preventing replayed-packet `peer_addr` hijacking, spoofed third-party packet reflection, and keepalive zombie-prevention DoS.
+
+### Added & Tested
+- Add `T13_replay_migration_and_zombie_spoof` regression test in `scripts/test_p2p.py` verifying zero packet reflection toward spoofed/replayed sources and intact dead-peer reaping under continuous packet replay, plus offer-protocol version rejection in `T12`.
+
 ## [1.0.2] - 2026-11-27
 
 ### Security

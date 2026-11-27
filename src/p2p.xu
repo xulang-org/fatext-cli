@@ -255,6 +255,8 @@ fn p2p_tcp_reader(tcp_fd int, out_ch chan string, eof_ch chan int) {
 fn p2p_stdin_line_reader(line_ch chan string, eof_ch chan int) {
     $buf := ""
     while true {
+        rdy := os.fd_wait_read(0, 50000000) or (err) { <- }
+        if rdy == 0 { -> }
         chunk := os.fd_read(0, 4096) or (err) { <- }
         if chunk.len == 0 { <- }
         buf = buf + chunk

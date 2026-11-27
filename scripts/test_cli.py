@@ -30,8 +30,8 @@ import time
 import urllib.parse
 
 CLI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLI_BIN = os.path.join(CLI_DIR, "build", "fatext")
-SERVER_BIN = os.path.normpath(os.path.join(CLI_DIR, "..", "fatext", "build", "fatext-server"))
+CLI_BIN = os.environ.get("FATEXT_CLI_BIN") or os.environ.get("FATEXT_BIN") or os.path.join(CLI_DIR, "build", "fatext")
+SERVER_BIN = os.environ.get("FATEXT_SERVER_BIN") or os.path.normpath(os.path.join(CLI_DIR, "..", "fatext", "build", "fatext-server"))
 WWW_DIR = os.path.normpath(os.path.join(CLI_DIR, "..", "fatext", "www"))
 TPL_DIR = os.path.normpath(os.path.join(CLI_DIR, "..", "fatext", "templates"))
 

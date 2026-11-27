@@ -80,7 +80,7 @@ Global flags (accepted before or with subcommands):
 | `--api <url>` | Override API base URL |
 | `--timeout <sec>` | HTTP request timeout in seconds (default `30`) |
 | `--pow-bits <n>` | Override PoW difficulty bits instead of fetching `/.well-known/fatext.json` |
-| `--version`, `-V` | Print CLI version (`fatext 1.0.3`) |
+| `--version`, `-V` | Print CLI version (`fatext 1.0.4`) |
 | `--help`, `-h` | Show command summary |
 
 ## Exit Codes

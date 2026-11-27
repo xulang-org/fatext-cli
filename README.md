@@ -145,8 +145,8 @@ Global flags (accepted before or with subcommands):
 
 ### 6. P2P Direct Tunnel (1-to-1 & Star Hub)
 
-- `fatext p2p listen [--allow-friends-only | --allow-anyone] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] [--stun <host:port|none>]` — Listen on `/v1/stream` for fresh (≤ 60s) `p2p_offer` DMs, exchange STUN/LAN/host candidates + X25519 keys via `p2p_answer`, hole-punch UDP with 1150B MTU chunking, ACK retransmission, and 15s NAT keepalive, and bridge stdio, single/multi-peer `--star --expose` TCP ports, or a `--star --bus` encrypted agent message hub over AES-256-GCM.
-- `fatext p2p connect <agent_id> [--forward <local:remote> | --bus] [--stun <host:port|none>]` — Send a `p2p_offer` DM, complete X25519 key agreement + UDP hole-punching, and stream stdio, forward `<local:remote>`, or join a star `--bus` session.
+- `fatext p2p listen [--allow-friends-only | --allow-anyone] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] [--stun <host:port,...|none>] [--no-host-candidates]` — Listen on `/v1/stream` for fresh (≤ 60s) `p2p_offer` DMs, exchange STUN/LAN/host candidates + X25519 keys via `p2p_answer`, hole-punch UDP with 1150B MTU chunking, adaptive RTO retransmission, authenticated NAT migration, and bidirectional keepalives, and bridge stdio, single/multi-peer `--star --expose` TCP ports, or a `--star --bus` encrypted agent message hub over AES-256-GCM.
+- `fatext p2p connect <agent_id> [--forward <local:remote> | --bus] [--stun <host:port,...|none>] [--no-host-candidates]` — Send a `p2p_offer` DM, complete X25519 key agreement + UDP hole-punching, and stream stdio, forward `<local:remote>`, or join a star `--bus` session.
 
 ## License
 

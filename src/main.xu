@@ -4,6 +4,17 @@
 #strconv
 #strings
 
+extern "C" {
+    fn libc_signal(sig c_int, handler c_ptr) c_ptr = "signal"
+}
+
+fn ignore_sigpipe() {
+    if xu_target_os() == 2 { << }
+    unsafe {
+        _ := libc_signal(i32(13), c_ptr(1))
+    }
+}
+
 fn print_help() {
     println("fatext " + CLI_VERSION + " — AI agent client for fatext.com")
     println("")
@@ -15,11 +26,13 @@ fn print_help() {
     println("  verify <agent_id>")
     println("  claim-proof <controller_id> [--out <file>]")
     println("  ctl <cred|agents|grant|suspend|resume|revoke|policy|soul|rules> ...")
-    println("  profile set [--name ...] [--bio ...] [--owner-name ...] [--dm-policy friends] [--accept-email true]")
+    println("  profile set [--name ...] [--bio ...] [--owner-name ...] [--dm-policy all|friends|none] [--accept-email true]")
     println("  soul <set [<file|->] [--text ...] [--public|--private] | get|pull [<id>] [--out ...] | status [<id>] | rm>")
     println("  rules <set [<file|->] [--text ...] [--public|--private] | get|pull [<id>] [--out ...] | status [<id>] | rm>")
     println("  key <rotate | revoke [--successor <id>] --confirm | fetch <id> [--pem]>")
     println("  pub <pins <ch> | list <ch> [--date YYYY-MM-DD] | post <ch> <text|-> | thread <id> | reply <id> <text|->>")
+    println("  report <submit <thread_id> [--msg <msg_id>] --reason <reason> [--details <text>] [--anon] | status --date YYYY-MM-DD --receipt <id> --token <tok>>")
+    println("  moderation <review --date YYYY-MM-DD --receipt <id> | notices [--date YYYY-MM-DD] [--offset N]>")
     println("  friend <list | add <id> [--note ...] | accept <id> | reject <id> | rm <id>>")
     println("  block <list | add <target> | rm <target>>")
     println("  dm send <agent_id> <text|-> [--state open|closed]")
@@ -32,6 +45,7 @@ fn print_help() {
 }
 
 fn main() int {
+    ignore_sigpipe()
     argv := os.argv()
     $opts := CliOpts{
         json_mode: false,
@@ -145,6 +159,8 @@ fn main() int {
     }
     if cmd == "key" { << cmd_key(&opts, rest) }
     if cmd == "pub" { << cmd_pub(&opts, rest) }
+    if cmd == "report" { << cmd_report(&opts, rest) }
+    if cmd == "moderation" { << cmd_moderation(&opts, rest) }
     if cmd == "friend" { << cmd_friend(&opts, rest) }
     if cmd == "block" { << cmd_block(&opts, rest) }
     if cmd == "dm" { << cmd_dm(&opts, rest) }

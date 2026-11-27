@@ -456,7 +456,8 @@ fn p2p_star_bus_worker(
                 unacked_tries += 1
                 last_tx_ns = unacked_ns
             } else {
-                wait_ack = false
+                alive = false
+                <-
             }
         }
 
@@ -602,7 +603,8 @@ fn p2p_bus_client_session(
                 unacked_tries += 1
                 last_tx_ns = unacked_ns
             } else {
-                wait_ack = false
+                alive = false
+                <-
             }
         }
 
@@ -1039,14 +1041,17 @@ fn p2p_punch_and_session(
                             }
                         }
                     }
+                    if !ack_ok { aborted = true }
                     if aborted { <- }
                     seq += 1
                 }
             }
-            fin_pkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_FIN, seq, &empty)
-            if fin_pkt.len > 0 {
-                for r in 0:3 {
-                    pconn_write_q(pconn, &fin_pkt, &peer_addr)
+            if !aborted {
+                fin_pkt := seal_pkt_q(&ciph.tx, session + "", P2P_PKT_FIN, seq, &empty)
+                if fin_pkt.len > 0 {
+                    for r in 0:3 {
+                        pconn_write_q(pconn, &fin_pkt, &peer_addr)
+                    }
                 }
             }
         } else {
@@ -1150,7 +1155,7 @@ fn p2p_punch_and_session(
                     unacked_tries += 1
                     last_tx_ns = unacked_ns
                 } else {
-                    wait_ack = false
+                    <-
                 }
             }
 
@@ -1275,7 +1280,7 @@ fn handle_incoming_p2p_offer(
     frame_json := json_encode_or(&d, d.get(d.root(), "frame"), "")
 
     fk := fetch_agent_key(cfg.api_base + "", opts.timeout_sec, from_id + "")
-    dec := decrypt_dm_frame(cfg.agent_id + "", priv, from_id + "", &fk.pk, fk.ok, &frame_json)
+    dec := decrypt_dm_frame_with_archive(cfg.home + "", cfg.agent_id + "", cfg.key_version, priv, from_id + "", &fk.pk, fk.ok, &frame_json)
     if !dec.ok || !dec.verified || dec.msg_type != "p2p_offer" { << -1 }
     now0 := time.now_time().unix()
     if dec.ts <= 0 || (now0 - dec.ts) > 60 || (dec.ts - now0) > 60 { << -1 }
@@ -1589,6 +1594,10 @@ pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
     }
     bus_mode := fs.get_bool("bus")
     stun_hp := fs.get_string("stun")
+    relay_url := fs.get_string("relay")
+    if relay_url.len > 0 {
+        << emit_err(opts, "ERR_USAGE", 0, "--relay is not supported yet", 0, EXIT_USAGE)
+    }
     if forward_mode && bus_mode {
         << emit_err(opts, "ERR_USAGE", 0, "--forward and --bus are mutually exclusive", 0, EXIT_USAGE)
     }
@@ -1655,7 +1664,8 @@ pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
     $peer_cands := []net.UDPAddr{}
     $peer_xpub_b64 := ""
     $got_answer := false
-    while true {
+    deadline := time.now_time().unix() + 75
+    while time.now_time().unix() < deadline {
         ev := sse_read_event($&sc)
         if ev.eof { <- }
         if !ev.ok || ev.event_type != "dm" { -> }
@@ -1664,7 +1674,7 @@ pub fn cmd_p2p_connect(opts &CliOpts, args []string) int {
         from_id := json_str_or(&d, d.get(d.root(), "from"), "")
         if from_id != peer_id { -> }
         frame_json := json_encode_or(&d, d.get(d.root(), "frame"), "")
-        dec := decrypt_dm_frame(cfg.agent_id + "", &priv, peer_id + "", &fk.pk, true, &frame_json)
+        dec := decrypt_dm_frame_with_archive(cfg.home + "", cfg.agent_id + "", cfg.key_version, &priv, peer_id + "", &fk.pk, true, &frame_json)
         if !dec.ok || !dec.verified || dec.msg_type != "p2p_answer" { -> }
         now_a := time.now_time().unix()
         if dec.ts <= 0 || (now_a - dec.ts) > 60 || (dec.ts - now_a) > 60 { -> }

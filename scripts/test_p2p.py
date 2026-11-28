@@ -532,6 +532,7 @@ class UdpNatSim:
         replay_spoof_after: int = 0,
         replay_target_index: int = 1,
         drop_real_after_replay: bool = False,
+        pps_limit: float = 0.0,
     ):
         self.nat_mode = nat_mode
         self.stun_attr_mode = stun_attr_mode
@@ -549,6 +550,7 @@ class UdpNatSim:
         self.replay_spoof_after = replay_spoof_after
         self.replay_target_index = replay_target_index
         self.drop_real_after_replay = drop_real_after_replay
+        self.pps_limit = pps_limit
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -567,6 +569,7 @@ class UdpNatSim:
         self._sym_socks = {}     # (src_real, dst_ext) -> sym_ext_port
         self._real_order = []    # registration order [R0, R1, ...]
         self._tx_counts = {}     # src_real -> count of forwarded packets
+        self._next_tx = {}       # src_real -> monotonic departure time for pps_limit
         self._drop_remaining = drop_first_packets
         self._migrated_real = set()
         self._captured_pkts = []
@@ -822,11 +825,17 @@ class UdpNatSim:
             if out_sock is None:
                 return
             self.stats["tx"] += 1
+            pacing_d = 0.0
+            if self.pps_limit > 0.0:
+                now_m = time.monotonic()
+                depart = max(now_m, self._next_tx.get(src_real, 0.0))
+                self._next_tx[src_real] = depart + (1.0 / self.pps_limit)
+                pacing_d = depart - now_m
 
         if replay_batch:
             self._spawn_replay_storm(replay_target, replay_batch)
 
-        base_d = max(0.0, (self.delay_ms + self._rng.uniform(-self.jitter_ms, self.jitter_ms)) / 1000.0)
+        base_d = max(0.0, (self.delay_ms + self._rng.uniform(-self.jitter_ms, self.jitter_ms)) / 1000.0) + pacing_d
         if self.reorder_rate > 0.0 and self._rng.random() < self.reorder_rate:
             base_d += self._rng.uniform(0.04, 0.10)
 
@@ -2023,6 +2032,80 @@ def t19_daemon_simultaneous_dial_and_hangup(ctx):
         _stop_daemon_safe(hb, api)
 
 
+def t20_daemon_high_rtt_shaped_link(ctx):
+    ha, hb, api = ctx["ha"], ctx["hb"], ctx["api"]
+    aid, bid = ctx["aid"], ctx["bid"]
+    echo_port, stop_echo = _start_echo_server()
+    lport = free_tcp_port()
+    sim = UdpNatSim(
+        nat_mode="port_restricted",
+        delay_ms=450.0,
+        jitter_ms=80.0,
+        loss_rate=0.05,
+        pps_limit=12.0,
+    ).start()
+    stun_arg = f"127.0.0.1:{sim.stun_port}"
+    no_host = _cand_args(ctx["no_host"])
+    try:
+        assert_eq(
+            run_cli(["--json", "p2p", "daemon", "start", "--expose", str(echo_port), "--stun", stun_arg] + no_host, home=hb, api_url=api)[0],
+            0, "t20 start B",
+        )
+        assert_eq(
+            run_cli(["--json", "p2p", "daemon", "start", "--stun", stun_arg] + no_host, home=ha, api_url=api)[0],
+            0, "t20 start A",
+        )
+        _wait_daemon_sse(ha, api)
+        _wait_daemon_sse(hb, api)
+
+        rc_d, _, err_d = run_cli(["--json", "p2p", "dial", bid, "--persist"], home=ha, api_url=api, timeout=25.0)
+        assert_eq(rc_d, 0, f"t20 dial err={err_d}")
+
+        assert_eq(run_cli(["--json", "p2p", "send", bid, "hi-rtt-ab", "--topic", "hirtt"], home=ha, api_url=api)[0], 0, "t20 send A->B")
+        assert_eq(run_cli(["--json", "p2p", "send", aid, "hi-rtt-ba", "--topic", "hirtt"], home=hb, api_url=api)[0], 0, "t20 send B->A")
+
+        deadline = time.time() + 18.0
+        got_a = got_b = False
+        while time.time() < deadline and not (got_a and got_b):
+            ra = json.loads(run_cli(["--json", "p2p", "recv", "--topic", "hirtt"], home=ha, api_url=api)[1])["messages"]
+            rb = json.loads(run_cli(["--json", "p2p", "recv", "--topic", "hirtt"], home=hb, api_url=api)[1])["messages"]
+            got_a = any(m["text"] == "hi-rtt-ba" for m in ra)
+            got_b = any(m["text"] == "hi-rtt-ab" for m in rb)
+            time.sleep(0.1)
+        assert_true(got_a and got_b, f"t20 bidirectional messages got_a={got_a} got_b={got_b}")
+
+        # Initial PING/PONG should have measured positive RTT on A
+        deadline_rtt = time.time() + 10.0
+        rtt_val = -1
+        while time.time() < deadline_rtt:
+            peers_a = json.loads(run_cli(["--json", "p2p", "peers"], home=ha, api_url=api)[1])["peers"]
+            if peers_a and peers_a[0].get("rtt_ms", -1) > 0:
+                rtt_val = peers_a[0]["rtt_ms"]
+                break
+            time.sleep(0.1)
+        assert_true(rtt_val > 0, f"t20 expected positive rtt_ms from initial PING/PONG, got {rtt_val}")
+
+        # Forward 16 KiB TCP stream over shaped high-RTT link
+        assert_eq(run_cli(["--json", "p2p", "forward", "add", bid, f"{lport}:{echo_port}"], home=ha, api_url=api)[0], 0, "t20 fwd add")
+        payload = os.urandom(16 * 1024)
+        with socket.create_connection(("127.0.0.1", lport), timeout=15.0) as cs:
+            cs.settimeout(25.0)
+            cs.sendall(payload)
+            cs.shutdown(socket.SHUT_WR)
+            got = bytearray()
+            while True:
+                ch = cs.recv(4096)
+                if not ch:
+                    break
+                got.extend(ch)
+        assert_eq(hashlib.sha256(bytes(got)).hexdigest(), hashlib.sha256(payload).hexdigest(), "t20 16KiB shaped-link SHA-256")
+    finally:
+        _stop_daemon_safe(ha, api)
+        _stop_daemon_safe(hb, api)
+        stop_echo.set()
+        sim.stop()
+
+
 TESTS = [
     ("T01_stun_discovery_and_failover", t01_stun_discovery_and_failover),
     ("T02_port_restricted_nat_and_noise", t02_port_restricted_nat_and_noise),
@@ -2043,6 +2126,7 @@ TESTS = [
     ("T17_daemon_multiplexed_concurrent_tcp_forward", t17_daemon_multiplexed_concurrent_tcp_forward),
     ("T18_daemon_persistent_auto_reconnect", t18_daemon_persistent_auto_reconnect),
     ("T19_daemon_simultaneous_dial_and_hangup", t19_daemon_simultaneous_dial_and_hangup),
+    ("T20_daemon_high_rtt_shaped_link", t20_daemon_high_rtt_shaped_link),
 ]
 
 

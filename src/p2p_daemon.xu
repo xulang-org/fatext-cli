@@ -779,7 +779,7 @@ fn daemon_peer_mux_worker(
         $kept_st := []MuxTcpStream{}
         for si in 0:streams.len {
             s := &streams[si]
-            if (s.local_eof && s.remote_eof) || (s.state == MSTREAM_CONNECTING && now_gc - s.created_ns >= 15000000000) {
+            if (s.local_eof && s.remote_eof) || (s.state == MSTREAM_CONNECTING && now_gc - s.created_ns >= 20000000000) {
                 net_close_q(s.fd)
             } else {
                 kept_st.push(streams[si])

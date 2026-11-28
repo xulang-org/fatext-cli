@@ -868,6 +868,7 @@ class LineProc:
         self._err_history = []
         self._lock = threading.Lock()
         self._out_done = threading.Event()
+        self._err_done = threading.Event()
         self._t_out = threading.Thread(target=self._pump_out, daemon=True)
         self._t_err = threading.Thread(target=self._pump_err, daemon=True)
         self._t_out.start()
@@ -892,11 +893,14 @@ class LineProc:
             self._out_done.set()
 
     def _pump_err(self):
-        for raw in iter(self.proc.stderr.readline, b""):
-            ln = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-            with self._lock:
-                self._err_history.append(ln)
-            self.err_lines.put(ln)
+        try:
+            for raw in iter(self.proc.stderr.readline, b""):
+                ln = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                with self._lock:
+                    self._err_history.append(ln)
+                self.err_lines.put(ln)
+        finally:
+            self._err_done.set()
 
     def send_stdin(self, data: bytes):
         self.proc.stdin.write(data)
@@ -945,10 +949,14 @@ class LineProc:
         raise AssertionError(f"Timed out waiting for stdout ({desc}); out={self.out_dump()} err={self.err_dump()}")
 
     def err_dump(self) -> str:
+        if self.proc.poll() is not None:
+            self._err_done.wait(timeout=2.0)
         with self._lock:
             return "\n".join(self._err_history)
 
     def out_dump(self) -> str:
+        if self.proc.poll() is not None:
+            self._out_done.wait(timeout=2.0)
         with self._lock:
             return "\n".join(self._out_history)
 
@@ -1391,7 +1399,7 @@ def t09_symmetric_nat_punch_timeout(ctx):
         elapsed = time.time() - t0
         assert_eq(tx_rc, 9, f"t09 tx punch timeout exit=9 stderr={tx.err_dump()}")
         assert_eq(rx_rc, 9, f"t09 rx punch timeout exit=9 stderr={rx.err_dump()}")
-        assert_true("punch_timeout" in tx.err_dump() and "punch_timeout" in rx.err_dump(), "t09 punch_timeout logged")
+        assert_true("punch_timeout" in tx.err_dump() and "punch_timeout" in rx.err_dump(), f"t09 punch_timeout logged: tx={tx.err_dump()!r} rx={rx.err_dump()!r}")
         assert_true(elapsed < 6.0, f"t09 completed quickly ({elapsed:.2f}s)")
     finally:
         if tx:

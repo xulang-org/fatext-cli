@@ -238,9 +238,12 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
     fs.define_string("bio", "", "agent bio")
     fs.define_string("owner", "", "owner display name")
     fs.define_string("credential", "", "enrollment credential file")
+    fs.define_string("pair", "", "controller pairing session ID (pair_...)")
+    fs.define_string("code", "", "6-digit controller 2FA pairing code")
+    fs.define_string("controller", "", "expected controller_id when using --pair")
     fs.define_bool("controller-only", false, "register controller-only identity")
     fs.define_int("bits", 2048, "RSA key bits (2048..4096)")
-    pr := parse_flags(opts, $&fs, args, false, "usage: fatext init [--name <name>] [--bio <bio>] [--owner <owner>] [--credential <file>] [--controller-only] [--bits 2048]")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext init [--name <name>] [--bio <bio>] [--owner <owner>] [--credential <file> | --pair <pair_id> [--code <6-digits>] [--controller <id>]] [--controller-only] [--bits 2048]")
     if pr == FLAG_HELP { << EXIT_OK }
     if pr != FLAG_OK { << EXIT_USAGE }
 
@@ -248,28 +251,28 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
     bio := fs.get_string("bio")
     owner := fs.get_string("owner")
     cred_file := fs.get_string("credential")
+    pair_id := strings.trim_space(&fs.get_string("pair"))
+    pair_code := fs.get_string("code")
+    pair_ctrl := strings.trim_space(&fs.get_string("controller"))
     ctrl_only := fs.get_bool("controller-only")
     bits := fs.get_int("bits")
     if bits < 2048 || bits > 4096 {
         << emit_err(opts, "ERR_USAGE", 0, "--bits must be 2048..4096", 0, EXIT_USAGE)
+    }
+    if pair_id.len > 0 && cred_file.len > 0 {
+        << emit_err(opts, "ERR_USAGE", 0, "--pair cannot be combined with --credential", 0, EXIT_USAGE)
+    }
+    if pair_id.len > 0 && ctrl_only {
+        << emit_err(opts, "ERR_USAGE", 0, "--pair cannot be combined with --controller-only", 0, EXIT_USAGE)
+    }
+    if pair_ctrl.len > 0 && !is_valid_agent_id(pair_ctrl + "") {
+        << emit_err(opts, "ERR_USAGE", 0, "invalid --controller agent_id", 0, EXIT_USAGE)
     }
 
     home := resolve_home(opts)
     cfg_path := resolve_config_path(opts)
     api_base := resolve_api_base(opts, "")
 
-    priv := rsa.generate_key(bits) or (err) {
-        << emit_err(opts, "ERR_CRYPTO", 0, "RSA keygen failed: " + err.msg(), 0, EXIT_CRYPTO)
-    }
-    priv_pem := encode_rsa_private_pem(&priv) or (err) {
-        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
-    }
-    pub_pem := encode_spki_public_pem(&priv.public) or (err) {
-        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
-    }
-    fp := pubkey_fingerprint(&pub_pem)
-
-    $pow_bits := discover_pow_bits(opts, api_base + "", "register", 20)
     $enr_json := ""
     $enr_cid := ""
     $enr_ctrl := ""
@@ -283,7 +286,28 @@ pub fn cmd_init(opts &CliOpts, args []string) int {
         enr_cid = json_str_or(&cdoc, cdoc.get(pl, "cred_id"), "")
         enr_ctrl = json_str_or(&cdoc, cdoc.get(pl, "controller_id"), "")
         enr_json = strings.trim_space(&craw)
+    } else if pair_id.len > 0 {
+        pv := pair_fetch_enrollment_voucher(opts, api_base + "", pair_id + "", pair_code + "", pair_ctrl + "")
+        if !pv.ok {
+            << emit_err(opts, pv.err_code + "", 0, pv.err_msg + "", 0, pv.exit_code)
+        }
+        enr_cid = pv.enr_cid + ""
+        enr_ctrl = pv.enr_ctrl + ""
+        enr_json = pv.enr_json + ""
     }
+
+    priv := rsa.generate_key(bits) or (err) {
+        << emit_err(opts, "ERR_CRYPTO", 0, "RSA keygen failed: " + err.msg(), 0, EXIT_CRYPTO)
+    }
+    priv_pem := encode_rsa_private_pem(&priv) or (err) {
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+    pub_pem := encode_spki_public_pem(&priv.public) or (err) {
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+    fp := pubkey_fingerprint(&pub_pem)
+
+    $pow_bits := discover_pow_bits(opts, api_base + "", "register", 20)
 
     $r := empty_api_err(false, "ERR_INIT", "not run")
     $pow_ms := 0

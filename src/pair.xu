@@ -1,0 +1,523 @@
+@main
+
+#crypto/aes
+#crypto/cipher
+#crypto/ecdh
+#crypto/hkdf
+#crypto/hmac
+#crypto/rand
+#crypto/sha256
+#crypto/subtle
+#encoding/base64
+#encoding/hex
+#encoding/json
+#errors
+#flag
+#os
+#strconv
+#strings
+#time
+
+pub struct PairDerived {
+    pub ok bool
+    pub err string
+    pub pair_key string
+    pub worker_confirm string
+    pub claim_secret_hex string
+    pub claim_hash string
+}
+
+pub struct PairVoucherRes {
+    pub ok bool
+    pub exit_code int
+    pub err_code string
+    pub err_msg string
+    pub enr_json string
+    pub enr_cid string
+    pub enr_ctrl string
+}
+
+fn pv_fail(ec int, code string, msg string) PairVoucherRes {
+    << PairVoucherRes{ok: false, exit_code: ec, err_code: code, err_msg: msg, enr_json: "", enr_cid: "", enr_ctrl: ""}
+}
+
+fn generate_pair_id() string {
+    b32 := "abcdefghijklmnopqrstuvwxyz234567"
+    rnd := rand.read(12) or >>
+    $out := "pair_"
+    for i in 0:12 {
+        idx := (rnd[i] & 255) % 32
+        out = out + b32[idx:(idx + 1)]
+    }
+    << out
+}
+
+pub fn pair_open_sign_msg(controller_id string, pair_id string, c_xpub string, expires_at int) string {
+    << "fatext-pair-v1\nopen\n" + controller_id + "\n" + pair_id + "\n" + c_xpub + "\n" + strconv.itoa(expires_at)
+}
+
+pub fn pair_voucher_aad(pair_id string, controller_id string, c_xpub string, w_xpub string) string {
+    << "fatext-pair-voucher-v1\n" + pair_id + "\n" + controller_id + "\n" + c_xpub + "\n" + w_xpub
+}
+
+pub fn pair_derive_keys(ecdh_raw &string, code_6d string, pair_id string, controller_id string, c_xpub string, w_xpub string) PairDerived {
+    ikm := *ecdh_raw + ":" + code_6d
+    salt := "fatext-pair-v1:" + pair_id + ":" + controller_id
+    prk := hkdf.extract(&ikm, &salt)
+
+    info_pk := "voucher-aead-key\n" + c_xpub + "\n" + w_xpub
+    pair_key := hkdf.expand(&prk, &info_pk, 32) or (err) {
+        << PairDerived{ok: false, err: err.msg(), pair_key: "", worker_confirm: "", claim_secret_hex: "", claim_hash: ""}
+    }
+    info_ck := "worker-confirm\n" + c_xpub + "\n" + w_xpub
+    confirm_key := hkdf.expand(&prk, &info_ck, 32) or (err) {
+        << PairDerived{ok: false, err: err.msg(), pair_key: "", worker_confirm: "", claim_secret_hex: "", claim_hash: ""}
+    }
+    info_cs := "voucher-claim\n" + c_xpub + "\n" + w_xpub
+    claim_secret := hkdf.expand(&prk, &info_cs, 32) or (err) {
+        << PairDerived{ok: false, err: err.msg(), pair_key: "", worker_confirm: "", claim_secret_hex: "", claim_hash: ""}
+    }
+
+    confirm_msg := "confirm\n" + pair_id + "\n" + controller_id + "\n" + c_xpub + "\n" + w_xpub
+    worker_confirm := hmac.sum256(&confirm_key, &confirm_msg)
+    claim_secret_hex := hex.encode_to_string(claim_secret)
+    claim_hash := sha256.sum256(claim_secret_hex + "")
+    << PairDerived{
+        ok: true,
+        err: "",
+        pair_key: pair_key,
+        worker_confirm: worker_confirm,
+        claim_secret_hex: claim_secret_hex,
+        claim_hash: claim_hash
+    }
+}
+
+fn write_stderr_q(s string) {
+    _ := os.fd_write(2, s) or (err) { << }
+}
+
+fn safe_totp_code(sec_raw &string, step int) string {
+    << totp_code_for_step(sec_raw, step) or (err) { << "" }
+}
+
+fn safe_b64_decode(s string) string {
+    << base64.decode_string(s) or (err) { << "" }
+}
+
+fn safe_ecdh_shared(priv &ecdh.PrivateKey, pubk &ecdh.PublicKey) string {
+    << priv.ecdh(pubk) or (err) { << "" }
+}
+
+fn safe_reload_totp(home string, fallback &TotpConfig) TotpConfig {
+    << load_totp_config(home + "") or (err) {
+        << TotpConfig{
+            version: fallback.version,
+            secret_b32: fallback.secret_b32 + "",
+            created_at: fallback.created_at,
+            last_used_step: fallback.last_used_step
+        }
+    }
+}
+
+fn prompt_totp_code() string {
+    write_stderr_q("Enter 6-digit Controller 2FA code: ")
+    $buf := ""
+    while buf.len < 64 {
+        ch := os.fd_read(0, 1) or (err) { <- }
+        if ch.len == 0 { <- }
+        b := ch[0] & 255
+        if b == 10 { <- }
+        buf = buf + ch
+    }
+    << buf
+}
+
+fn find_matched_totp_step(tcfg &TotpConfig, sec_raw &string, ecdh_raw &string, pair_id string, controller_id string, c_xpub string, w_xpub string, w_confirm string, now int) int {
+    cur_step := totp_step_of(now)
+    offsets := [0, -1, 1]
+    for i in 0:3 {
+        step := cur_step + offsets[i]
+        if step <= tcfg.last_used_step || step < 0 { -> }
+        code := totp_code_for_step(sec_raw, step) or (err) { -> }
+        pd := pair_derive_keys(ecdh_raw, code + "", pair_id + "", controller_id + "", c_xpub + "", w_xpub + "")
+        if !pd.ok { -> }
+        if subtle.constant_time_compare(&pd.worker_confirm, &w_confirm) == 1 {
+            << step
+        }
+    }
+    << -1
+}
+
+pub fn cmd_ctl_pair(opts &CliOpts, args []string) int {
+    $fs := flag.new_set("ctl pair")
+    fs.define_string("label", "", "credential label")
+    fs.define_string("scopes", "all", "comma-separated capability scopes or all")
+    fs.define_string("ttl", "30d", "credential lifetime (e.g. 30d, 12h)")
+    fs.define_int("timeout", 300, "pairing session lifetime in seconds (30..600)")
+    fs.define_bool("no-show-code", false, "do not display live 2FA code on controller terminal")
+    pr := parse_flags(opts, $&fs, args, false, "usage: fatext ctl pair [--label ...] [--scopes all|csv] [--ttl 30d] [--timeout 300] [--no-show-code]")
+    if pr == FLAG_HELP { << EXIT_OK }
+    if pr != FLAG_OK { << EXIT_USAGE }
+
+    lbl := fs.get_string("label")
+    scopes_in := fs.get_string("scopes")
+    ttl_s := fs.get_string("ttl")
+    pair_timeout := fs.get_int("timeout")
+    no_show := fs.get_bool("no-show-code")
+
+    if pair_timeout < 30 || pair_timeout > 600 {
+        << emit_err(opts, "ERR_USAGE", 0, "--timeout must be between 30 and 600 seconds", 0, EXIT_USAGE)
+    }
+    sr := normalize_cli_scopes(&scopes_in)
+    if !sr.ok { << emit_err(opts, "ERR_USAGE", 0, "invalid scopes: " + scopes_in, 0, EXIT_USAGE) }
+    ttl := parse_ttl_seconds(&ttl_s)
+    if ttl < 0 { << emit_err(opts, "ERR_USAGE", 0, "invalid ttl: " + ttl_s, 0, EXIT_USAGE) }
+
+    cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    priv := load_private_key_checked(cfg.home + "") or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+    $tcfg := load_totp_config(cfg.home + "") or (err) {
+        << emit_err(opts, "ERR_TOTP_NOT_CONFIGURED", 0, "controller 2FA not initialized; run `fatext ctl 2fa init` first", 0, EXIT_CONFIG)
+    }
+    sec_raw := base32_decode_str(&tcfg.secret_b32) or (err) {
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+
+    c_xpriv := ecdh.generate_key(ecdh.x25519()) or (err) {
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+    c_xpub_b64 := base64.encode_to_string(c_xpriv.public_key().bytes())
+    pair_id := generate_pair_id() or (err) {
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+    now0 := time.now_time().unix()
+    expires_at := now0 + pair_timeout
+    open_msg := pair_open_sign_msg(cfg.agent_id + "", pair_id + "", c_xpub_b64 + "", expires_at)
+    open_sig := sign_pss_message(&priv, &open_msg) or (err) {
+        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+    }
+
+    open_body := "{" +
+        "\"pair_id\":" + json.quote(&pair_id) + "," +
+        "\"c_xpub\":" + json.quote(&c_xpub_b64) + "," +
+        "\"c_xpub_sig\":" + json.quote(&open_sig) + "," +
+        "\"expires_at\":" + strconv.itoa(expires_at) + "}"
+    or_resp := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/ctl/pair", &open_body, "")
+    if !or_resp.ok {
+        << handle_api_fail(opts, &or_resp)
+    }
+
+    $last_shown_step := totp_step_of(now0)
+    $init_code := ""
+    if !no_show {
+        init_code = safe_totp_code(&sec_raw, last_shown_step)
+    }
+    rem0 := totp_remaining_sec(now0)
+    join_cmd := "fatext --api " + cfg.api_base + " init --name <worker-name> --pair " + pair_id
+
+    if opts.json_mode {
+        $oj := "{\"event\":\"open\",\"ok\":true,\"pair_id\":" + json.quote(&pair_id) +
+            ",\"controller_id\":" + json.quote(&cfg.agent_id) +
+            ",\"expires_at\":" + strconv.itoa(expires_at) +
+            ",\"join_command\":" + json.quote(&join_cmd)
+        if !no_show {
+            oj = oj + ",\"totp_code\":" + json.quote(&init_code) + ",\"totp_remaining_sec\":" + strconv.itoa(rem0)
+        }
+        emit_stdout_line(oj + "}")
+    } else {
+        emit_stdout_line("pairing session open: " + pair_id + " (expires in " + strconv.itoa(pair_timeout) + "s)")
+        emit_stdout_line("worker command: " + join_cmd)
+        if !no_show {
+            emit_stdout_line("controller 2FA code: " + init_code + " (" + strconv.itoa(rem0) + "s remaining)")
+        } else {
+            emit_stdout_line("waiting for worker to enter your Authenticator 2FA code...")
+        }
+    }
+
+    while time.now_time().unix() < expires_at {
+        now := time.now_time().unix()
+        cur_step := totp_step_of(now)
+        if !no_show && cur_step != last_shown_step {
+            last_shown_step = cur_step
+            refreshed := safe_totp_code(&sec_raw, cur_step)
+            rsec := totp_remaining_sec(now)
+            if opts.json_mode {
+                emit_stdout_line("{\"event\":\"totp_refresh\",\"pair_id\":" + json.quote(&pair_id) +
+                    ",\"totp_code\":" + json.quote(&refreshed) +
+                    ",\"totp_remaining_sec\":" + strconv.itoa(rsec) + "}")
+            } else {
+                emit_stdout_line("controller 2FA code: " + refreshed + " (" + strconv.itoa(rsec) + "s remaining)")
+            }
+        }
+
+        empty := ""
+        pr_poll := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "GET", "/v1/ctl/pair/" + pair_id, &empty, "")
+        if !pr_poll.ok {
+            if pr_poll.err_code == "ERR_NOT_FOUND" {
+                << emit_err(opts, "ERR_TIMEOUT", 404, "pairing session expired or closed", 0, EXIT_NOT_FOUND)
+            }
+            << handle_api_fail(opts, &pr_poll)
+        }
+
+        pdoc := json.parse(&pr_poll.body)
+        if pdoc.ok() && pdoc.is_dict(pdoc.root()) {
+            prt := pdoc.root()
+            pst := json_has_str(&pdoc, prt, "status", "waiting")
+            if pst == "joined" {
+                w_xpub := json_has_str(&pdoc, prt, "w_xpub", "")
+                w_confirm := json_has_str(&pdoc, prt, "worker_confirm", "")
+                $matched := false
+                $matched_code := ""
+                $matched_step := -1
+                $ecdh_raw := ""
+
+                w_raw := safe_b64_decode(w_xpub + "")
+                if w_raw.len == 32 {
+                    peer_xpub := ecdh.new_public_key(ecdh.x25519(), &w_raw) or (err) {
+                        << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+                    }
+                    ecdh_raw = safe_ecdh_shared(&c_xpriv, &peer_xpub)
+                }
+
+                if ecdh_raw.len > 0 {
+                    // Reload totp.json to get the latest last_used_step
+                    tcfg = safe_reload_totp(cfg.home + "", &tcfg)
+                    ms := find_matched_totp_step(&tcfg, &sec_raw, &ecdh_raw, pair_id + "", cfg.agent_id + "", c_xpub_b64 + "", w_xpub + "", w_confirm + "", now)
+                    if ms >= 0 {
+                        matched_step = ms
+                        matched_code = safe_totp_code(&sec_raw, ms)
+                        matched = matched_code.len == 6
+                    }
+                }
+
+                if !matched {
+                    rej_body := "{}"
+                    rj := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/ctl/pair/" + pair_id + "/reject", &rej_body, "")
+                    if !rj.ok { << handle_api_fail(opts, &rj) }
+                    rdoc := json.parse(&rj.body)
+                    $burned := false
+                    $rem_att := 0
+                    if rdoc.ok() && rdoc.is_dict(rdoc.root()) {
+                        burned = json_has_bool(&rdoc, rdoc.root(), "burned", false)
+                        rem_att = json_has_int(&rdoc, rdoc.root(), "attempts_remaining", 0)
+                    }
+                    if burned {
+                        << emit_err(opts, "ERR_PAIR_EXHAUSTED", 401, "pairing session burned after too many invalid 2FA codes", 0, EXIT_AUTH)
+                    }
+                    if opts.json_mode {
+                        emit_stdout_line("{\"event\":\"rejected\",\"pair_id\":" + json.quote(&pair_id) + ",\"attempts_remaining\":" + strconv.itoa(rem_att) + "}")
+                    } else {
+                        emit_stdout_line("rejected invalid 2FA code (" + strconv.itoa(rem_att) + " attempts remaining)")
+                    }
+                    time.sleep(300000000)
+                    ->
+                }
+
+                // Match succeeded: guard replay by updating last_used_step before delivering voucher
+                tcfg = TotpConfig{version: tcfg.version, secret_b32: tcfg.secret_b32 + "", created_at: tcfg.created_at, last_used_step: matched_step}
+                save_totp_config(cfg.home + "", &tcfg) or (err) {
+                    << emit_err(opts, "ERR_CONFIG", 0, "failed updating totp.json: " + err.msg(), 0, EXIT_CONFIG)
+                }
+
+                pd := pair_derive_keys(&ecdh_raw, matched_code + "", pair_id + "", cfg.agent_id + "", c_xpub_b64 + "", w_xpub + "")
+                if !pd.ok {
+                    << emit_err(opts, "ERR_CRYPTO", 0, pd.err + "", 0, EXIT_CRYPTO)
+                }
+
+                iat := time.now_time().unix()
+                $exp := 0
+                if ttl > 0 { exp = iat + ttl }
+                ul := new_ulid() or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+                cid := "cred_" + ul
+                canon_pl := cli_canon_enrollment(cfg.agent_id + "", cfg.key_version, cid + "", exp, iat, lbl + "", &sr.scopes)
+                csig := sign_pss_message(&priv, &canon_pl) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+                voucher := "{\"payload\":" + canon_pl + ",\"controller_sig\":" + json.quote(&csig) + "}\n"
+
+                iv := rand.read(12) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+                ciph := aes.new_cipher(&pd.pair_key) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+                aad := pair_voucher_aad(pair_id + "", cfg.agent_id + "", c_xpub_b64 + "", w_xpub + "")
+                ct := cipher.seal_gcm(&ciph, &iv, &voucher, &aad) or (err) {
+                    << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+                }
+                iv_b64 := base64.encode_to_string(iv)
+                ct_b64 := base64.encode_to_string(ct)
+                deliv_body := "{\"iv\":" + json.quote(&iv_b64) + ",\"ct\":" + json.quote(&ct_b64) + "}"
+                dr := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "POST", "/v1/ctl/pair/" + pair_id + "/deliver", &deliv_body, "")
+                if !dr.ok { << handle_api_fail(opts, &dr) }
+
+                if opts.json_mode {
+                    emit_stdout_line("{\"event\":\"delivered\",\"ok\":true,\"pair_id\":" + json.quote(&pair_id) +
+                        ",\"controller_id\":" + json.quote(&cfg.agent_id) +
+                        ",\"cred_id\":" + json.quote(&cid) +
+                        ",\"expires_at\":" + strconv.itoa(exp) + "}")
+                } else {
+                    emit_stdout_line("delivered encrypted enrollment credential " + cid + " via " + pair_id)
+                }
+                << EXIT_OK
+            }
+        }
+        time.sleep(500000000)
+    }
+
+    // Best-effort cleanup on local timeout
+    empty_del := ""
+    _ := api_call(cfg.api_base + "", opts.timeout_sec, cfg.agent_id + "", &priv, true, "DELETE", "/v1/ctl/pair/" + pair_id, &empty_del, "")
+    << emit_err(opts, "ERR_TIMEOUT", 0, "pairing timed out waiting for worker", 0, EXIT_NET)
+}
+
+pub fn pair_fetch_enrollment_voucher(opts &CliOpts, api_base string, pair_id string, code_flag string, expected_ctrl string) PairVoucherRes {
+    $raw_code := code_flag + ""
+    if raw_code.len == 0 {
+        raw_code = os.getenv("FATEXT_PAIR_CODE")
+    }
+    if raw_code.len == 0 {
+        raw_code = prompt_totp_code()
+    }
+    code := normalize_totp_code(&raw_code)
+    if code.len != 6 {
+        << pv_fail(EXIT_USAGE, "ERR_USAGE", "2FA pairing code must be exactly 6 digits")
+    }
+
+    empty := ""
+    ir := api_call_anon(api_base + "", opts.timeout_sec, "GET", "/v1/pair/" + pair_id, &empty, "")
+    if !ir.ok {
+        $ec := map_http_exit_code(ir.status, ir.err_code + "")
+        if ir.net_err { ec = EXIT_NET }
+        << pv_fail(ec, ir.err_code + "", ir.err_msg + "")
+    }
+    idoc := json.parse(&ir.body)
+    if !idoc.ok() || !idoc.is_dict(idoc.root()) {
+        << pv_fail(EXIT_ERR, "ERR_ERR", "invalid pairing info json")
+    }
+    irt := idoc.root()
+    ctrl_id := json_has_str(&idoc, irt, "controller_id", "")
+    c_xpub_b64 := json_has_str(&idoc, irt, "c_xpub", "")
+    c_xpub_sig := json_has_str(&idoc, irt, "c_xpub_sig", "")
+    exp := json_has_int(&idoc, irt, "expires_at", 0)
+    if !is_valid_agent_id(ctrl_id + "") || c_xpub_b64.len == 0 || c_xpub_sig.len == 0 {
+        << pv_fail(EXIT_ERR, "ERR_ERR", "incomplete pairing info from server")
+    }
+    if expected_ctrl.len > 0 && ctrl_id != expected_ctrl {
+        << pv_fail(EXIT_AUTH, "ERR_FORBIDDEN", "pairing controller_id mismatch: got " + ctrl_id + ", expected " + expected_ctrl)
+    }
+
+    fk := fetch_agent_key(api_base + "", opts.timeout_sec, ctrl_id + "")
+    if !fk.ok {
+        << pv_fail(fk.exit_code, fk.err_code + "", fk.err_msg + "")
+    }
+    open_msg := pair_open_sign_msg(ctrl_id + "", pair_id + "", c_xpub_b64 + "", exp)
+    if !verify_pss_message(&fk.pk, &open_msg, c_xpub_sig + "") {
+        << pv_fail(EXIT_CRYPTO, "ERR_BAD_SIGNATURE", "controller c_xpub_sig verification failed")
+    }
+
+    c_raw := base64.decode_string(c_xpub_b64 + "") or (err) {
+        << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", "invalid c_xpub base64: " + err.msg())
+    }
+    c_xpub_pk := ecdh.new_public_key(ecdh.x25519(), &c_raw) or (err) {
+        << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", "invalid c_xpub key: " + err.msg())
+    }
+    w_xpriv := ecdh.generate_key(ecdh.x25519()) or (err) {
+        << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", err.msg())
+    }
+    w_xpub_b64 := base64.encode_to_string(w_xpriv.public_key().bytes())
+    ecdh_raw := w_xpriv.ecdh(&c_xpub_pk) or (err) {
+        << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", err.msg())
+    }
+    pd := pair_derive_keys(&ecdh_raw, code + "", pair_id + "", ctrl_id + "", c_xpub_b64 + "", w_xpub_b64 + "")
+    if !pd.ok {
+        << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", pd.err + "")
+    }
+
+    join_body := "{" +
+        "\"w_xpub\":" + json.quote(&w_xpub_b64) + "," +
+        "\"worker_confirm\":" + json.quote(&pd.worker_confirm) + "," +
+        "\"claim_hash\":" + json.quote(&pd.claim_hash) + "}"
+    jr := api_call_anon(api_base + "", opts.timeout_sec, "POST", "/v1/pair/" + pair_id + "/join", &join_body, "")
+    if !jr.ok {
+        $ec := map_http_exit_code(jr.status, jr.err_code + "")
+        if jr.net_err { ec = EXIT_NET }
+        << pv_fail(ec, jr.err_code + "", jr.err_msg + "")
+    }
+
+    claim_hdr := "X-Pair-Claim: " + pd.claim_secret_hex + "\r\n"
+    $deadline := time.now_time().unix() + 60
+    if exp > 0 && exp < deadline { deadline = exp }
+    while true {
+        empty_v := ""
+        vr := api_call_anon(api_base + "", opts.timeout_sec, "GET", "/v1/pair/" + pair_id + "/voucher", &empty_v, claim_hdr + "")
+        if !vr.ok {
+            $ec := map_http_exit_code(vr.status, vr.err_code + "")
+            if vr.net_err { ec = EXIT_NET }
+            << pv_fail(ec, vr.err_code + "", vr.err_msg + "")
+        }
+        vdoc := json.parse(&vr.body)
+        if !vdoc.ok() || !vdoc.is_dict(vdoc.root()) {
+            << pv_fail(EXIT_ERR, "ERR_ERR", "invalid voucher relay json")
+        }
+        vrt := vdoc.root()
+        vst := json_has_str(&vdoc, vrt, "status", "")
+        if vst == "pending" {
+            if time.now_time().unix() >= deadline {
+                << pv_fail(EXIT_NET, "ERR_TIMEOUT", "timed out waiting for controller to verify 2FA code")
+            }
+            time.sleep(350000000)
+            ->
+        }
+        if vst != "delivered" {
+            << pv_fail(EXIT_ERR, "ERR_ERR", "unexpected voucher relay status: " + vst)
+        }
+
+        iv_b64 := json_has_str(&vdoc, vrt, "iv", "")
+        ct_b64 := json_has_str(&vdoc, vrt, "ct", "")
+        iv := base64.decode_string(iv_b64 + "") or (err) {
+            << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", "invalid voucher iv")
+        }
+        ct := base64.decode_string(ct_b64 + "") or (err) {
+            << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", "invalid voucher ct")
+        }
+        if iv.len != 12 {
+            << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", "invalid AES-GCM iv length")
+        }
+        ciph := aes.new_cipher(&pd.pair_key) or (err) {
+            << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", err.msg())
+        }
+        aad := pair_voucher_aad(pair_id + "", ctrl_id + "", c_xpub_b64 + "", w_xpub_b64 + "")
+        pt := cipher.open_gcm(&ciph, &iv, &ct, &aad) or (err) {
+            << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", "failed decrypting pairing voucher: " + err.msg())
+        }
+
+        enr_trimmed := strings.trim_space(&pt)
+        cdoc := json.parse(&enr_trimmed)
+        if !cdoc.ok() || !cdoc.is_dict(cdoc.root()) || !cdoc.has(cdoc.root(), "payload") || !cdoc.has(cdoc.root(), "controller_sig") {
+            << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", "decrypted payload is not a valid voucher")
+        }
+        pl := cdoc.get(cdoc.root(), "payload")
+        csig := json_has_str(&cdoc, cdoc.root(), "controller_sig", "")
+        pl_kind := json_has_str(&cdoc, pl, "kind", "")
+        pl_ctrl := json_has_str(&cdoc, pl, "controller_id", "")
+        pl_ckv := json_has_int(&cdoc, pl, "controller_key_version", 0)
+        pl_cid := json_has_str(&cdoc, pl, "cred_id", "")
+        pl_exp := json_has_int(&cdoc, pl, "expires_at", 0)
+        pl_iat := json_has_int(&cdoc, pl, "issued_at", 0)
+        pl_lbl := json_has_str(&cdoc, pl, "label", "")
+        if pl_kind != "enrollment" || pl_ctrl != ctrl_id || !is_valid_cred_id(pl_cid + "") {
+            << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", "decrypted voucher metadata mismatch")
+        }
+        $scopes := []string{}
+        if cdoc.has(pl, "scopes") && cdoc.is_list(cdoc.get(pl, "scopes")) {
+            sarr := cdoc.get(pl, "scopes")
+            for si in 0:cdoc.count(sarr) {
+                sv := json_str_or(&cdoc, cdoc.at(sarr, si), "")
+                if !cli_valid_scope(sv + "") {
+                    << pv_fail(EXIT_CRYPTO, "ERR_CRYPTO", "decrypted voucher has invalid scope")
+                }
+                scopes.push(sv)
+            }
+        }
+        canon_pl := cli_canon_enrollment(pl_ctrl + "", pl_ckv, pl_cid + "", pl_exp, pl_iat, pl_lbl + "", &scopes)
+        if !verify_pss_message(&fk.pk, &canon_pl, csig + "") {
+            << pv_fail(EXIT_CRYPTO, "ERR_BAD_SIGNATURE", "decrypted voucher controller_sig verification failed")
+        }
+        << PairVoucherRes{ok: true, exit_code: 0, err_code: "", err_msg: "", enr_json: enr_trimmed, enr_cid: pl_cid, enr_ctrl: pl_ctrl}
+    }
+    << pv_fail(EXIT_NET, "ERR_TIMEOUT", "pairing failed")
+}

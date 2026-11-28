@@ -29,10 +29,10 @@ pub const P2P_REPLAY_WIN = 62
 pub const P2P_REPLAY_MASK = 4611686018427387903
 pub const P2P_MAX_PN = 4611686018427387900
 pub const P2P_MTU_CHUNK = 1150
-pub const P2P_MAX_RETRIES = 12
+pub const P2P_MAX_RETRIES = 14
 pub const P2P_RTO_MIN_NS = 100000000
-pub const P2P_RTO_INIT_NS = 200000000
-pub const P2P_RTO_MAX_NS = 2000000000
+pub const P2P_RTO_INIT_NS = 600000000
+pub const P2P_RTO_MAX_NS = 8000000000
 pub const P2P_WIN_SIZE = 32
 pub const P2P_SACK_BITS = 62
 pub const P2P_MAX_RX_OOO = 62
@@ -50,13 +50,14 @@ pub fn p2p_env_ms(name string, def_ms int, min_ms int, max_ms int) int {
 
 pub struct P2PRtoState {
     pub srtt_ns int
+    pub rttvar_ns int
     pub rto_ns int
     pub cur_rto_ns int
     pub last_backoff_ns int
 }
 
 pub fn rto_init() P2PRtoState {
-    << P2PRtoState{srtt_ns: 0, rto_ns: P2P_RTO_INIT_NS, cur_rto_ns: P2P_RTO_INIT_NS, last_backoff_ns: 0}
+    << P2PRtoState{srtt_ns: 0, rttvar_ns: 0, rto_ns: P2P_RTO_INIT_NS, cur_rto_ns: P2P_RTO_INIT_NS, last_backoff_ns: 0}
 }
 
 pub fn rto_on_ack(st $&P2PRtoState, sample_ns int, tries int) {
@@ -65,24 +66,31 @@ pub fn rto_on_ack(st $&P2PRtoState, sample_ns int, tries int) {
     if smp < 1000000 { smp = 1000000 }
     if st.srtt_ns == 0 {
         st.srtt_ns = smp
+        st.rttvar_ns = smp / 2
     } else {
+        $diff := st.srtt_ns - smp
+        if diff < 0 { diff = -diff }
+        st.rttvar_ns = (st.rttvar_ns * 3 + diff) / 4
         st.srtt_ns = (st.srtt_ns * 7 + smp) / 8
     }
-    $r := st.srtt_ns * 2 + 80000000
+    $r := st.srtt_ns + st.rttvar_ns * 4
+    r_floor := st.srtt_ns * 2 + 80000000
+    if r < r_floor { r = r_floor }
     if r < P2P_RTO_MIN_NS { r = P2P_RTO_MIN_NS }
     if r > P2P_RTO_MAX_NS { r = P2P_RTO_MAX_NS }
     st.rto_ns = r
     st.cur_rto_ns = r
 }
 
-pub fn rto_on_timeout(st $&P2PRtoState, now_ns int) {
+pub fn rto_on_timeout(st $&P2PRtoState, now_ns int) bool {
     if st.last_backoff_ns > 0 && (now_ns - st.last_backoff_ns) < st.cur_rto_ns / 2 {
-        <<
+        << false
     }
     $nxt := st.cur_rto_ns * 2
     if nxt > P2P_RTO_MAX_NS { nxt = P2P_RTO_MAX_NS }
     st.cur_rto_ns = nxt
     st.last_backoff_ns = now_ns
+    << true
 }
 
 pub fn udp_addr_eq(a &net.UDPAddr, b &net.UDPAddr) bool {
@@ -472,7 +480,7 @@ fn stun_discover_one(pconn $&net.PacketConn, stun_hp string) string {
             pconn_deadline_q(pconn, 0)
             << ""
         }
-        deadline := time.now() + 800000000
+        deadline := time.now() + 600000000
         while time.now() < deadline {
             $rem := deadline - time.now()
             if rem <= 0 { <- }

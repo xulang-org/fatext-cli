@@ -1342,7 +1342,9 @@ def run_self_update_tests():
     os_part = "macos" if sys_n == "darwin" else ("windows" if sys_n.startswith("win") else sys_n)
     arch_part = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(mach, mach)
     target_plat = f"{os_part}-{arch_part}"
-    asset_name = f"fatext-v1.2.0-{target_plat}.tar.gz"
+    next_ver = "99.1.0"
+    min_unsupported = "99.0.0"
+    asset_name = f"fatext-v{next_ver}-{target_plat}.tar.gz"
 
     with tempfile.TemporaryDirectory(prefix="fatext-update-test-") as td:
         priv_p = os.path.join(td, "official.priv.pem")
@@ -1391,7 +1393,7 @@ def run_self_update_tests():
                 tf.addfile(ti, io.BytesIO(script_body))
             return buf.getvalue()
 
-        good_tar = make_tar_gz("1.2.0")
+        good_tar = make_tar_gz(next_ver)
         good_sha = hashlib.sha256(good_tar).hexdigest()
         sums_bytes = f"{good_sha}  {asset_name}\n".encode("utf-8")
         good_sig = sign_pss_b64(sums_bytes)
@@ -1411,7 +1413,7 @@ def run_self_update_tests():
                 if self.path == "/.well-known/fatext.json":
                     body = json.dumps({
                         "version": "3.0",
-                        "cli": {"min_version": mock_cfg["min_version"], "latest_version": "1.2.0"},
+                        "cli": {"min_version": mock_cfg["min_version"], "latest_version": next_ver},
                     }).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -1530,7 +1532,7 @@ def run_self_update_tests():
             assert_eq(rc, 0, f"update --check failed: {err}")
             chk = json.loads(out.strip())
             assert_eq(chk["status"], "update_available", "update --check status")
-            assert_eq(chk["latest_version"], "1.2.0", "update --check latest_version")
+            assert_eq(chk["latest_version"], next_ver, "update --check latest_version")
 
             # 2. Tampered SHA256SUMS.sig -> exit 8 (EXIT_CRYPTO)
             prefix_bad = os.path.join(td, "prefix_bad")
@@ -1556,9 +1558,9 @@ def run_self_update_tests():
             ures = json.loads(out.strip())
             assert_eq(ures["updated"], True, "updated true")
             assert_eq(ures["verified"], True, "verified true")
-            assert_eq(ures["version"], "1.2.0", "installed version")
+            assert_eq(ures["version"], next_ver, "installed version")
             ver_out = subprocess.check_output([os.path.join(prefix_ok, "fatext"), "--version"], text=True).strip()
-            assert_true("fatext 1.2.0" in ver_out, f"prefix binary --version: {ver_out}")
+            assert_true(f"fatext {next_ver}" in ver_out, f"prefix binary --version: {ver_out}")
 
             # 5. Real in-place self-update outside .git checkout
             self_dir = os.path.join(td, "self_bin")
@@ -1572,9 +1574,9 @@ def run_self_update_tests():
             )
             assert_eq(p_self.returncode, 0, f"in-place self-update failed: {p_self.stderr}")
             sres = json.loads(p_self.stdout.strip())
-            assert_eq(sres["version"], "1.2.0", "in-place updated version")
+            assert_eq(sres["version"], next_ver, "in-place updated version")
             ver_self = subprocess.check_output([self_bin, "--version"], text=True).strip()
-            assert_true("fatext 1.2.0" in ver_self, f"replaced binary --version: {ver_self}")
+            assert_true(f"fatext {next_ver}" in ver_self, f"replaced binary --version: {ver_self}")
 
             # 6. Git checkout safety guard refuses overwriting CLI_BIN directly
             rc, _, err = run_cli(["--json", "update"], api_url=api_url)
@@ -1587,32 +1589,32 @@ def run_self_update_tests():
             prefix_off = os.path.join(td, "prefix_off")
             os.makedirs(prefix_off, exist_ok=True)
             rc, out, err = run_cli(
-                ["--json", "update", "--archive", arch_file, "--version", "1.2.0", "--prefix", prefix_off],
+                ["--json", "update", "--archive", arch_file, "--version", next_ver, "--prefix", prefix_off],
                 api_url=api_url,
             )
             assert_eq(rc, 0, f"offline --archive install failed: {err}")
             ores = json.loads(out.strip())
             assert_eq(ores["verified"], False, "offline archive verified=false")
-            assert_eq(ores["version"], "1.2.0", "offline version")
+            assert_eq(ores["version"], next_ver, "offline version")
 
             # 7b. Offline --archive= --version= --prefix= equals syntax
             prefix_eq = os.path.join(td, "prefix_eq")
             os.makedirs(prefix_eq, exist_ok=True)
             rc, out, err = run_cli(
-                ["--json=true", f"--timeout=15", "update", f"--archive={arch_file}", "--version=1.2.0", f"--prefix={prefix_eq}"],
+                ["--json=true", f"--timeout=15", "update", f"--archive={arch_file}", f"--version={next_ver}", f"--prefix={prefix_eq}"],
                 api_url=api_url,
             )
             assert_eq(rc, 0, f"offline --flag=value update failed: {err}")
             oeq = json.loads(out.strip())
-            assert_eq(oeq["version"], "1.2.0", "offline --flag=value version")
+            assert_eq(oeq["version"], next_ver, "offline --flag=value version")
 
             # 8. min_version unsupported detection in update --check
-            mock_cfg["min_version"] = "1.1.0"
+            mock_cfg["min_version"] = min_unsupported
             rc, out, err = run_cli(["--json", "update", "--check"], api_url=api_url)
             assert_eq(rc, 1, f"update --check below min_version should exit 1: out={out} err={err}")
             uchk = json.loads(out.strip())
             assert_eq(uchk["status"], "unsupported", "unsupported status")
-            assert_eq(uchk["min_version"], "1.1.0", "min_version reported")
+            assert_eq(uchk["min_version"], min_unsupported, "min_version reported")
         finally:
             srv.shutdown()
             srv.server_close()

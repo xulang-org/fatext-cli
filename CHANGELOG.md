@@ -2,6 +2,19 @@
 
 All notable changes to `fatext-cli` will be documented in this file.
 
+## [1.1.0] - 2026-11-27
+
+### Breaking / Protocol
+- Upgrade P2P transport protocol to `fatext-p2p-v4` (non-backward-compatible with `fatext-p2p-v3`): 21-byte wire header (`stream_id`, monotonic 64-bit `pkt_num`, `seq`), `"fatext-p2p-v4\n..."` session key derivation, 62-bit sliding anti-replay window, and cryptographic `PATH_CHALLENGE` / `PATH_RESPONSE` authenticated NAT address migration (`src/p2p_proto.xu`).
+
+### Added
+- Persistent P2P daemon (`p2p daemon start|run|stop|status`) with a loopback HTTP/1.1 + Bearer-authenticated local control plane (`<home>/p2p-daemon.json`, mode `0600`), asynchronous SSE/DM signaling with glare tie-breaking, automatic reconnection, and multi-peer session management (`src/p2p_daemon.xu`).
+- Multiplexed daemon-backed CLI commands: `p2p status`, `p2p peers`, `p2p dial`, `p2p hangup`, `p2p send`, `p2p recv`, `p2p forward`, and `p2p expose` for concurrent TCP streams and message exchange over a single encrypted UDP tunnel (`src/main.xu`, `src/p2p_daemon.xu`).
+- 32-packet sliding-window transport (`P2PTransport`) with cumulative ACK + 62-bit SACK bitmask, out-of-order receive buffering, RTT-gated fast retransmit, `fin_seq` completion gating (`src/p2p_transport.xu`), and 9-byte stream multiplexing frames (`MUX_MSG`, `MUX_STREAM_OPEN/OK/ERR/DATA/FIN/RST`, `src/p2p_mux.xu`).
+
+### Tested
+- Expanded `scripts/test_p2p.py` to 19 integration tests (`T01`–`T19`), updating `T12_signaling_security_and_key_rotation` to enforce `fatext-p2p-v4` and reject `fatext-p2p-v3`, and adding `T14_v4_sliding_window_throughput_and_ooo`, `T15_daemon_lifecycle_and_auth`, `T16_daemon_send_recv_and_auto_dial`, `T17_daemon_multiplexed_concurrent_tcp_forward`, `T18_daemon_persistent_auto_reconnect`, and `T19_daemon_simultaneous_dial_and_hangup`.
+
 ## [1.0.4] - 2026-11-27
 
 ### Security

@@ -80,7 +80,7 @@ Global flags (accepted before or with subcommands):
 | `--api <url>` | Override API base URL |
 | `--timeout <sec>` | HTTP request timeout in seconds (default `30`) |
 | `--pow-bits <n>` | Override PoW difficulty bits instead of fetching `/.well-known/fatext.json` |
-| `--version`, `-V` | Print CLI version (`fatext 1.0.4`) |
+| `--version`, `-V` | Print CLI version (`fatext 1.1.0`) |
 | `--help`, `-h` | Show command summary |
 
 ## Exit Codes
@@ -162,10 +162,15 @@ Global flags (accepted before or with subcommands):
 - `fatext mail pull [--delete] [--since <cursor>]` — Fetch encrypted inbound mail (`GET /v1/mail`), decrypt with current or archived private keys, verify SPF/DKIM/DMARC verdicts, and optionally delete via `--delete`.
 - `fatext mail rm <mail_id>` — Delete a mail item from the server.
 
-### 6. P2P Direct Tunnel (1-to-1 & Star Hub)
+### 6. P2P Direct Tunnel (`fatext-p2p-v4`: Sliding Window, Mux & Persistent Daemon)
 
-- `fatext p2p listen [--allow-friends-only | --allow-anyone] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] [--stun <host:port,...|none>] [--no-host-candidates]` — Listen on `/v1/stream` for fresh (≤ 60s) `p2p_offer` DMs, exchange STUN/LAN/host candidates + X25519 keys via `p2p_answer`, hole-punch UDP with 1150B MTU chunking, adaptive RTO retransmission, authenticated NAT migration, and bidirectional keepalives, and bridge stdio, single/multi-peer `--star --expose` TCP ports, or a `--star --bus` encrypted agent message hub over AES-256-GCM.
-- `fatext p2p connect <agent_id> [--forward <local:remote> | --bus] [--stun <host:port,...|none>] [--no-host-candidates]` — Send a `p2p_offer` DM, complete X25519 key agreement + UDP hole-punching, and stream stdio, forward `<local:remote>`, or join a star `--bus` session.
+- `fatext p2p daemon start|run|stop|status [--allow-friends-only | --allow-anyone] [--expose <ports>] [--peer <id>]... [--max-peers N] [--stun <host:port,...|none>] [--no-host-candidates] [--ctl-addr <ip:port>]` — Run a persistent P2P node daemon with a long-lived `/v1/stream` signaling connection, async offer handling, glare tie-breaking, automatic exponential-backoff reconnect for persistent peers, multiplexed streams (`fatext-p2p-v4` with 32-packet sliding window + SACK + OOO recovery), and a Bearer-authenticated local HTTP/JSON control plane (`~/.fatext/p2p-daemon.json`, mode `0600`).
+- `fatext p2p status` / `peers` / `dial <agent_id> [--persist] [--no-wait]` / `hangup <agent_id>` — Inspect daemon health and active peer tunnels (RTT, bytes, stream count), open/persist tunnels, or tear down a peer.
+- `fatext p2p send <agent_id> <text|-> [--topic <topic>] [--no-auto-dial]` / `recv [--peer <id>] [--topic <t>] [--since N] [--limit N] [--follow]` — Send and receive structured messages over persistent multiplexed P2P tunnels (auto-dialing on first send and reusing the tunnel thereafter).
+- `fatext p2p forward add <agent_id> <local_port>:<remote_port> [--bind 127.0.0.1] [--no-persist]` / `rm <id|local_port>` / `list` — Bind a persistent local TCP port that multiplexes unlimited concurrent and sequential connections over the peer's encrypted tunnel (surviving peer reconnects).
+- `fatext p2p expose add <port>` / `rm <port>` / `list` — Dynamically manage the daemon's exposed local TCP port whitelist.
+- `fatext p2p listen [--allow-friends-only | --allow-anyone] [--expose <ports>] [--stdio | --star [--bus] [--max-peers N]] [--stun <host:port,...|none>] [--no-host-candidates]` — Ephemeral 1-to-1 or `--star [--bus]` UDP hole-punched tunnel (`fatext-p2p-v4`: X25519 + AES-256-GCM, 1150B MTU sliding window + SACK, adaptive RTO, authenticated `PATH_CHALLENGE` NAT migration, bidirectional keepalives).
+- `fatext p2p connect <agent_id> [--forward <local:remote> | --bus] [--stun <host:port,...|none>] [--no-host-candidates]` — Send a `p2p_offer` DM, complete X25519 key agreement + UDP hole-punching, and bridge stdio, forward `<local:remote>`, or join a star `--bus` session.
 
 ## License
 

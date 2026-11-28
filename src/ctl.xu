@@ -110,11 +110,18 @@ pub fn cli_canon_adoption(aid string, fp string, controller_id string, ts int) s
 
 pub fn cmd_ctl(opts &CliOpts, args []string) int {
     if args.len < 1 {
-        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl <cred|agents|grant|suspend|resume|revoke|policy|soul|rules|human> ...", 0, EXIT_USAGE)
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl <2fa|pair|cred|agents|grant|suspend|resume|revoke|policy|soul|rules|human> ...", 0, EXIT_USAGE)
     }
     sub := args[0] + ""
     $rest := []string{}
     for i in 1:args.len { rest.push(args[i] + "") }
+
+    if sub == "2fa" {
+        << cmd_ctl_2fa(opts, rest)
+    }
+    if sub == "pair" {
+        << cmd_ctl_pair(opts, rest)
+    }
 
     if sub == "cred" {
         if rest.len < 1 || rest[0] != "issue" {

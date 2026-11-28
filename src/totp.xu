@@ -1,0 +1,345 @@
+@main
+
+#crypto/rand
+#crypto/sha1
+#encoding/hex
+#encoding/json
+#errors
+#flag
+#os
+#strconv
+#strings
+#time
+
+pub const TOTP_PERIOD = 30
+pub const TOTP_DIGITS = 6
+
+pub struct TotpConfig {
+    pub version int
+    pub secret_b32 string
+    pub created_at int
+    pub last_used_step int
+}
+
+pub fn base32_encode_nopad(raw &string) string {
+    alpha := "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    $out := ""
+    $acc := 0
+    $bits := 0
+    for i in 0:raw.len {
+        acc = (acc << 8) | (raw[i] & 255)
+        bits += 8
+        while bits >= 5 {
+            bits -= 5
+            idx := (acc >> bits) & 31
+            out = out + alpha[idx:(idx + 1)]
+        }
+    }
+    if bits > 0 {
+        idx := (acc << (5 - bits)) & 31
+        out = out + alpha[idx:(idx + 1)]
+    }
+    << out
+}
+
+fn base32_char_val(c int) int {
+    if c >= 65 && c <= 90 { << c - 65 }
+    if c >= 50 && c <= 55 { << 26 + (c - 50) }
+    << -1
+}
+
+pub fn base32_decode_str(s_in &string) string {
+    up := strings.to_upper(s_in)
+    $bytes := []int{}
+    $acc := 0
+    $bits := 0
+    $saw_pad := false
+    for i in 0:up.len {
+        c := up[i] & 255
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 45 {
+            ->
+        }
+        if c == 61 {
+            saw_pad = true
+            ->
+        }
+        if saw_pad {
+            >> errors.new("totp: invalid base32 padding")
+        }
+        v := base32_char_val(c)
+        if v < 0 {
+            >> errors.new("totp: invalid base32 character")
+        }
+        acc = (acc << 5) | v
+        bits += 5
+        if bits >= 8 {
+            bits -= 8
+            bytes.push((acc >> bits) & 255)
+        }
+    }
+    << string_from_bytes(bytes)
+}
+
+fn sha1_bytes(data &string) string {
+    $d := sha1.new()
+    d.write(data)
+    h := d.sum()
+    << hex.decode_string(h) or >>
+}
+
+fn xor_pad_64(key &string, pad int) string {
+    $b := []int{}
+    for i in 0:64 {
+        $k := 0
+        if i < key.len { k = key[i] & 255 }
+        b.push(k ^ pad)
+    }
+    << string_from_bytes(b)
+}
+
+pub fn hmac_sha1_bytes(key &string, data &string) string {
+    $k := key + ""
+    if k.len > 64 {
+        k = sha1_bytes(&k) or >>
+    }
+    ip := xor_pad_64(&k, 54)
+    op := xor_pad_64(&k, 92)
+    $inner := sha1.new()
+    inner.write(&ip)
+    inner.write(data)
+    raw := hex.decode_string(inner.sum()) or >>
+    $outer := sha1.new()
+    outer.write(&op)
+    outer.write(&raw)
+    << hex.decode_string(outer.sum()) or >>
+}
+
+pub fn totp_code_for_step(secret_raw &string, step int) string {
+    $cb := []int{}
+    $sh := 56
+    while sh >= 0 {
+        cb.push((step >> sh) & 255)
+        sh -= 8
+    }
+    counter := string_from_bytes(cb)
+    mac := hmac_sha1_bytes(secret_raw, &counter) or >>
+    if mac.len != 20 { >> errors.new("totp: invalid hmac-sha1 length") }
+    off := mac[19] & 15
+    bin := ((mac[off] & 127) << 24) |
+        ((mac[off + 1] & 255) << 16) |
+        ((mac[off + 2] & 255) << 8) |
+        (mac[off + 3] & 255)
+    num := bin % 1000000
+    $s := strconv.itoa(num)
+    while s.len < TOTP_DIGITS {
+        s = "0" + s
+    }
+    << s
+}
+
+pub fn totp_step_of(unix_sec int) int {
+    << unix_sec / TOTP_PERIOD
+}
+
+pub fn totp_remaining_sec(unix_sec int) int {
+    rem := TOTP_PERIOD - (unix_sec % TOTP_PERIOD)
+    if rem <= 0 { << TOTP_PERIOD }
+    << rem
+}
+
+pub fn normalize_totp_code(raw &string) string {
+    $out := ""
+    for i in 0:raw.len {
+        c := raw[i] & 255
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 45 { -> }
+        if c < 48 || c > 57 { << "" }
+        out.push_byte(c)
+    }
+    if out.len != TOTP_DIGITS { << "" }
+    << out
+}
+
+pub fn totp_path(home string) string {
+    << home + "/totp.json"
+}
+
+pub fn totp_exists(home string) bool {
+    _ := os.stat(totp_path(home + "")) or (err) { << false }
+    << true
+}
+
+pub fn load_totp_config(home string) TotpConfig {
+    tp := totp_path(home + "")
+    check_private_key_perms(tp + "") or >>
+    raw := os.read(tp + "") or >>
+    doc := json.parse(&raw)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        >> errors.new("invalid totp.json")
+    }
+    r := doc.root()
+    ver := json_has_int(&doc, r, "version", 0)
+    sb32 := json_has_str(&doc, r, "secret_b32", "")
+    cat := json_has_int(&doc, r, "created_at", 0)
+    lus := json_has_int(&doc, r, "last_used_step", 0)
+    if ver != 1 || sb32.len == 0 {
+        >> errors.new("malformed totp.json")
+    }
+    raw_sec := base32_decode_str(&sb32) or >>
+    if raw_sec.len < 16 {
+        >> errors.new("totp secret too short")
+    }
+    << TotpConfig{version: ver, secret_b32: sb32, created_at: cat, last_used_step: lus}
+}
+
+pub fn save_totp_config(home string, cfg &TotpConfig) int {
+    ensure_dir_mode(home + "", 448) or >>
+    tp := totp_path(home + "")
+    body := "{" +
+        "\"version\":1," +
+        "\"algorithm\":\"SHA1\"," +
+        "\"digits\":6," +
+        "\"period\":30," +
+        "\"secret_b32\":" + json.quote(&cfg.secret_b32) + "," +
+        "\"created_at\":" + strconv.itoa(cfg.created_at) + "," +
+        "\"last_used_step\":" + strconv.itoa(cfg.last_used_step) +
+        "}\n"
+    << write_atomic_mode(tp + "", &body, 384) or >>
+}
+
+pub fn build_otpauth_uri(controller_id string, secret_b32 string) string {
+    lbl := url_encode(&("fatext:" + controller_id))
+    << "otpauth://totp/" + lbl + "?secret=" + secret_b32 + "&issuer=fatext&algorithm=SHA1&digits=6&period=30"
+}
+
+pub fn cmd_ctl_2fa(opts &CliOpts, args []string) int {
+    if args.len < 1 {
+        << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl 2fa <init|code|status|rm> ...", 0, EXIT_USAGE)
+    }
+    act := args[0] + ""
+    rest := slice_args(&args, 1)
+
+    if act == "init" {
+        $fs := flag.new_set("ctl 2fa init")
+        fs.define_bool("force", false, "overwrite existing TOTP secret")
+        pr := parse_flags(opts, $&fs, rest, false, "usage: fatext ctl 2fa init [--force]")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        force := fs.get_bool("force")
+
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        if totp_exists(cfg.home + "") && !force {
+            << emit_err(opts, "ERR_EXISTS", 0, "controller TOTP already initialized (use --force to rotate)", 0, EXIT_CONFLICT)
+        }
+        rnd := rand.read(20) or (err) { << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO) }
+        sec_b32 := base32_encode_nopad(&rnd)
+        now := time.now_time().unix()
+        tcfg := TotpConfig{version: 1, secret_b32: sec_b32 + "", created_at: now, last_used_step: 0}
+        save_totp_config(cfg.home + "", &tcfg) or (err) {
+            << emit_err(opts, "ERR_CONFIG", 0, "failed saving totp.json: " + err.msg(), 0, EXIT_CONFIG)
+        }
+        step := totp_step_of(now)
+        code := totp_code_for_step(&rnd, step) or (err) {
+            << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+        }
+        rem := totp_remaining_sec(now)
+        uri := build_otpauth_uri(cfg.agent_id + "", sec_b32 + "")
+        if opts.json_mode {
+            println("{\"ok\":true,\"controller_id\":" + json.quote(&cfg.agent_id) +
+                ",\"algorithm\":\"SHA1\",\"digits\":6,\"period\":30" +
+                ",\"secret_b32\":" + json.quote(&sec_b32) +
+                ",\"otpauth_uri\":" + json.quote(&uri) +
+                ",\"code\":" + json.quote(&code) +
+                ",\"remaining_sec\":" + strconv.itoa(rem) +
+                ",\"path\":" + json.quote(&totp_path(cfg.home + "")) + "}")
+        } else {
+            println("initialized controller TOTP 2FA (" + totp_path(cfg.home + "") + ", mode 0600)")
+            println("secret:      " + sec_b32)
+            println("otpauth URI: " + uri)
+            println("current 2FA: " + code + " (" + strconv.itoa(rem) + "s remaining)")
+        }
+        << EXIT_OK
+    }
+
+    if act == "code" {
+        $fs := flag.new_set("ctl 2fa code")
+        pr := parse_flags(opts, $&fs, rest, false, "usage: fatext ctl 2fa code")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        tcfg := load_totp_config(cfg.home + "") or (err) {
+            << emit_err(opts, "ERR_TOTP_NOT_CONFIGURED", 0, "controller 2FA not initialized; run `fatext ctl 2fa init`", 0, EXIT_CONFIG)
+        }
+        sec_raw := base32_decode_str(&tcfg.secret_b32) or (err) {
+            << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+        }
+        now := time.now_time().unix()
+        step := totp_step_of(now)
+        code := totp_code_for_step(&sec_raw, step) or (err) {
+            << emit_err(opts, "ERR_CRYPTO", 0, err.msg(), 0, EXIT_CRYPTO)
+        }
+        rem := totp_remaining_sec(now)
+        if opts.json_mode {
+            println("{\"ok\":true,\"controller_id\":" + json.quote(&cfg.agent_id) +
+                ",\"code\":" + json.quote(&code) +
+                ",\"step\":" + strconv.itoa(step) +
+                ",\"remaining_sec\":" + strconv.itoa(rem) + "}")
+        } else {
+            println(code + " (" + strconv.itoa(rem) + "s remaining)")
+        }
+        << EXIT_OK
+    }
+
+    if act == "status" {
+        $fs := flag.new_set("ctl 2fa status")
+        pr := parse_flags(opts, $&fs, rest, false, "usage: fatext ctl 2fa status")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        if !totp_exists(cfg.home + "") {
+            if opts.json_mode {
+                println("{\"ok\":true,\"enabled\":false,\"controller_id\":" + json.quote(&cfg.agent_id) + "}")
+            } else {
+                println("2FA enabled=false controller_id=" + cfg.agent_id)
+            }
+            << EXIT_OK
+        }
+        tcfg := load_totp_config(cfg.home + "") or (err) {
+            << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG)
+        }
+        if opts.json_mode {
+            println("{\"ok\":true,\"enabled\":true,\"controller_id\":" + json.quote(&cfg.agent_id) +
+                ",\"algorithm\":\"SHA1\",\"digits\":6,\"period\":30" +
+                ",\"created_at\":" + strconv.itoa(tcfg.created_at) +
+                ",\"last_used_step\":" + strconv.itoa(tcfg.last_used_step) + "}")
+        } else {
+            println("2FA enabled=true controller_id=" + cfg.agent_id + " algorithm=SHA1 digits=6 period=30 created_at=" + strconv.itoa(tcfg.created_at) + " last_used_step=" + strconv.itoa(tcfg.last_used_step))
+        }
+        << EXIT_OK
+    }
+
+    if act == "rm" {
+        $fs := flag.new_set("ctl 2fa rm")
+        fs.define_bool("confirm", false, "confirm removal of controller TOTP secret")
+        pr := parse_flags(opts, $&fs, rest, false, "usage: fatext ctl 2fa rm --confirm")
+        if pr == FLAG_HELP { << EXIT_OK }
+        if pr != FLAG_OK { << EXIT_USAGE }
+        if !fs.get_bool("confirm") {
+            << emit_err(opts, "ERR_CONFIRM_REQUIRED", 0, "removing TOTP secret requires --confirm", 0, EXIT_USAGE)
+        }
+        cfg := load_config(opts) or (err) { << emit_err(opts, "ERR_CONFIG", 0, err.msg(), 0, EXIT_CONFIG) }
+        tp := totp_path(cfg.home + "")
+        os.remove(tp + "") or (err) {
+            << emit_err(opts, "ERR_NOT_FOUND", 0, "totp.json not found: " + err.msg(), 0, EXIT_NOT_FOUND)
+        }
+        if opts.json_mode {
+            println("{\"ok\":true,\"removed\":true,\"controller_id\":" + json.quote(&cfg.agent_id) + "}")
+        } else {
+            println("removed controller TOTP 2FA (" + tp + ")")
+        }
+        << EXIT_OK
+    }
+
+    << emit_err(opts, "ERR_USAGE", 0, "usage: fatext ctl 2fa <init|code|status|rm> ...", 0, EXIT_USAGE)
+}

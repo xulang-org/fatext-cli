@@ -165,6 +165,10 @@ jobs:
         shell: bash
         run: |
           python3 fatext/scripts/test_ctl_chain.py
+          if [ -f fatext/scripts/test_ctl_pair.py ]; then
+            python3 fatext/scripts/test_ctl_pair.py
+            python3 fatext-cli/scripts/test_ctl_pair_e2e.py
+          fi
           python3 fatext/scripts/test_docs_and_name.py
           python3 fatext/scripts/test_logging.py
           python3 fatext/scripts/test_rooms.py

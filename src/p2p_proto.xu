@@ -31,7 +31,7 @@ pub const P2P_MAX_PN = 4611686018427387900
 pub const P2P_MTU_CHUNK = 1150
 pub const P2P_MAX_RETRIES = 14
 pub const P2P_RTO_MIN_NS = 100000000
-pub const P2P_RTO_INIT_NS = 1000000000
+pub const P2P_RTO_INIT_NS = 600000000
 pub const P2P_RTO_MAX_NS = 8000000000
 pub const P2P_WIN_SIZE = 32
 pub const P2P_SACK_BITS = 62
@@ -73,7 +73,7 @@ pub fn rto_on_ack(st $&P2PRtoState, sample_ns int, tries int) {
         st.rttvar_ns = (st.rttvar_ns * 3 + diff) / 4
         st.srtt_ns = (st.srtt_ns * 7 + smp) / 8
     }
-    $r := st.srtt_ns + st.rttvar_ns * 4 + 80000000
+    $r := st.srtt_ns + st.rttvar_ns * 4
     r_floor := st.srtt_ns * 2 + 80000000
     if r < r_floor { r = r_floor }
     if r < P2P_RTO_MIN_NS { r = P2P_RTO_MIN_NS }

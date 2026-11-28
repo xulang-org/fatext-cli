@@ -39,6 +39,7 @@ pub struct P2PTransport {
     pub cwnd int
     pub ssthresh int
     pub cwnd_ack_cnt int
+    pub last_cc_ns int
     pub local_fin bool
     pub remote_fin bool
     pub fin_seq int
@@ -71,6 +72,7 @@ pub fn make_p2p_transport(session string, peer_id string, init_addr &net.UDPAddr
         cwnd: 4,
         ssthresh: P2P_WIN_SIZE,
         cwnd_ack_cnt: 0,
+        last_cc_ns: 0,
         local_fin: false,
         remote_fin: false,
         fin_seq: -1,
@@ -244,10 +246,15 @@ pub fn p2p_tr_on_ack(tr $&P2PTransport, pconn $&net.PacketConn, ciph $&P2PCipher
             }
         }
         if did_fast_retx {
-            tr.ssthresh = tr.cwnd / 2
-            if tr.ssthresh < 2 { tr.ssthresh = 2 }
-            tr.cwnd = tr.ssthresh
-            tr.cwnd_ack_cnt = 0
+            $cc_gap := tr.rto.srtt_ns
+            if cc_gap < 100000000 { cc_gap = 100000000 }
+            if tr.last_cc_ns == 0 || (now_rt - tr.last_cc_ns) >= cc_gap {
+                tr.ssthresh = tr.cwnd / 2
+                if tr.ssthresh < 4 { tr.ssthresh = 4 }
+                tr.cwnd = tr.ssthresh
+                tr.cwnd_ack_cnt = 0
+                tr.last_cc_ns = now_rt
+            }
         }
     }
     tr.inflight = kept
@@ -269,7 +276,11 @@ pub fn p2p_tr_flush_tx(tr $&P2PTransport, pconn $&net.PacketConn, ciph $&P2PCiph
     $win_lim := tr.cwnd
     if win_lim < 1 { win_lim = 1 }
     if win_lim > P2P_WIN_SIZE { win_lim = P2P_WIN_SIZE }
-    while tr.inflight.len < win_lim && tr.tx_head < tr.tx_q.len {
+    $unacked := 0
+    for ui in 0:tr.inflight.len {
+        if !tr.inflight[ui].acked { unacked += 1 }
+    }
+    while unacked < win_lim && tr.inflight.len < P2P_WIN_SIZE && tr.tx_head < tr.tx_q.len {
         ch_s := tr.tx_q[tr.tx_head] + ""
         tr.tx_head += 1
         dpkt := seal_pkt_q(ciph, tr.session + "", P2P_PKT_DATA, tr.next_seq, &ch_s)
@@ -290,6 +301,7 @@ pub fn p2p_tr_flush_tx(tr $&P2PTransport, pconn $&net.PacketConn, ciph $&P2PCiph
                 acked: false,
                 sack_hits: 0
             })
+            unacked += 1
             tr.last_tx_ns = now_tx
             tr.next_seq += 1
         }
@@ -345,9 +357,14 @@ pub fn p2p_tr_flush_tx(tr $&P2PTransport, pconn $&net.PacketConn, ciph $&P2PCiph
             backed_off := rto_on_timeout($&tr.rto, now)
             if backed_off {
                 tr.ssthresh = tr.cwnd / 2
-                if tr.ssthresh < 2 { tr.ssthresh = 2 }
-                tr.cwnd = 1
+                if tr.ssthresh < 4 { tr.ssthresh = 4 }
+                if tr.cwnd <= 2 {
+                    tr.cwnd = 1
+                } else {
+                    tr.cwnd = 2
+                }
                 tr.cwnd_ack_cnt = 0
+                tr.last_cc_ns = now
             }
         }
     }
